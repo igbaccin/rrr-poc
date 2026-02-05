@@ -189,7 +189,7 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
         f"Topic: {topic}\n\n"
         f"Below are {n_mechs} mechanism claims. Group them into thematic clusters.\n\n"
         "RULES:\n"
-        "- Use fewer clusters (4-8 typical).\n"
+        "- Use between 4 and 8 clusters.\n"
         "- Cluster labels: SHORT (3-6 words).\n"
         f"- Valid indices are 1 to {n_mechs} only.\n"
         "- Every index must appear exactly once.\n"
