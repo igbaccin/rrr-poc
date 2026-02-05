@@ -189,7 +189,7 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
         f"Topic: {topic}\n\n"
         f"Below are {n_mechs} mechanism claims. Group them into thematic clusters.\n\n"
         "RULES:\n"
-        "- Use as FEW clusters as naturally emerge (3-12 typical).\n"
+        "- Use fewer clusters (4-8 typical).\n"
         "- Cluster labels: SHORT (3-6 words).\n"
         f"- Valid indices are 1 to {n_mechs} only.\n"
         "- Every index must appear exactly once.\n"
@@ -215,7 +215,7 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
             res = ollama.chat(
                 model=_MODEL,
                 messages=[{"role": "user", "content": cluster_prompt}],
-                options={"temperature": 0.0, "num_ctx": 16384, "num_predict": 2000},
+                options={"temperature": 0.0, "num_ctx": 16384, "num_predict": 6000},
                 keep_alive=_KEEP_ALIVE,
                 stream=False
             )
