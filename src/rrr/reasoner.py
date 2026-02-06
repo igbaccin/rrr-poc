@@ -6,6 +6,12 @@ _MODEL      = os.environ.get("RRR_MODEL", "mistral")
 _OPTIONS    = {"temperature": 0.0, "num_ctx": 32768}
 _KEEP_ALIVE = "30m"
 
+
+class ClusteringFailedError(Exception):
+    """Raised when clustering fails after all retries — triggers full pipeline restart."""
+    pass
+
+
 def _build_prompt(evidence_texts: List[str], claim: str) -> str:
     prompt = (
         "You are an economic historian.\n"
@@ -165,6 +171,11 @@ def _try_parse_cluster_json(raw: str, n_mechs: int, all_mechs: list):
     return mech_to_cluster
 
 def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
+    """
+    Cluster mechanisms into themes.
+    
+    Raises ClusteringFailedError after MAX_RETRIES failures — caller should restart pipeline.
+    """
     mech_to_docs = {}
     for doc in doc_summaries:
         did = doc.get("doc_id", "")
@@ -206,7 +217,7 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
         "JSON:\n"
     )
     
-    MAX_RETRIES = 3
+    MAX_RETRIES = 5  # Bumped from 3
     mech_to_cluster = None
     
     for attempt in range(MAX_RETRIES):
@@ -236,9 +247,9 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
             print(f"[Clustering] Attempt {attempt+1}/{MAX_RETRIES} error: {e}")
             continue
     
+    # NO FALLBACK — raise error to trigger full pipeline restart
     if mech_to_cluster is None:
-        print(f"[Clustering] All {MAX_RETRIES} attempts failed, using fallback")
-        return {m: m[:60] for m in all_mechs}
+        raise ClusteringFailedError(f"Clustering failed after {MAX_RETRIES} attempts")
     
     # Fill in any missing mechanisms
     for m in all_mechs:
@@ -386,7 +397,13 @@ def _cite_harvard(row):
     cite += "."
     return cite
 
-def layered_t2(args, meta_path):
+
+def _layered_t2_inner(args, meta_path, restart_attempt=0):
+    """
+    Inner implementation of layered_t2.
+    
+    Separated to allow restart wrapper to catch ClusteringFailedError.
+    """
     import os, json
     import pandas as pd
     from rrr.retrieve import retrieve
@@ -530,6 +547,7 @@ def layered_t2(args, meta_path):
                 doc_summaries.append(res)
 
     print("[Layered-T2] clustering mechanisms...")
+    # This can raise ClusteringFailedError — caught by wrapper
     mech_to_cluster = _cluster_mechanisms(doc_summaries, topic)
     
     for doc in doc_summaries:
@@ -602,8 +620,15 @@ def layered_t2(args, meta_path):
         return "\n".join(lines)
 
     ensure_dir("runs")
+    
+    # Save ledger WITH restart tracking
+    ledger_data = {
+        "topic": topic,
+        "docs": doc_summaries,
+        "restarts_required": restart_attempt  # Track restarts for summariser
+    }
     with open(os.path.join("runs","review_ledger.json"), "w", encoding="utf-8") as f:
-        json.dump({"topic": topic, "docs": doc_summaries}, f, indent=2, ensure_ascii=False)
+        json.dump(ledger_data, f, indent=2, ensure_ascii=False)
 
     narrative_md = _render_review_narrative(topic, doc_summaries, len(all_doc_ids))
     with open(os.path.join("runs","review_narrative.md"), "w", encoding="utf-8") as f:
@@ -723,4 +748,35 @@ def layered_t2(args, meta_path):
 
         except Exception as e:
             print(f"[Layered-T2] writer failed: {e}")
+
+
+def layered_t2(args, meta_path):
+    """
+    Main entry point for layered T2 with automatic restart on clustering failure.
+    
+    If clustering fails after 5 retries, the entire pipeline restarts from scratch.
+    This is self-healing: fresh retrieval/mechanism extraction usually succeeds.
+    """
+    MAX_RESTARTS = 5
+    
+    for restart_attempt in range(MAX_RESTARTS):
+        try:
+            if restart_attempt > 0:
+                print(f"[Layered-T2] === RESTART {restart_attempt}/{MAX_RESTARTS} ===")
+            
+            _layered_t2_inner(args, meta_path, restart_attempt)
+            return  # Success
+            
+        except ClusteringFailedError as e:
+            print(f"[Layered-T2] {e}")
+            if restart_attempt < MAX_RESTARTS - 1:
+                print(f"[Layered-T2] Restarting full pipeline...")
+                # Clear stance cache to get fresh mechanisms on restart
+                import shutil
+                cache_path = os.path.join("runs", "cache", "stance")
+                if os.path.isdir(cache_path):
+                    shutil.rmtree(cache_path)
+                continue
+            else:
+                raise RuntimeError(f"Pipeline failed after {MAX_RESTARTS} full restarts due to clustering failures")
 
