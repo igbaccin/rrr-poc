@@ -1,4 +1,6 @@
-import os, json, re
+import os
+import json
+import re
 from collections import Counter, defaultdict
 from rrr.utils import ensure_dir
 
@@ -22,32 +24,44 @@ Examples of CORRECT format:
 - (NorthEtAl_2006: p.17)
 - (Broadberry&Gardner_2022: p.1)
 - (Acemoglu&Johnson_2005: p.23)
+- (AcemogluEtAl_2002: p.49)
 
 WRONG formats (NEVER use these):
+- (2002: p.4) — WRONG, missing author prefix
+- (2006: p.17) — WRONG, missing author prefix
 - North et al. (2006) — WRONG
 - (North et al., 2006) — WRONG
 - (North et al. 2006: 17) — WRONG
 - Broadberry and Gardner (2022) — WRONG
 - (NorthEtAl_2006: p.3, p.17, p.4) — WRONG (only cite ONE page per parenthesis)
 
-This citation format is mandatory and non-negotiable. Every citation must follow the (DocId_Year: p.X) pattern exactly with only ONE page number."""
+CRITICAL: The document ID MUST include the author name(s), not just the year.
+WRONG: (2002: p.4)
+CORRECT: (AcemogluEtAl_2002: p.4)
+
+Copy the document ID exactly as shown in the evidence snippets."""
+
 
 def _get_cluster(d):
     return d.get("cluster", "Other") or "Other"
 
+
 def _score_doc(d) -> float:
     return d.get("avg_score", 0)
+
 
 def _clip(s: str, n=260) -> str:
     s = (s or "").strip().replace("\n", " ")
     s = re.sub(r"\s+", " ", s)
     return (s[:n] + "…") if len(s) > n else s
 
+
 def _format_quote(q) -> str:
     did = str(q.get("doc_id", "")).strip()
     pg = int(q.get("page", 0) or 0)
     tx = _clip(q.get("text", ""), n=260)
     return f'"{tx}" ({did}: p.{pg})'
+
 
 def _format_doc_entry(d) -> str:
     did = str(d.get("doc_id", "")).strip()
@@ -57,12 +71,14 @@ def _format_doc_entry(d) -> str:
         lines.append(f"  {_format_quote(q)}")
     return "\n".join(lines)
 
+
 def _strip_wrapping(text: str) -> str:
     t = (text or "").strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
     return t
+
 
 def _strip_continuation_markers(text: str) -> str:
     """Remove 'to be continued' and similar markers."""
@@ -80,6 +96,7 @@ def _strip_continuation_markers(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+
 def _strip_conclusion(text: str) -> str:
     """Remove conclusion paragraphs."""
     patterns = [
@@ -91,6 +108,7 @@ def _strip_conclusion(text: str) -> str:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
     return text.strip()
 
+
 def _extract_citation_dumps(text: str):
     """Extract citation dump lines and return (cleaned_text, dump_citations)."""
     lines = text.split('\n')
@@ -100,18 +118,15 @@ def _extract_citation_dumps(text: str):
     for line in lines:
         stripped = line.strip()
         
-        # Pattern 1: Single parenthesis with multiple comma-separated citations (different docs)
-        # e.g., (vanZanden_2009: p.1, McCloskey_2015: p.9, Williamson_1996: p.30)
+        # Pattern 1: Single parenthesis with multiple comma-separated citations
         if stripped.startswith('(') and stripped.endswith(')') and ',' in stripped:
-            inner = stripped[1:-1]  # Remove outer parens
-            # Check if it's mostly citations (contains DocId_Year: p.X patterns)
+            inner = stripped[1:-1]
             cite_matches = re.findall(r'[A-Za-z0-9_&]+_\d{4}[a-z]?:\s*p\.\d+', inner)
             if len(cite_matches) >= 2:
                 for m in cite_matches:
                     did = m.split(':')[0]
                     dump_citations.append(did)
-                continue  # Skip this line
-            # Also check for academic format: Author & Author_Year: p.X
+                continue
             cite_matches_academic = re.findall(r'[A-Za-z&\s]+_\d{4}[a-z]?:\s*p\.\d+', inner)
             if len(cite_matches_academic) >= 2:
                 for m in cite_matches_academic:
@@ -119,17 +134,15 @@ def _extract_citation_dumps(text: str):
                     dump_citations.append(did)
                 continue
         
-        # Pattern 2: Single doc with multiple pages (same doc, multiple p.X)
-        # e.g., (NorthEtAl_2006: p.3, p.17, p.4, p.76)
+        # Pattern 2: Single doc with multiple pages
         if stripped.startswith('(') and stripped.endswith(')'):
             inner = stripped[1:-1]
             page_refs = re.findall(r'p\.\d+', inner)
             if len(page_refs) >= 3:
-                # Extract the doc_id (first part before colon)
                 doc_match = re.match(r'([A-Za-z0-9_&]+)', inner)
                 if doc_match:
                     dump_citations.append(doc_match.group(1))
-                continue  # Skip this line
+                continue
         
         # Pattern 3: Multiple separate parenthetical citations on one line
         paren_count = len(re.findall(r'\([A-Za-z]', stripped))
@@ -147,6 +160,7 @@ def _extract_citation_dumps(text: str):
     
     return '\n'.join(cleaned), dump_citations
 
+
 def _strip_references_section(text: str) -> str:
     """Remove formal References/Bibliography sections."""
     patterns = [
@@ -159,8 +173,10 @@ def _strip_references_section(text: str) -> str:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
     return text.strip()
 
+
 def _count_words(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text or ""))
+
 
 def _build_allowed_citations(docs):
     allowed_pairs = set()
@@ -182,8 +198,9 @@ def _build_allowed_citations(docs):
                 allowed_pages_by_doc[qdid].add(pg)
     return allowed_pairs, allowed_docs, allowed_pages_by_doc
 
+
 def _build_example_citations_for_chunk(cluster_docs, allowed_pages_by_doc):
-    """Build example citations from THIS chunk's docs only — ensures alignment."""
+    """Build example citations from THIS chunk's docs only."""
     examples = []
     for d in cluster_docs[:3]:
         did = str(d.get("doc_id", "")).strip()
@@ -192,24 +209,68 @@ def _build_example_citations_for_chunk(cluster_docs, allowed_pages_by_doc):
             examples.append(f"({did}: p.{pgs[0]})")
     return ", ".join(examples) if examples else "(DocId_Year: p.X)"
 
+
+def _build_year_to_docid_for_chunk(cluster_docs):
+    """
+    Build year -> doc_id mapping for a chunk.
+    Only includes unambiguous mappings (one doc per year).
+    """
+    year_to_docs = defaultdict(list)
+    for d in cluster_docs:
+        did = str(d.get("doc_id", "")).strip()
+        if not did:
+            continue
+        # Extract year from doc_id (last 4 digits before optional letter suffix)
+        m = re.search(r'_(\d{4})[a-z]?$', did)
+        if m:
+            year = m.group(1)
+            year_to_docs[year].append(did)
+    
+    # Only return unambiguous mappings
+    return {year: docs[0] for year, docs in year_to_docs.items() if len(docs) == 1}
+
+
+def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
+    """
+    Repair (YEAR: p.X) -> (DocId_Year: p.X) using chunk context.
+    
+    Returns (repaired_text, repair_count).
+    """
+    repair_count = 0
+    
+    def replacer(m):
+        nonlocal repair_count
+        year = m.group(1)
+        page = m.group(2)
+        if year in year_to_docid:
+            repair_count += 1
+            return f"({year_to_docid[year]}: p.{page})"
+        return m.group(0)  # Leave unchanged if ambiguous
+    
+    repaired = re.sub(r'\((\d{4}):\s*p\.(\d+)\)', replacer, text)
+    return repaired, repair_count
+
+
 def _build_opening_prompt(topic: str, cluster: str, evidence: str, example_str: str):
     return f"""Write the opening section of a literature review on: {topic}
 
 Theme: {cluster}
 
-Use ONLY this citation format: {example_str}
+CITATION FORMAT — Copy document IDs exactly as shown: {example_str}
+WRONG: (2002: p.4) — Never use year-only citations!
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite sources using the EXACT format shown above: (DocId_Year: p.X)
+- Cite using EXACT document IDs from the evidence: (AuthorName_Year: p.X)
 - Focus on the topic, not author names as sentence subjects
 - No headings, no bullets
 - End mid-thought for continuation
 
 Begin:"""
+
 
 def _build_continuation_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
@@ -219,20 +280,22 @@ Previous text ended with:
 
 Next theme: {cluster}
 
-Use ONLY this citation format: {example_str}
+CITATION FORMAT — Copy document IDs exactly as shown: {example_str}
+WRONG: (2002: p.4) — Never use year-only citations!
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite sources using the EXACT format shown above: (DocId_Year: p.X)
+- Cite using EXACT document IDs from the evidence: (AuthorName_Year: p.X)
 - Connect smoothly to previous text
 - Focus on the topic, not author names as sentence subjects
 - No headings, no bullets
 - End mid-thought for continuation
 
 Continue:"""
+
 
 def _build_closing_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
     return f"""Write the final section of this literature review on: {topic}
@@ -242,14 +305,15 @@ Previous text ended with:
 
 Final theme: {cluster}
 
-Use ONLY this citation format: {example_str}
+CITATION FORMAT — Copy document IDs exactly as shown: {example_str}
+WRONG: (2002: p.4) — Never use year-only citations!
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite sources using the EXACT format shown above: (DocId_Year: p.X)
+- Cite using EXACT document IDs from the evidence: (AuthorName_Year: p.X)
 - Connect smoothly to previous text
 - Focus on the topic, not author names as sentence subjects
 - No headings, no bullets
@@ -257,6 +321,7 @@ Requirements:
 - Do NOT write "In conclusion"
 
 Continue:"""
+
 
 def _ollama_chat(prompt: str):
     import ollama
@@ -272,6 +337,7 @@ def _ollama_chat(prompt: str):
     )
     return (res.get("message", {}).get("content") or "").strip()
 
+
 def _build_author_year_lookup(allowed_docs):
     """Build reverse lookup: (author, year) -> doc_id for academic citation matching."""
     author_year_to_docid = {}
@@ -285,6 +351,7 @@ def _build_author_year_lookup(allowed_docs):
             if "EtAl" in did:
                 author_year_to_docid[(author + " et al", year)] = did
     return author_year_to_docid
+
 
 def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
     """Collect cited doc_ids from both correct and academic citation formats."""
@@ -328,6 +395,7 @@ def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
     
     return cited_docs
 
+
 def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     if not os.path.isfile(ledger_path):
         raise SystemExit(f"Ledger not found: {ledger_path}")
@@ -369,12 +437,14 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
     chunks = []
     all_dump_citations = []
+    total_repairs = 0
     
     for i, (cluster, cluster_docs) in enumerate(cluster_rank):
         cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
         
-        # Build examples from THIS chunk's docs — key fix for alignment
+        # Build examples and year->docid mapping for THIS chunk
         example_str = _build_example_citations_for_chunk(cluster_docs_sorted, allowed_pages_by_doc)
+        year_to_docid = _build_year_to_docid_for_chunk(cluster_docs_sorted)
         
         evidence_lines = []
         for d in cluster_docs_sorted:
@@ -398,6 +468,10 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
         chunk = _strip_wrapping(chunk)
         
+        # REPAIR year-only citations using chunk context
+        chunk, repair_count = _repair_year_only_citations(chunk, year_to_docid)
+        total_repairs += repair_count
+        
         # Extract citation dumps before stripping
         chunk, dump_cites = _extract_citation_dumps(chunk)
         all_dump_citations.extend(dump_cites)
@@ -410,14 +484,31 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             chunk = _strip_conclusion(chunk)
 
         word_count = _count_words(chunk)
-        print(f"[Writer] Chunk {i+1}/{len(cluster_rank)} ({cluster}): {word_count} words")
+        repair_note = f", repaired {repair_count}" if repair_count > 0 else ""
+        print(f"[Writer] Chunk {i+1}/{len(cluster_rank)} ({cluster}): {word_count} words{repair_note}")
 
         chunks.append(chunk)
 
     # Concatenate chunks
     full_text = "\n\n".join(chunks)
     
-    # Final cleanup passes — run citation dump extraction again on full text
+    # Build global year->docid for final pass (using all docs)
+    global_year_to_docid = {}
+    for d in docs:
+        did = str(d.get("doc_id", "")).strip()
+        if did:
+            m = re.search(r'_(\d{4})[a-z]?$', did)
+            if m:
+                year = m.group(1)
+                # Only add if not already present (avoid ambiguity)
+                if year not in global_year_to_docid:
+                    global_year_to_docid[year] = did
+    
+    # Final repair pass on full text
+    full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
+    total_repairs += final_repairs
+    
+    # Final cleanup passes
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
     
@@ -428,7 +519,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # Clean up extra whitespace
     full_text = re.sub(r'\n{3,}', '\n\n', full_text)
 
-    # Collect all cited docs: inline + dumps
+    # Collect all cited docs
     cited_docs = _collect_cited_docs(full_text, allowed_docs, author_year_to_docid)
     
     # Add dump citations that are in allowed_docs
@@ -436,7 +527,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         if did in allowed_docs:
             cited_docs.add(did)
 
-    # Dedupe and sort alphabetically
+    # Dedupe and sort
     cited_docids = sorted(cited_docs)
 
     # Stats
@@ -447,14 +538,16 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(full_text)
 
-    # Save cited docs for reference builder (sorted, deduped)
+    # Save cited docs for reference builder
     with open("runs/review_cited_docs.json", "w", encoding="utf-8") as f:
         json.dump(cited_docids, f, indent=2)
 
     print(f"[Writer] review_composed.md written ({total_words} words).")
-    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)}")
+    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} citations_repaired={total_repairs}")
     
     return out_path
 
+
 if __name__ == "__main__":
     compose_from_ledger()
+
