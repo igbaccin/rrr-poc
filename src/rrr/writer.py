@@ -18,28 +18,30 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"([A-Za-z0-9_&.\-]+):\s*p\.(\d+)")
 
+# NO SPECIFIC DOC_IDS - prevents prompt leakage into output
 _SYSTEM_CITATION_INSTRUCTION = """You MUST cite using EXACTLY this format: (DocId_Year: p.X)
 
-Examples of CORRECT format:
-- (NorthEtAl_2006: p.17)
-- (Broadberry&Gardner_2022: p.1)
-- (Acemoglu&Johnson_2005: p.23)
-- (AcemogluEtAl_2002: p.49)
+The DocId comes from the evidence snippets provided — copy it EXACTLY as shown.
+
+Format pattern: (AuthorName_Year: p.PageNumber)
+
+Examples of the PATTERN (not real documents):
+- (AuthorName_Year: p.12)
+- (FirstAuthor&SecondAuthor_Year: p.5)
+- (AuthorEtAl_Year: p.23)
 
 WRONG formats (NEVER use these):
-- (2002: p.4) — WRONG, missing author prefix
-- (2006: p.17) — WRONG, missing author prefix
-- North et al. (2006) — WRONG
-- (North et al., 2006) — WRONG
-- (North et al. 2006: 17) — WRONG
-- Broadberry and Gardner (2022) — WRONG
-- (NorthEtAl_2006: p.3, p.17, p.4) — WRONG (only cite ONE page per parenthesis)
+- (2002: p.4) — WRONG, missing author name
+- (Year: p.X) — WRONG, missing author name  
+- Author et al. (Year) — WRONG, use (AuthorEtAl_Year: p.X) instead
+- (Author et al., Year) — WRONG, use (AuthorEtAl_Year: p.X) instead
+- (Author_Year: p.1, p.2, p.3) — WRONG, only ONE page per citation
 
-CRITICAL: The document ID MUST include the author name(s), not just the year.
-WRONG: (2002: p.4)
-CORRECT: (AcemogluEtAl_2002: p.4)
-
-Copy the document ID exactly as shown in the evidence snippets."""
+CRITICAL RULES:
+1. Copy document IDs EXACTLY as they appear in the evidence snippets
+2. Do NOT invent or guess document IDs
+3. Only cite documents that appear in the provided evidence
+4. Each citation must have exactly ONE page number"""
 
 
 def _get_cluster(d):
@@ -200,14 +202,14 @@ def _build_allowed_citations(docs):
 
 
 def _build_example_citations_for_chunk(cluster_docs, allowed_pages_by_doc):
-    """Build example citations from THIS chunk's docs only."""
+    """Build example citations from THIS chunk's docs only — real examples from evidence."""
     examples = []
     for d in cluster_docs[:3]:
         did = str(d.get("doc_id", "")).strip()
         pgs = sorted(list(allowed_pages_by_doc.get(did, set())))
         if pgs:
             examples.append(f"({did}: p.{pgs[0]})")
-    return ", ".join(examples) if examples else "(DocId_Year: p.X)"
+    return ", ".join(examples) if examples else "(AuthorName_Year: p.X)"
 
 
 def _build_year_to_docid_for_chunk(cluster_docs):
@@ -256,15 +258,14 @@ def _build_opening_prompt(topic: str, cluster: str, evidence: str, example_str: 
 
 Theme: {cluster}
 
-CITATION FORMAT — Copy document IDs exactly as shown: {example_str}
-WRONG: (2002: p.4) — Never use year-only citations!
+CITATION FORMAT — Use these document IDs from the evidence: {example_str}
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite using EXACT document IDs from the evidence: (AuthorName_Year: p.X)
+- Cite using EXACT document IDs from the evidence above
 - Focus on the topic, not author names as sentence subjects
 - No headings, no bullets
 - End mid-thought for continuation
@@ -280,15 +281,14 @@ Previous text ended with:
 
 Next theme: {cluster}
 
-CITATION FORMAT — Copy document IDs exactly as shown: {example_str}
-WRONG: (2002: p.4) — Never use year-only citations!
+CITATION FORMAT — Use these document IDs from the evidence: {example_str}
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite using EXACT document IDs from the evidence: (AuthorName_Year: p.X)
+- Cite using EXACT document IDs from the evidence above
 - Connect smoothly to previous text
 - Focus on the topic, not author names as sentence subjects
 - No headings, no bullets
@@ -305,15 +305,14 @@ Previous text ended with:
 
 Final theme: {cluster}
 
-CITATION FORMAT — Copy document IDs exactly as shown: {example_str}
-WRONG: (2002: p.4) — Never use year-only citations!
+CITATION FORMAT — Use these document IDs from the evidence: {example_str}
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite using EXACT document IDs from the evidence: (AuthorName_Year: p.X)
+- Cite using EXACT document IDs from the evidence above
 - Connect smoothly to previous text
 - Focus on the topic, not author names as sentence subjects
 - No headings, no bullets
