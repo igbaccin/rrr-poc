@@ -25,11 +25,6 @@ The DocId comes from the evidence snippets provided — copy it EXACTLY as shown
 
 Format pattern: (AuthorName_Year: p.PageNumber)
 
-Examples of the PATTERN (not real documents):
-- (AuthorName_Year: p.12)
-- (FirstAuthor&SecondAuthor_Year: p.5)
-- (AuthorEtAl_Year: p.23)
-
 WRONG formats (NEVER use these):
 - (2002: p.4) — WRONG, missing author name
 - (Year: p.X) — WRONG, missing author name  
@@ -80,6 +75,18 @@ def _strip_wrapping(text: str) -> str:
         t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
     return t
+
+
+def _strip_placeholder_citations(text: str) -> str:
+    """Remove placeholder citations that leaked from system prompt."""
+    # Pattern-based placeholders from system instruction
+    text = re.sub(r'\s*\(DocId_Year:\s*p\.[X\d]+\)', '', text)
+    text = re.sub(r'\s*\(AuthorName_Year:\s*p\.[X\d]+\)', '', text)
+    text = re.sub(r'\s*\(AuthorEtAl_Year:\s*p\.[X\d]+\)', '', text)
+    text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_Year:\s*p\.[X\d]+\)', '', text)
+    # Also catch variations
+    text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)  # DocId_2021 etc
+    return text
 
 
 def _strip_continuation_markers(text: str) -> str:
@@ -437,6 +444,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     chunks = []
     all_dump_citations = []
     total_repairs = 0
+    total_placeholders_stripped = 0
     
     for i, (cluster, cluster_docs) in enumerate(cluster_rank):
         cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
@@ -467,6 +475,12 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
         chunk = _strip_wrapping(chunk)
         
+        # STRIP placeholder citations that leaked from prompt
+        chunk_before = chunk
+        chunk = _strip_placeholder_citations(chunk)
+        placeholders_stripped = chunk_before.count('DocId_Year') + chunk_before.count('AuthorName_Year')
+        total_placeholders_stripped += placeholders_stripped
+        
         # REPAIR year-only citations using chunk context
         chunk, repair_count = _repair_year_only_citations(chunk, year_to_docid)
         total_repairs += repair_count
@@ -483,8 +497,13 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             chunk = _strip_conclusion(chunk)
 
         word_count = _count_words(chunk)
-        repair_note = f", repaired {repair_count}" if repair_count > 0 else ""
-        print(f"[Writer] Chunk {i+1}/{len(cluster_rank)} ({cluster}): {word_count} words{repair_note}")
+        notes = []
+        if repair_count > 0:
+            notes.append(f"repaired {repair_count}")
+        if placeholders_stripped > 0:
+            notes.append(f"stripped {placeholders_stripped} placeholders")
+        note_str = f" ({', '.join(notes)})" if notes else ""
+        print(f"[Writer] Chunk {i+1}/{len(cluster_rank)} ({cluster}): {word_count} words{note_str}")
 
         chunks.append(chunk)
 
@@ -506,6 +525,9 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # Final repair pass on full text
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
     total_repairs += final_repairs
+    
+    # Final placeholder strip pass
+    full_text = _strip_placeholder_citations(full_text)
     
     # Final cleanup passes
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
@@ -542,7 +564,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         json.dump(cited_docids, f, indent=2)
 
     print(f"[Writer] review_composed.md written ({total_words} words).")
-    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} citations_repaired={total_repairs}")
+    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} citations_repaired={total_repairs} placeholders_stripped={total_placeholders_stripped}")
     
     return out_path
 
