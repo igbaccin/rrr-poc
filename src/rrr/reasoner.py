@@ -736,29 +736,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 for i, rline in enumerate(ref_lines, start=1):
                     f.write(f"{i}. {rline}\n")
 
-            # ============================================================
-            # E4 VALIDATION: Check stance-context mismatches
-            # ============================================================
-            try:
-                from rrr.e4_validate import validate_stance_context, generate_e4_report
-                stance_map = {d["doc_id"]: d.get("stance", "tangential") for d in doc_summaries}
-                violations = validate_stance_context(long_form, stance_map)
-                if violations:
-                    print("\n" + "="*80)
-                    print("E4 VALIDATION (stance-context mismatches)")
-                    print("="*80 + "\n")
-                    print(generate_e4_report(violations))
-                    with open(os.path.join("runs", "e4_violations.json"), "w", encoding="utf-8") as f:
-                        json.dump(violations, f, indent=2)
-                else:
-                    print("[E4] No stance-context mismatches detected.")
-            except ImportError:
-                pass  # e4_validate not available
-
-        except Exception as e:
-            print(f"[Layered-T2] writer failed: {e}")
-
-
 def layered_t2(args, meta_path):
     """
     Main entry point for layered T2 with automatic restart on clustering failure.

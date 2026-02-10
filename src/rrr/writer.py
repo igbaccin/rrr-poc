@@ -18,29 +18,32 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"([A-Za-z0-9_&.\-]+):\s*p\.(\d+)")
 
-_SYSTEM_CITATION_INSTRUCTION = """You MUST cite using EXACTLY this format: (DocId_Year: p.X)
+_SYSTEM_CITATION_INSTRUCTION = """CITATION FORMAT IS MANDATORY. You MUST cite using EXACTLY this format: (DocId_Year: p.X)
 
-The DocId comes from the evidence snippets provided — copy it EXACTLY as shown.
-
-Format pattern: (AuthorName_Year: p.PageNumber)
+Examples of CORRECT citations:
+- (North_1989: p.9)
+- (AcemogluEtAl_2001: p.19)
+- (North&Weingast_1989: p.28)
+- (Broadberry&Gupta_2006: p.9)
 
 WRONG formats (NEVER use these):
-- (2002: p.4) — WRONG, missing author name
-- (Year: p.X) — WRONG, missing author name  
-- Author et al. (Year) — WRONG, use (AuthorEtAl_Year: p.X) instead
-- (Author et al., Year) — WRONG, use (AuthorEtAl_Year: p.X) instead
-- (Author_Year: p.1, p.2, p.3) — WRONG, only ONE page per citation
-- Do NOT mention author names in prose that differ from the document ID
+- (2002: p.4) — WRONG, missing author
+- Kuznets (1973) — WRONG, must be (Kuznets_1973: p.X)
+- (Temin 2002: p.4) — WRONG, missing underscore
+- Author et al. (Year) — WRONG
+- (Author et al., Year) — WRONG
+- (Broadberry & Gardner 2022: p.21) — WRONG, use (Broadberry&Gardner_2022: p.21)
+- (Author_Year: p.1, p.2) — WRONG, only ONE page per citation
 
 CRITICAL RULES:
 1. Copy document IDs EXACTLY as they appear in the evidence snippets
-2. Do NOT invent or guess document IDs — only cite what is in the evidence
-3. Only cite documents that appear in the provided evidence
-4. Each citation must have exactly ONE page number
-5. When mentioning authors in prose, derive the name from the document ID only
+2. ALWAYS include underscore between name and year: Author_Year
+3. ALWAYS include page number with p. prefix
+4. Do NOT invent document IDs — only cite what is in the evidence
+5. Each citation must have exactly ONE page number
 6. Do NOT end paragraphs with bare citations — integrate them into sentences
 
-AVOID these overused phrases — they weaken academic prose:
+PROSE QUALITY — Avoid these overused phrases:
 - "This perspective underscores..."
 - "This finding suggests..."
 - "sheds light on..."
@@ -57,9 +60,8 @@ AVOID these overused phrases — they weaken academic prose:
 - "delves into..."
 - "a crucial factor..."
 - "a pivotal role..."
-- "underscores the importance of..."
 
-Instead, make direct statements. Say what the evidence shows, not that it "underscores" or "sheds light on" something. Vary your sentence structures."""
+Make direct statements. Say what the evidence shows."""
 
 
 def _get_cluster(d):
@@ -122,13 +124,10 @@ def _strip_orphaned_citations(text: str) -> str:
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        # Line is just a citation in parentheses with page
         if re.match(r'^\([A-Za-z0-9_&.\-]+:\s*p\.\d+\)$', stripped):
             continue
-        # Line is just a citation without page
         if re.match(r'^\([A-Za-z0-9_&]+_\d{4}[a-z]?\)$', stripped):
             continue
-        # Line is just "et al." style citation
         if re.match(r'^\([A-Za-z]+\s+et\s+al\.?,?\s*\d{4}\)$', stripped):
             continue
         cleaned.append(line)
@@ -146,7 +145,9 @@ def _strip_continuation_markers(text: str) -> str:
         r'\.\.\.to be continued in the next section\.',
         r'Continued in next message\.\.\.?\s*',
         r'The discussion will continue.*?\.',
-        r'In the following section,?\s*$',
+        r'In the following section[s,]*\s*$',
+        r'This review will continue.*?\.',
+        r'As we continue our exploration.*?\.',
     ]
     for pattern in patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
@@ -290,7 +291,7 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
 
 
 # ============================================================
-# STANCE-AWARE PROMPTS
+# STANCE-AWARE PROMPTS WITH STRICT CITATION FORMAT
 # ============================================================
 
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, example_str: str):
@@ -298,7 +299,10 @@ def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, exampl
 
 This review examines a scholarly debate. {stance_summary}
 
-CITATION FORMAT — Use document IDs from the evidence: {example_str}
+CITATION FORMAT — You MUST use this exact format: {example_str}
+- Format: (AuthorName_Year: p.PageNumber)
+- Copy document IDs EXACTLY from the evidence below
+- Every citation needs underscore and page number
 
 Evidence to synthesize:
 {evidence}
@@ -307,7 +311,7 @@ Requirements:
 - 400-500 words
 - Frame the central question and why it matters
 - Introduce the key positions scholars take
-- Cite using EXACT document IDs from evidence
+- Cite using EXACT format: (DocId_Year: p.X)
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
@@ -322,7 +326,10 @@ Previous text ended with:
 
 Now present SUPPORTING arguments for the thesis. Theme: {cluster}
 
-CITATION FORMAT — Use document IDs from the evidence: {example_str}
+CITATION FORMAT — You MUST use this exact format: {example_str}
+- Format: (AuthorName_Year: p.PageNumber)
+- Copy document IDs EXACTLY from the evidence below
+- Every citation needs underscore and page number
 
 Evidence to synthesize (these scholars SUPPORT the thesis):
 {evidence}
@@ -331,7 +338,7 @@ Requirements:
 - 350-450 words
 - Present the mechanisms and evidence these scholars offer
 - Connect smoothly to previous text
-- Cite using EXACT document IDs from evidence
+- Cite using EXACT format: (DocId_Year: p.X)
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
@@ -346,17 +353,20 @@ Previous text ended with:
 
 Now present COUNTERARGUMENTS to the thesis. Theme: {cluster}
 
-CITATION FORMAT — Use document IDs from the evidence: {example_str}
+CITATION FORMAT — You MUST use this exact format: {example_str}
+- Format: (AuthorName_Year: p.PageNumber)
+- Copy document IDs EXACTLY from the evidence below
+- Every citation needs underscore and page number
 
 Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
 {evidence}
 
 Requirements:
 - 350-450 words
-- Present the objections, alternative explanations, or empirical challenges these scholars raise
-- Frame these as counterarguments: "However...", "Against this view...", "Critics argue..."
+- Present the objections, alternative explanations, or empirical challenges
+- Frame as counterarguments: "However...", "Against this view...", "Critics argue..."
 - Connect smoothly to previous text
-- Cite using EXACT document IDs from evidence
+- Cite using EXACT format: (DocId_Year: p.X)
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
@@ -371,17 +381,20 @@ Previous text ended with:
 
 Now present NUANCES and QUALIFICATIONS to the thesis. Theme: {cluster}
 
-CITATION FORMAT — Use document IDs from the evidence: {example_str}
+CITATION FORMAT — You MUST use this exact format: {example_str}
+- Format: (AuthorName_Year: p.PageNumber)
+- Copy document IDs EXACTLY from the evidence below
+- Every citation needs underscore and page number
 
 Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
 {evidence}
 
 Requirements:
 - 350-450 words
-- Present conditional factors, scope conditions, or contextual variations these scholars identify
+- Present conditional factors, scope conditions, or contextual variations
 - Frame as refinements: "The relationship proves more complex when...", "Context matters because..."
 - Connect smoothly to previous text
-- Cite using EXACT document IDs from evidence
+- Cite using EXACT format: (DocId_Year: p.X)
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
@@ -394,7 +407,10 @@ def _build_closing_prompt(topic: str, evidence: str, example_str: str, previous_
 Previous text ended with:
 ...{previous_tail}
 
-CITATION FORMAT — Use document IDs from the evidence: {example_str}
+CITATION FORMAT — You MUST use this exact format: {example_str}
+- Format: (AuthorName_Year: p.PageNumber)
+- Copy document IDs EXACTLY from the evidence below
+- Every citation needs underscore and page number
 
 Remaining evidence to integrate:
 {evidence}
@@ -404,7 +420,7 @@ Requirements:
 - Synthesize the debate: where do scholars agree, where do they diverge?
 - Identify gaps in the literature or unresolved questions
 - End with directions for future research
-- Cite using EXACT document IDs from evidence
+- Cite using EXACT format: (DocId_Year: p.X)
 - Write in flowing prose, no bullet points or headers
 - Do NOT write "In conclusion" or similar
 
@@ -499,7 +515,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         cluster = _get_cluster(d)
         stance_buckets[stance][cluster].append(d)
 
-    # Count for summary
     stance_counts = {s: sum(len(cl) for cl in clusters.values()) 
                      for s, clusters in stance_buckets.items()}
     
@@ -513,9 +528,8 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # BUILD CHUNK SEQUENCE: OPENING → SUPPORTS → CRITIQUES → COMPLICATES → CLOSING
     # ============================================================
     
-    chunk_plan = []  # List of (stance, cluster, docs, prompt_builder)
+    chunk_plan = []
     
-    # Rank clusters within each stance by total score
     def rank_clusters(stance):
         if stance not in stance_buckets:
             return []
@@ -525,19 +539,15 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             key=lambda kv: sum(_score_doc(x) for x in kv[1]),
             reverse=True
         )
-        # Limit clusters per stance
         max_per_stance = int(os.environ.get("RRR_WRITER_MAX_CLUSTERS_PER_STANCE", "3"))
         return ranked[:max_per_stance]
     
-    # Add supports chunks
     for cluster, cluster_docs in rank_clusters("supports"):
         chunk_plan.append(("supports", cluster, cluster_docs, _build_supports_prompt))
     
-    # Add critiques chunks
     for cluster, cluster_docs in rank_clusters("critiques"):
         chunk_plan.append(("critiques", cluster, cluster_docs, _build_critiques_prompt))
     
-    # Add complicates chunks
     for cluster, cluster_docs in rank_clusters("complicates"):
         chunk_plan.append(("complicates", cluster, cluster_docs, _build_complicates_prompt))
     
@@ -551,7 +561,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     total_repairs = 0
     total_placeholders_stripped = 0
     
-    # Helper for post-processing chunks
     def postprocess_chunk(chunk, chunk_docs):
         nonlocal total_repairs, total_placeholders_stripped, all_dump_citations
         
@@ -579,7 +588,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # ============================================================
     # GENERATE OPENING
     # ============================================================
-    # Use top docs from supports for opening evidence
     opening_docs = []
     for stance in ["supports", "complicates", "critiques"]:
         for cluster, cluster_docs in stance_buckets[stance].items():
@@ -630,7 +638,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # ============================================================
     # GENERATE CLOSING
     # ============================================================
-    # Use remaining tangential docs plus a sample from each stance
     closing_docs = []
     for d in docs:
         if _get_stance(d) == "tangential":
@@ -661,7 +668,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # ============================================================
     full_text = "\n\n".join(chunks)
     
-    # Global year->docid for final repair pass
     global_year_to_docid = _build_year_to_docid(docs)
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
     total_repairs += final_repairs
