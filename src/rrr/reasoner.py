@@ -9,7 +9,7 @@ _KEEP_ALIVE = "30m"
 
 
 class ClusteringFailedError(Exception):
-    """Raised when clustering fails after all retries — triggers full pipeline restart."""
+    """Raised when clustering fails after all retries - triggers full pipeline restart."""
     pass
 
 
@@ -40,7 +40,7 @@ def _build_prompt(evidence_texts: List[str], claim: str) -> str:
         "}\n\n"
         "Strict output rules:\n"
         "- The entire reply must be a SINGLE JSON object. No commentary, no explanations, no preambles.\n"
-        "- If you cannot fill a field, use an empty string or empty array [] — never omit the key.\n"
+        "- If you cannot fill a field, use an empty string or empty array [] - never omit the key.\n"
         "- Do not add text before or after the JSON. The system will reject any non-JSON tokens.\n\n"
         "After printing the JSON, output the word SUMMARY on a new line and then write your 2–6-sentence summary.\n"
     )
@@ -175,7 +175,7 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
     """
     Cluster mechanisms into themes.
     
-    Raises ClusteringFailedError after MAX_RETRIES failures — caller should restart pipeline.
+    Raises ClusteringFailedError after MAX_RETRIES failures - caller should restart pipeline.
     """
     mech_to_docs = {}
     for doc in doc_summaries:
@@ -611,7 +611,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             nd = notable(sec, 6)
             if nd:
                 lines.append("**Notable documents (by evidence relevance):**")
-                lines += [f"- {c} — avg score {s:.1f}" for c, s in nd] + [""]
+                lines += [f"- {c} - avg score {s:.1f}" for c, s in nd] + [""]
 
         return "\n".join(lines)
 

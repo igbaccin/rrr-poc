@@ -24,7 +24,7 @@ def render_markdown(obj, refs):
     lines = [f"### Claim / Topic\n{obj.get('claim') or obj.get('topic','')}\n"]
     for ev in obj.get('evidence', []):
         ref = refs.get(ev['doc_id'], ev['doc_id'])
-        lines.append(f"- p.{ev['page']} — {ref}")
+        lines.append(f"- p.{ev['page']} - {ref}")
         snippet = ev['text'][:350].replace("\n"," ")
         lines.append(f"  > {snippet}...\n")
     return "\n".join(lines)

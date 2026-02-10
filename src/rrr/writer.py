@@ -18,11 +18,11 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 
-_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES — MANDATORY:
+_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES - MANDATORY:
 
 You MUST cite using EXACTLY this format: (DocId_Year: p.X)
 
-_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES — MANDATORY:
+_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES - MANDATORY:
 
 You MUST cite using EXACTLY this format: (AuthorName_Year: p.X)
 
@@ -32,13 +32,13 @@ FORMAT PATTERNS:
 - Three+ authors: (FirstAuthorEtAl_YYYY: p.N)
 
 WRONG formats (NEVER use):
-- (2002: p.4) — missing author
-- Author (Year) — missing underscore and page
-- (AJR_2001) — no abbreviations
-- Author et al. (Year) — wrong format
-- (Author_Year: p.1, p.2) — only ONE page per citation
+- (2002: p.4) - missing author
+- Author (Year) - missing underscore and page
+- (AJR_2001) - no abbreviations
+- Author et al. (Year) - wrong format
+- (Author_Year: p.1, p.2) - only ONE page per citation
 
-CRITICAL — DO NOT FABRICATE:
+CRITICAL - DO NOT FABRICATE:
 1. ONLY cite documents that appear in the evidence provided below
 2. ONLY cite page numbers that appear in the evidence provided below
 3. If you cannot find a citation in the evidence, DO NOT INVENT ONE
@@ -47,7 +47,7 @@ CRITICAL — DO NOT FABRICATE:
 6. Never cite documents not explicitly listed in the evidence
 7. Copy document IDs CHARACTER-FOR-CHARACTER from the evidence
 
-PROSE QUALITY — Avoid overused phrases:
+PROSE QUALITY - Avoid overused phrases:
 - "This perspective underscores..."
 - "sheds light on..."
 - "It is worth noting..."
@@ -422,7 +422,7 @@ def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowe
 
 This review examines a scholarly debate. {stance_summary}
 
-ALLOWED CITATIONS — You may ONLY cite from this list:
+ALLOWED CITATIONS - You may ONLY cite from this list:
 {allowed_list}
 
 DO NOT cite any document or page not in this list. If unsure, omit the citation.
@@ -449,7 +449,7 @@ Previous text ended with:
 
 Now present SUPPORTING arguments for the thesis. Theme: {cluster}
 
-ALLOWED CITATIONS — You may ONLY cite from this list:
+ALLOWED CITATIONS - You may ONLY cite from this list:
 {allowed_list}
 
 DO NOT cite any document or page not in this list. DO NOT invent citations.
@@ -459,7 +459,7 @@ Evidence to synthesize (these scholars SUPPORT the thesis):
 
 Requirements:
 - 200-300 words
-- Synthesize the argument — make ONE coherent point, weaving sources together
+- Synthesize the argument - make ONE coherent point, weaving sources together
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
@@ -476,7 +476,7 @@ Previous text ended with:
 
 Now present COUNTERARGUMENTS to the thesis. Theme: {cluster}
 
-ALLOWED CITATIONS — You may ONLY cite from this list:
+ALLOWED CITATIONS - You may ONLY cite from this list:
 {allowed_list}
 
 DO NOT cite any document or page not in this list. DO NOT invent citations.
@@ -486,7 +486,7 @@ Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
 
 Requirements:
 - 200-300 words
-- Synthesize the counterargument — make ONE coherent point, weaving sources together
+- Synthesize the counterargument - make ONE coherent point, weaving sources together
 - Frame as counterarguments: "However...", "Against this view...", "Critics argue..."
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
@@ -504,7 +504,7 @@ Previous text ended with:
 
 Now present NUANCES and QUALIFICATIONS to the thesis. Theme: {cluster}
 
-ALLOWED CITATIONS — You may ONLY cite from this list:
+ALLOWED CITATIONS - You may ONLY cite from this list:
 {allowed_list}
 
 DO NOT cite any document or page not in this list. DO NOT invent citations.
@@ -514,7 +514,7 @@ Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
 
 Requirements:
 - 200-300 words
-- Synthesize the nuance — make ONE coherent point, weaving sources together
+- Synthesize the nuance - make ONE coherent point, weaving sources together
 - Frame as refinements: "The relationship proves more complex when...", "Context matters because..."
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
@@ -530,7 +530,7 @@ def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous
 Previous text ended with:
 ...{previous_tail}
 
-ALLOWED CITATIONS — You may ONLY cite from this list:
+ALLOWED CITATIONS - You may ONLY cite from this list:
 {allowed_list}
 
 DO NOT cite any document or page not in this list. DO NOT invent citations.
