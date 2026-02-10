@@ -1,6 +1,7 @@
 from typing import List
 import os, subprocess, json, re, ast, hashlib
 from rrr.utils import ensure_dir
+from rrr.stance import classify_stance
 
 _MODEL      = os.environ.get("RRR_MODEL", "mistral")
 _OPTIONS    = {"temperature": 0.0, "num_ctx": 32768}
@@ -114,26 +115,26 @@ def reason_over_evidence(evidence_texts: List[str], claim: str, model: str = _MO
     else:
         return out
 
-def _stance_signature(topic: str, quotes) -> str:
+def _mechanism_signature(topic: str, quotes) -> str:
     h = hashlib.sha256()
     h.update((topic or "").encode("utf-8"))
     for q in quotes:
         h.update(f"{q.get('doc_id','')}|{q.get('page','')}|{q.get('text','')}\n".encode("utf-8"))
     return h.hexdigest()[:16]
 
-def _stance_cache_path(doc_id: str, sig: str) -> str:
-    return os.path.join("runs", "cache", "stance", f"{doc_id}_{sig}.json")
+def _mechanism_cache_path(doc_id: str, sig: str) -> str:
+    return os.path.join("runs", "cache", "mechanisms", f"{doc_id}_{sig}.json")
 
-def _load_stance_cache(doc_id: str, sig: str):
+def _load_mechanism_cache(doc_id: str, sig: str):
     try:
-        with open(_stance_cache_path(doc_id, sig), encoding="utf-8") as f:
+        with open(_mechanism_cache_path(doc_id, sig), encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
-def _save_stance_cache(doc_id: str, sig: str, obj):
-    ensure_dir(os.path.join("runs", "cache", "stance"))
-    with open(_stance_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
+def _save_mechanism_cache(doc_id: str, sig: str, obj):
+    ensure_dir(os.path.join("runs", "cache", "mechanisms"))
+    with open(_mechanism_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 def _try_parse_cluster_json(raw: str, n_mechs: int, all_mechs: list):
@@ -217,7 +218,7 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
         "JSON:\n"
     )
     
-    MAX_RETRIES = 5  # Bumped from 3
+    MAX_RETRIES = 5
     mech_to_cluster = None
     
     for attempt in range(MAX_RETRIES):
@@ -247,11 +248,9 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
             print(f"[Clustering] Attempt {attempt+1}/{MAX_RETRIES} error: {e}")
             continue
     
-    # NO FALLBACK — raise error to trigger full pipeline restart
     if mech_to_cluster is None:
         raise ClusteringFailedError(f"Clustering failed after {MAX_RETRIES} attempts")
     
-    # Fill in any missing mechanisms
     for m in all_mechs:
         if m not in mech_to_cluster:
             mech_to_cluster[m] = "Other"
@@ -279,19 +278,16 @@ def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
     """Collect cited doc_ids from both correct and academic citation formats."""
     cited_docs = set()
     
-    # Correct format: (DocId: p.X)
     for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", text):
         did = m.group(1)
         if did in allowed_docs:
             cited_docs.add(did)
     
-    # Format without page: (DocId_Year)
     for m in re.finditer(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)", text):
         did = m.group(1)
         if did in allowed_docs:
             cited_docs.add(did)
     
-    # Academic format (parenthetical): (Author et al., Year)
     for m in re.finditer(r"\(([A-Za-z&]+(?:\s+et\s+al\.?)?)[,\s]+(\d{4})\)", text):
         author = m.group(1).lower().strip().rstrip('.')
         year = m.group(2)
@@ -299,7 +295,6 @@ def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
         if did:
             cited_docs.add(did)
     
-    # Academic format (inline): Author et al. (Year)
     for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4})\)", text):
         author = m.group(1).lower().strip().rstrip('.')
         year = m.group(2)
@@ -313,9 +308,7 @@ def _clean_latex(s: str) -> str:
     """Clean LaTeX artifacts from BibTeX strings."""
     if not s:
         return s
-    # Remove stray braces
     s = s.replace('{', '').replace('}', '')
-    # Common LaTeX diacritics
     replacements = [
         (r"\\'e", 'é'), (r"\\`e", 'è'), (r'\\"e', 'ë'), (r'\\^e', 'ê'),
         (r"\\'a", 'á'), (r"\\`a", 'à'), (r'\\"a', 'ä'), (r'\\^a', 'â'),
@@ -323,7 +316,7 @@ def _clean_latex(s: str) -> str:
         (r"\\'u", 'ú'), (r"\\`u", 'ù'), (r'\\"u', 'ü'), (r'\\^u', 'û'),
         (r"\\'i", 'í'), (r"\\`i", 'ì'), (r'\\"i', 'ï'), (r'\\^i', 'î'),
         (r'\\c{c}', 'ç'), (r'\\c{C}', 'Ç'),
-        (r'\\c{s}', 'ş'), (r'\\c{S}', 'Ş'),  # Turkish ş/Ş
+        (r'\\c{s}', 'ş'), (r'\\c{S}', 'Ş'),
         (r'\\v{s}', 'š'), (r'\\v{S}', 'Š'),
         (r'\\~n', 'ñ'), (r'\\~N', 'Ñ'),
         (r'\\ss', 'ß'),
@@ -332,7 +325,6 @@ def _clean_latex(s: str) -> str:
     ]
     for latex, char in replacements:
         s = s.replace(latex, char)
-    # Clean up any remaining backslashes before letters
     s = re.sub(r'\\([a-zA-Z])', r'\1', s)
     return s.strip()
 
@@ -343,7 +335,6 @@ def _cite_harvard(row):
         return "" if val.lower() == "nan" else val
     
     def clean_num(x):
-        """Convert '46.0' to '46' but leave other values alone."""
         val = s(x)
         if val.endswith('.0'):
             return val[:-2]
@@ -358,7 +349,6 @@ def _cite_harvard(row):
     number = clean_num(row.get("number"))
     pages = s(row.get("pages"))
     
-    # Format authors: "Surname, I., Surname, I. and Surname, I."
     if author_full:
         author_parts = [p.strip() for p in author_full.split(";") if p.strip()]
         formatted_authors = []
@@ -379,7 +369,6 @@ def _cite_harvard(row):
     else:
         author_str = authors_short or "[Unknown]"
     
-    # Build citation
     cite = f"{author_str} ({year})" if year else author_str
     
     if title:
@@ -401,8 +390,6 @@ def _cite_harvard(row):
 def _layered_t2_inner(args, meta_path, restart_attempt=0):
     """
     Inner implementation of layered_t2.
-    
-    Separated to allow restart wrapper to catch ClusteringFailedError.
     """
     import os, json
     import pandas as pd
@@ -483,57 +470,62 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             return (s[:n] + "…") if len(s) > n else s
         ev_texts = [f"[{q['doc_id']} p.{q['page']}]\n- {_clip(q['text'])}" for q in valid_quotes]
 
+        # ============================================================
+        # STANCE: Classify from abstract (cached by doc_id + topic)
+        # ============================================================
+        abstract_stance = classify_stance(did, topic)
+
+        # ============================================================
+        # MECHANISMS: Extract from snippets (unchanged logic)
+        # ============================================================
         topic_words = set(w.lower() for w in re.findall(r'\b\w{4,}\b', topic))
         topic_words_str = ", ".join(sorted(topic_words))
 
-        stance_prompt = (
-            "Extract the core analytical contribution from this document using ONLY the quotes provided.\n\n"
+        mechanism_prompt = (
+            "Extract the key causal mechanisms from this document using ONLY the quotes provided.\n\n"
             f"Topic:\n{topic}\n\n"
             "Quotes:\n" + "\n\n---\n\n".join(ev_texts) + "\n\n"
             "Return ONE JSON object:\n"
             "{\n"
-            '  "stance": "supports|challenges|refines|orthogonal",\n'
             '  "mechanisms": ["specific mechanism 1", "specific mechanism 2"]\n'
             "}\n\n"
             "Rules for mechanisms:\n"
-            "- Each mechanism must answer HOW or THROUGH WHAT, not just WHETHER the claim holds\n"
+            "- Each mechanism must answer HOW or THROUGH WHAT\n"
             "- Must contain at least one concrete noun NOT in this list: [" + topic_words_str + "]\n"
-            "- Do NOT restate the topic with synonyms. If your mechanism could describe ANY paper on this topic, it is too vague.\n"
-            "- Name a specific causal pathway, variable, condition, or empirical referent from the quotes\n"
-            "- BAD examples: 'institutions matter', 'institutions drive growth', 'institutions are important'\n"
-            "- GOOD examples: 'settler mortality shaped colonial institutions', 'property rights reduced transaction costs', 'guilds restricted market entry'\n"
+            "- Name a specific causal pathway, variable, condition, or empirical referent\n"
             "- 8-15 words per mechanism\n"
             "- Maximum 3 mechanisms per document\n"
         )
 
-        sig = _stance_signature(topic, valid_quotes)
-        cached = _load_stance_cache(did, sig)
-        if cached:
-            stance_obj = cached
+        sig = _mechanism_signature(topic, valid_quotes)
+        cached = _load_mechanism_cache(did, sig)
+        if cached and "mechanisms" in cached:
+            mechanisms = cached.get("mechanisms", [])
         else:
             try:
                 import ollama
                 res = ollama.chat(
                     model=_MODEL,
-                    messages=[{"role": "user", "content": stance_prompt}],
+                    messages=[{"role": "user", "content": mechanism_prompt}],
                     options=_OPTIONS, keep_alive=_KEEP_ALIVE, stream=False
                 )
-                stance_raw = res["message"]["content"].strip()
+                mech_raw = res["message"]["content"].strip()
                 try:
-                    stance_obj = json.loads(stance_raw[stance_raw.find("{"):])
+                    mech_obj = json.loads(mech_raw[mech_raw.find("{"):])
+                    mechanisms = mech_obj.get("mechanisms", [])
                 except Exception:
-                    stance_obj = {"stance": "mixed", "mechanisms": []}
+                    mechanisms = []
             except Exception:
-                stance_obj = {"stance": "mixed", "mechanisms": []}
-            _save_stance_cache(did, sig, stance_obj)
+                mechanisms = []
+            _save_mechanism_cache(did, sig, {"mechanisms": mechanisms})
 
         avg_score = sum(q.get("score", 0) for q in valid_quotes) / len(valid_quotes) if valid_quotes else 0
 
         return {
             "doc_id": did,
             "citation": refs.get(did, did),
-            "stance": stance_obj.get("stance", "mixed"),
-            "mechanisms": stance_obj.get("mechanisms", []),
+            "stance": abstract_stance,  # FROM ABSTRACT
+            "mechanisms": mechanisms,
             "quotes": valid_quotes,
             "avg_score": round(avg_score, 2)
         }
@@ -547,7 +539,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 doc_summaries.append(res)
 
     print("[Layered-T2] clustering mechanisms...")
-    # This can raise ClusteringFailedError — caught by wrapper
     mech_to_cluster = _cluster_mechanisms(doc_summaries, topic)
     
     for doc in doc_summaries:
@@ -567,6 +558,11 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     kept = len(doc_summaries)
     print(f"[Layered-T2] per-document sweep complete: {kept} docs summarised")
 
+    # Print stance distribution
+    from collections import Counter
+    stance_counts = Counter(d.get("stance", "tangential") for d in doc_summaries)
+    print(f"[Layered-T2] stance distribution: {dict(stance_counts)}")
+
     if kept < GLOBAL_MIN_DOCS:
         print("[Layered-T2] refusal=insufficient_global_evidence")
         write_run("T2_LAYERED_GLOBAL", topic, {"docs_seen": len(all_doc_ids), "docs_represented": kept},
@@ -576,7 +572,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     import collections
     def _render_review_narrative(topic, doc_summaries, meta_n_total):
         def norm(s): return re.sub(r"\s+"," ",(s or "").strip())
-        counts = collections.Counter(x.get("stance","mixed") for x in doc_summaries)
+        counts = collections.Counter(x.get("stance","tangential") for x in doc_summaries)
         
         cluster_counts = collections.Counter(x.get("cluster", "Other") for x in doc_summaries)
         
@@ -599,13 +595,13 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         lines.append(f"**Topic:** {topic}\n")
         lines.append(f"**Coverage:** {len(doc_summaries)} of {meta_n_total} documents.\n")
         lines.append("**Stance distribution:** " + ", ".join(
-            f"{k}: {counts.get(k,0)}" for k in ["supports","challenges","mixed","not_applicable"]
+            f"{k}: {counts.get(k,0)}" for k in ["supports","critiques","complicates","tangential"]
         ) + "\n")
         lines.append("**Thematic clusters:** " + ", ".join(
             f"{k} ({v})" for k, v in cluster_counts.most_common()
         ) + "\n")
         lines.append("---\n")
-        for sec in ["supports","challenges","mixed"]:
+        for sec in ["supports","critiques","complicates"]:
             if counts.get(sec,0)==0: continue
             lines.append(f"## {sec.capitalize()}\n")
             mechs = top_mechs(sec, 8)
@@ -621,11 +617,10 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     ensure_dir("runs")
     
-    # Save ledger WITH restart tracking
     ledger_data = {
         "topic": topic,
         "docs": doc_summaries,
-        "restarts_required": restart_attempt  # Track restarts for summariser
+        "restarts_required": restart_attempt
     }
     with open(os.path.join("runs","review_ledger.json"), "w", encoding="utf-8") as f:
         json.dump(ledger_data, f, indent=2, ensure_ascii=False)
@@ -637,7 +632,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     if not getattr(args, "narrative_only", False):
         md_lines = [f"# Literature Review\n", f"**Topic:** {topic}\n", f"\n**Coverage:** {kept} of {len(all_doc_ids)} documents.\n", "\n---\n"]
         def stance_key(s):
-            return {"supports":0, "mixed":1, "challenges":2, "not_applicable":3}.get(s.get("stance","mixed"), 1)
+            return {"supports":0, "complicates":1, "critiques":2, "tangential":3}.get(s.get("stance","tangential"), 3)
         for entry in sorted(doc_summaries, key=stance_key):
             md_lines.append(f"## {entry['citation']}")
             md_lines.append(f"**Stance:** {entry['stance']} | **Cluster:** {entry.get('cluster', 'Other')} | **Relevance:** {entry.get('avg_score', 0):.1f}")
@@ -674,7 +669,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             print(long_form)
             print("\n" + "="*80 + "\n")
 
-            # Build allowed docs and lookup
             allowed_docs = set()
             allowed_pages_by_doc = {}
             for d in doc_summaries:
@@ -693,7 +687,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                         allowed_docs.add(qdid)
                         allowed_pages_by_doc.setdefault(qdid, set()).add(pg)
 
-            # Use review_cited_docs.json if available, otherwise collect from text
             cited_docs_path = os.path.join("runs", "review_cited_docs.json")
             if os.path.isfile(cited_docs_path):
                 with open(cited_docs_path, "r", encoding="utf-8") as f:
@@ -714,10 +707,8 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 print("\n" + "="*80 + "\n")
                 return
 
-            # Build reference lines using Harvard format
             raw_ref_lines = [(did, refs.get(did, did)) for did in cited_docids]
             
-            # Sort alphabetically by surname (first part of doc_id)
             def sort_key(item):
                 did = item[0]
                 clean = did.replace("EtAl", "").replace("&", "")
@@ -726,7 +717,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             
             raw_ref_lines = sorted(raw_ref_lines, key=sort_key)
             
-            # Deduplicate by reference TEXT (catches Austin_2008a/b producing identical strings)
             seen_refs = set()
             ref_lines = []
             for did, rline in raw_ref_lines:
@@ -746,6 +736,25 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 for i, rline in enumerate(ref_lines, start=1):
                     f.write(f"{i}. {rline}\n")
 
+            # ============================================================
+            # E4 VALIDATION: Check stance-context mismatches
+            # ============================================================
+            try:
+                from rrr.e4_validate import validate_stance_context, generate_e4_report
+                stance_map = {d["doc_id"]: d.get("stance", "tangential") for d in doc_summaries}
+                violations = validate_stance_context(long_form, stance_map)
+                if violations:
+                    print("\n" + "="*80)
+                    print("E4 VALIDATION (stance-context mismatches)")
+                    print("="*80 + "\n")
+                    print(generate_e4_report(violations))
+                    with open(os.path.join("runs", "e4_violations.json"), "w", encoding="utf-8") as f:
+                        json.dump(violations, f, indent=2)
+                else:
+                    print("[E4] No stance-context mismatches detected.")
+            except ImportError:
+                pass  # e4_validate not available
+
         except Exception as e:
             print(f"[Layered-T2] writer failed: {e}")
 
@@ -753,9 +762,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 def layered_t2(args, meta_path):
     """
     Main entry point for layered T2 with automatic restart on clustering failure.
-    
-    If clustering fails after 5 retries, the entire pipeline restarts from scratch.
-    This is self-healing: fresh retrieval/mechanism extraction usually succeeds.
     """
     MAX_RESTARTS = 5
     
@@ -765,15 +771,14 @@ def layered_t2(args, meta_path):
                 print(f"[Layered-T2] === RESTART {restart_attempt}/{MAX_RESTARTS} ===")
             
             _layered_t2_inner(args, meta_path, restart_attempt)
-            return  # Success
+            return
             
         except ClusteringFailedError as e:
             print(f"[Layered-T2] {e}")
             if restart_attempt < MAX_RESTARTS - 1:
                 print(f"[Layered-T2] Restarting full pipeline...")
-                # Clear stance cache to get fresh mechanisms on restart
                 import shutil
-                cache_path = os.path.join("runs", "cache", "stance")
+                cache_path = os.path.join("runs", "cache", "mechanisms")
                 if os.path.isdir(cache_path):
                     shutil.rmtree(cache_path)
                 continue
