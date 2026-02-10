@@ -168,7 +168,7 @@ def _fix_ajr_abbreviation(text: str) -> tuple:
 def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
     """
     Normalize citation case to match corpus.
-    e.g., VanZanden_2009 → vanZanden_2009
+    e.g., VanZanden_2009 to vanZanden_2009
     Returns (fixed_text, fix_count).
     """
     lower_to_canonical = {did.lower(): did for did in allowed_docs}
