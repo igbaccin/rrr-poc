@@ -8,7 +8,7 @@ _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.35")),
+    "temperature": float(os.environ.get("RRR_WRITER_T", "0.45")),  # Slightly higher for prose variety
     "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
     "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
@@ -18,7 +18,6 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"([A-Za-z0-9_&.\-]+):\s*p\.(\d+)")
 
-# NO SPECIFIC DOC_IDS - prevents prompt leakage into output
 _SYSTEM_CITATION_INSTRUCTION = """You MUST cite using EXACTLY this format: (DocId_Year: p.X)
 
 The DocId comes from the evidence snippets provided — copy it EXACTLY as shown.
@@ -31,16 +30,22 @@ WRONG formats (NEVER use these):
 - Author et al. (Year) — WRONG, use (AuthorEtAl_Year: p.X) instead
 - (Author et al., Year) — WRONG, use (AuthorEtAl_Year: p.X) instead
 - (Author_Year: p.1, p.2, p.3) — WRONG, only ONE page per citation
+- Do NOT mention author names in prose that differ from the document ID
 
 CRITICAL RULES:
 1. Copy document IDs EXACTLY as they appear in the evidence snippets
 2. Do NOT invent or guess document IDs
 3. Only cite documents that appear in the provided evidence
-4. Each citation must have exactly ONE page number"""
+4. Each citation must have exactly ONE page number
+5. When mentioning authors in prose, derive the name from the document ID only"""
 
 
 def _get_cluster(d):
     return d.get("cluster", "Other") or "Other"
+
+
+def _get_stance(d):
+    return d.get("stance", "tangential") or "tangential"
 
 
 def _score_doc(d) -> float:
@@ -61,8 +66,10 @@ def _format_quote(q) -> str:
 
 
 def _format_doc_entry(d) -> str:
+    """Format doc entry with stance label for writer context."""
     did = str(d.get("doc_id", "")).strip()
-    lines = [f"[{did}]"]
+    stance = d.get("stance", "tangential")
+    lines = [f"[{did}] [STANCE: {stance.upper()}]"]
     qs = d.get("quotes") or []
     for q in qs[:4]:
         lines.append(f"  {_format_quote(q)}")
@@ -79,13 +86,11 @@ def _strip_wrapping(text: str) -> str:
 
 def _strip_placeholder_citations(text: str) -> str:
     """Remove placeholder citations that leaked from system prompt."""
-    # Pattern-based placeholders from system instruction
     text = re.sub(r'\s*\(DocId_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(AuthorName_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(AuthorEtAl_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_Year:\s*p\.[X\d]+\)', '', text)
-    # Also catch variations
-    text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)  # DocId_2021 etc
+    text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)
     return text
 
 
@@ -127,7 +132,6 @@ def _extract_citation_dumps(text: str):
     for line in lines:
         stripped = line.strip()
         
-        # Pattern 1: Single parenthesis with multiple comma-separated citations
         if stripped.startswith('(') and stripped.endswith(')') and ',' in stripped:
             inner = stripped[1:-1]
             cite_matches = re.findall(r'[A-Za-z0-9_&]+_\d{4}[a-z]?:\s*p\.\d+', inner)
@@ -136,14 +140,7 @@ def _extract_citation_dumps(text: str):
                     did = m.split(':')[0]
                     dump_citations.append(did)
                 continue
-            cite_matches_academic = re.findall(r'[A-Za-z&\s]+_\d{4}[a-z]?:\s*p\.\d+', inner)
-            if len(cite_matches_academic) >= 2:
-                for m in cite_matches_academic:
-                    did = m.split(':')[0].strip()
-                    dump_citations.append(did)
-                continue
         
-        # Pattern 2: Single doc with multiple pages
         if stripped.startswith('(') and stripped.endswith(')'):
             inner = stripped[1:-1]
             page_refs = re.findall(r'p\.\d+', inner)
@@ -153,7 +150,6 @@ def _extract_citation_dumps(text: str):
                     dump_citations.append(doc_match.group(1))
                 continue
         
-        # Pattern 3: Multiple separate parenthetical citations on one line
         paren_count = len(re.findall(r'\([A-Za-z]', stripped))
         if paren_count >= 3 and len(stripped) < 600:
             without_citations = re.sub(r'\([^)]+\)', '', stripped)
@@ -208,10 +204,10 @@ def _build_allowed_citations(docs):
     return allowed_pairs, allowed_docs, allowed_pages_by_doc
 
 
-def _build_example_citations_for_chunk(cluster_docs, allowed_pages_by_doc):
-    """Build example citations from THIS chunk's docs only — real examples from evidence."""
+def _build_example_citations(docs, allowed_pages_by_doc):
+    """Build example citations from docs — real examples from evidence."""
     examples = []
-    for d in cluster_docs[:3]:
+    for d in docs[:3]:
         did = str(d.get("doc_id", "")).strip()
         pgs = sorted(list(allowed_pages_by_doc.get(did, set())))
         if pgs:
@@ -219,32 +215,22 @@ def _build_example_citations_for_chunk(cluster_docs, allowed_pages_by_doc):
     return ", ".join(examples) if examples else "(AuthorName_Year: p.X)"
 
 
-def _build_year_to_docid_for_chunk(cluster_docs):
-    """
-    Build year -> doc_id mapping for a chunk.
-    Only includes unambiguous mappings (one doc per year).
-    """
+def _build_year_to_docid(docs):
+    """Build year -> doc_id mapping. Only includes unambiguous mappings."""
     year_to_docs = defaultdict(list)
-    for d in cluster_docs:
+    for d in docs:
         did = str(d.get("doc_id", "")).strip()
         if not did:
             continue
-        # Extract year from doc_id (last 4 digits before optional letter suffix)
         m = re.search(r'_(\d{4})[a-z]?$', did)
         if m:
             year = m.group(1)
             year_to_docs[year].append(did)
-    
-    # Only return unambiguous mappings
     return {year: docs[0] for year, docs in year_to_docs.items() if len(docs) == 1}
 
 
 def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
-    """
-    Repair (YEAR: p.X) -> (DocId_Year: p.X) using chunk context.
-    
-    Returns (repaired_text, repair_count).
-    """
+    """Repair (YEAR: p.X) -> (DocId_Year: p.X) using context."""
     repair_count = 0
     
     def replacer(m):
@@ -254,77 +240,130 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
         if year in year_to_docid:
             repair_count += 1
             return f"({year_to_docid[year]}: p.{page})"
-        return m.group(0)  # Leave unchanged if ambiguous
+        return m.group(0)
     
     repaired = re.sub(r'\((\d{4}):\s*p\.(\d+)\)', replacer, text)
     return repaired, repair_count
 
 
-def _build_opening_prompt(topic: str, cluster: str, evidence: str, example_str: str):
+# ============================================================
+# STANCE-AWARE PROMPTS
+# ============================================================
+
+def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, example_str: str):
     return f"""Write the opening section of a literature review on: {topic}
 
-Theme: {cluster}
+This review examines a scholarly debate. {stance_summary}
 
-CITATION FORMAT — Use these document IDs from the evidence: {example_str}
+CITATION FORMAT — Use document IDs from the evidence: {example_str}
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
 - 400-500 words
-- Cite using EXACT document IDs from the evidence above
-- Focus on the topic, not author names as sentence subjects
-- No headings, no bullets
+- Frame the central question and why it matters
+- Introduce the key positions scholars take
+- Cite using EXACT document IDs from evidence
+- Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
 Begin:"""
 
 
-def _build_continuation_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
+def _build_supports_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
 Previous text ended with:
 ...{previous_tail}
 
-Next theme: {cluster}
+Now present SUPPORTING arguments for the thesis. Theme: {cluster}
 
-CITATION FORMAT — Use these document IDs from the evidence: {example_str}
+CITATION FORMAT — Use document IDs from the evidence: {example_str}
 
-Evidence to synthesize:
+Evidence to synthesize (these scholars SUPPORT the thesis):
 {evidence}
 
 Requirements:
-- 400-500 words
-- Cite using EXACT document IDs from the evidence above
+- 350-450 words
+- Present the mechanisms and evidence these scholars offer
 - Connect smoothly to previous text
-- Focus on the topic, not author names as sentence subjects
-- No headings, no bullets
+- Cite using EXACT document IDs from evidence
+- Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
 Continue:"""
 
 
-def _build_closing_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
-    return f"""Write the final section of this literature review on: {topic}
+def _build_critiques_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
+    return f"""Continue this literature review on: {topic}
 
 Previous text ended with:
 ...{previous_tail}
 
-Final theme: {cluster}
+Now present COUNTERARGUMENTS to the thesis. Theme: {cluster}
 
-CITATION FORMAT — Use these document IDs from the evidence: {example_str}
+CITATION FORMAT — Use document IDs from the evidence: {example_str}
 
-Evidence to synthesize:
+Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
 {evidence}
 
 Requirements:
-- 400-500 words
-- Cite using EXACT document IDs from the evidence above
+- 350-450 words
+- Present the objections, alternative explanations, or empirical challenges these scholars raise
+- Frame these as counterarguments: "However...", "Against this view...", "Critics argue..."
 - Connect smoothly to previous text
-- Focus on the topic, not author names as sentence subjects
-- No headings, no bullets
-- End with open questions for future research
-- Do NOT write "In conclusion"
+- Cite using EXACT document IDs from evidence
+- Write in flowing prose, no bullet points or headers
+- End mid-thought for continuation
+
+Continue:"""
+
+
+def _build_complicates_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
+    return f"""Continue this literature review on: {topic}
+
+Previous text ended with:
+...{previous_tail}
+
+Now present NUANCES and QUALIFICATIONS to the thesis. Theme: {cluster}
+
+CITATION FORMAT — Use document IDs from the evidence: {example_str}
+
+Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
+{evidence}
+
+Requirements:
+- 350-450 words
+- Present conditional factors, scope conditions, or contextual variations these scholars identify
+- Frame as refinements: "The relationship proves more complex when...", "Context matters because..."
+- Connect smoothly to previous text
+- Cite using EXACT document IDs from evidence
+- Write in flowing prose, no bullet points or headers
+- End mid-thought for continuation
+
+Continue:"""
+
+
+def _build_closing_prompt(topic: str, evidence: str, example_str: str, previous_tail: str):
+    return f"""Write the closing section of this literature review on: {topic}
+
+Previous text ended with:
+...{previous_tail}
+
+CITATION FORMAT — Use document IDs from the evidence: {example_str}
+
+Remaining evidence to integrate:
+{evidence}
+
+Requirements:
+- 300-400 words
+- Synthesize the debate: where do scholars agree, where do they diverge?
+- Identify gaps in the literature or unresolved questions
+- End with directions for future research
+- Cite using EXACT document IDs from evidence
+- Write in flowing prose, no bullet points or headers
+- Do NOT write "In conclusion" or similar
 
 Continue:"""
 
@@ -363,19 +402,16 @@ def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
     """Collect cited doc_ids from both correct and academic citation formats."""
     cited_docs = set()
     
-    # Correct format: (DocId: p.X)
     for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", text):
         did = m.group(1)
         if did in allowed_docs:
             cited_docs.add(did)
     
-    # Format without page: (DocId_Year)
     for m in re.finditer(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)", text):
         did = m.group(1)
         if did in allowed_docs:
             cited_docs.add(did)
     
-    # Academic format (parenthetical): (Author et al., Year)
     for m in re.finditer(r"\(([A-Za-z&]+(?:\s+et\s+al\.?)?)[,\s]+(\d{4})\)", text):
         author = m.group(1).lower().strip().rstrip('.')
         year = m.group(2)
@@ -383,16 +419,7 @@ def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
         if did:
             cited_docs.add(did)
     
-    # Academic format (inline): Author et al. (Year)
     for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4})\)", text):
-        author = m.group(1).lower().strip().rstrip('.')
-        year = m.group(2)
-        did = author_year_to_docid.get((author, year))
-        if did:
-            cited_docs.add(did)
-    
-    # Also catch inline academic with page: Author (Year: p.X)
-    for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4}):\s*p\.\d+\)", text):
         author = m.group(1).lower().strip().rstrip('.')
         year = m.group(2)
         did = author_year_to_docid.get((author, year))
@@ -420,138 +447,195 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
     author_year_to_docid = _build_author_year_lookup(allowed_docs)
 
-    # Bucket docs by cluster
-    buckets = defaultdict(list)
+    # ============================================================
+    # BUCKET BY STANCE FIRST, THEN BY CLUSTER
+    # ============================================================
+    stance_buckets = defaultdict(lambda: defaultdict(list))
     for d in docs:
-        buckets[_get_cluster(d)].append(d)
+        stance = _get_stance(d)
+        cluster = _get_cluster(d)
+        stance_buckets[stance][cluster].append(d)
 
-    # Rank clusters by total relevance score
-    cluster_rank = sorted(
-        buckets.items(),
-        key=lambda kv: sum(_score_doc(x) for x in kv[1]),
-        reverse=True
-    )
+    # Count for summary
+    stance_counts = {s: sum(len(cl) for cl in clusters.values()) 
+                     for s, clusters in stance_buckets.items()}
+    
+    stance_summary = f"Of {len(docs)} sources, {stance_counts.get('supports', 0)} support the thesis, " \
+                     f"{stance_counts.get('critiques', 0)} offer critiques, and " \
+                     f"{stance_counts.get('complicates', 0)} add nuance or qualifications."
+    
+    print(f"[Writer] Stance distribution: {dict(stance_counts)}")
 
-    # Limit to top clusters
-    max_clusters = int(os.environ.get("RRR_WRITER_MAX_CLUSTERS", "8"))
-    cluster_rank = cluster_rank[:max_clusters]
+    # ============================================================
+    # BUILD CHUNK SEQUENCE: OPENING → SUPPORTS → CRITIQUES → COMPLICATES → CLOSING
+    # ============================================================
+    
+    chunk_plan = []  # List of (stance, cluster, docs, prompt_builder)
+    
+    # Rank clusters within each stance by total score
+    def rank_clusters(stance):
+        if stance not in stance_buckets:
+            return []
+        clusters = stance_buckets[stance]
+        ranked = sorted(
+            clusters.items(),
+            key=lambda kv: sum(_score_doc(x) for x in kv[1]),
+            reverse=True
+        )
+        # Limit clusters per stance
+        max_per_stance = int(os.environ.get("RRR_WRITER_MAX_CLUSTERS_PER_STANCE", "3"))
+        return ranked[:max_per_stance]
+    
+    # Add supports chunks
+    for cluster, cluster_docs in rank_clusters("supports"):
+        chunk_plan.append(("supports", cluster, cluster_docs, _build_supports_prompt))
+    
+    # Add critiques chunks
+    for cluster, cluster_docs in rank_clusters("critiques"):
+        chunk_plan.append(("critiques", cluster, cluster_docs, _build_critiques_prompt))
+    
+    # Add complicates chunks
+    for cluster, cluster_docs in rank_clusters("complicates"):
+        chunk_plan.append(("complicates", cluster, cluster_docs, _build_complicates_prompt))
+    
+    if not chunk_plan:
+        raise SystemExit("No documents to write about.")
 
-    if not cluster_rank:
-        raise SystemExit("No clusters found.")
-
-    print(f"[Writer] Generating {len(cluster_rank)} chunks (one per theme)...")
+    print(f"[Writer] Generating {len(chunk_plan) + 2} sections (opening + {len(chunk_plan)} stance sections + closing)...")
 
     chunks = []
     all_dump_citations = []
     total_repairs = 0
     total_placeholders_stripped = 0
     
-    for i, (cluster, cluster_docs) in enumerate(cluster_rank):
-        cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
+    # Helper for post-processing chunks
+    def postprocess_chunk(chunk, chunk_docs):
+        nonlocal total_repairs, total_placeholders_stripped, all_dump_citations
         
-        # Build examples and year->docid mapping for THIS chunk
-        example_str = _build_example_citations_for_chunk(cluster_docs_sorted, allowed_pages_by_doc)
-        year_to_docid = _build_year_to_docid_for_chunk(cluster_docs_sorted)
-        
-        evidence_lines = []
-        for d in cluster_docs_sorted:
-            evidence_lines.append(_format_doc_entry(d))
-        evidence = "\n\n".join(evidence_lines)
-
-        if i == 0:
-            prompt = _build_opening_prompt(topic, cluster, evidence, example_str)
-        elif i == len(cluster_rank) - 1:
-            previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-            prompt = _build_closing_prompt(topic, cluster, evidence, example_str, previous_tail)
-        else:
-            previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-            prompt = _build_continuation_prompt(topic, cluster, evidence, example_str, previous_tail)
-
-        try:
-            chunk = _ollama_chat(prompt)
-        except Exception as e:
-            print(f"[Writer] Chunk {i+1} failed: {e}")
-            continue
-
         chunk = _strip_wrapping(chunk)
         
-        # STRIP placeholder citations that leaked from prompt
         chunk_before = chunk
         chunk = _strip_placeholder_citations(chunk)
         placeholders_stripped = chunk_before.count('DocId_Year') + chunk_before.count('AuthorName_Year')
         total_placeholders_stripped += placeholders_stripped
         
-        # REPAIR year-only citations using chunk context
+        year_to_docid = _build_year_to_docid(chunk_docs)
         chunk, repair_count = _repair_year_only_citations(chunk, year_to_docid)
         total_repairs += repair_count
         
-        # Extract citation dumps before stripping
         chunk, dump_cites = _extract_citation_dumps(chunk)
         all_dump_citations.extend(dump_cites)
         
-        # Strip formal references sections
         chunk = _strip_references_section(chunk)
+        chunk = _strip_conclusion(chunk)
         
-        # Strip conclusions from non-final chunks
-        if i < len(cluster_rank) - 1:
-            chunk = _strip_conclusion(chunk)
+        return chunk, repair_count, placeholders_stripped
 
+    # ============================================================
+    # GENERATE OPENING
+    # ============================================================
+    # Use top docs from supports for opening evidence
+    opening_docs = []
+    for stance in ["supports", "complicates", "critiques"]:
+        for cluster, cluster_docs in stance_buckets[stance].items():
+            opening_docs.extend(sorted(cluster_docs, key=_score_doc, reverse=True)[:2])
+    opening_docs = sorted(opening_docs, key=_score_doc, reverse=True)[:6]
+    
+    example_str = _build_example_citations(opening_docs, allowed_pages_by_doc)
+    evidence = "\n\n".join(_format_doc_entry(d) for d in opening_docs)
+    
+    prompt = _build_opening_prompt(topic, stance_summary, evidence, example_str)
+    
+    try:
+        chunk = _ollama_chat(prompt)
+        chunk, repairs, placeholders = postprocess_chunk(chunk, opening_docs)
         word_count = _count_words(chunk)
-        notes = []
-        if repair_count > 0:
-            notes.append(f"repaired {repair_count}")
-        if placeholders_stripped > 0:
-            notes.append(f"stripped {placeholders_stripped} placeholders")
-        note_str = f" ({', '.join(notes)})" if notes else ""
-        print(f"[Writer] Chunk {i+1}/{len(cluster_rank)} ({cluster}): {word_count} words{note_str}")
-
+        print(f"[Writer] Opening: {word_count} words")
         chunks.append(chunk)
+    except Exception as e:
+        print(f"[Writer] Opening failed: {e}")
 
-    # Concatenate chunks
+    # ============================================================
+    # GENERATE STANCE SECTIONS
+    # ============================================================
+    for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
+        cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
+        
+        example_str = _build_example_citations(cluster_docs_sorted, allowed_pages_by_doc)
+        evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
+        
+        previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
+        prompt = prompt_builder(topic, cluster, evidence, example_str, previous_tail)
+        
+        try:
+            chunk = _ollama_chat(prompt)
+            chunk, repairs, placeholders = postprocess_chunk(chunk, cluster_docs_sorted)
+            word_count = _count_words(chunk)
+            notes = []
+            if repairs > 0:
+                notes.append(f"repaired {repairs}")
+            if placeholders > 0:
+                notes.append(f"stripped {placeholders}")
+            note_str = f" ({', '.join(notes)})" if notes else ""
+            print(f"[Writer] {stance.upper()}/{cluster}: {word_count} words{note_str}")
+            chunks.append(chunk)
+        except Exception as e:
+            print(f"[Writer] {stance}/{cluster} failed: {e}")
+
+    # ============================================================
+    # GENERATE CLOSING
+    # ============================================================
+    # Use remaining tangential docs plus a sample from each stance
+    closing_docs = []
+    for d in docs:
+        if _get_stance(d) == "tangential":
+            closing_docs.append(d)
+    closing_docs = sorted(closing_docs, key=_score_doc, reverse=True)[:4]
+    
+    if closing_docs:
+        example_str = _build_example_citations(closing_docs, allowed_pages_by_doc)
+        evidence = "\n\n".join(_format_doc_entry(d) for d in closing_docs)
+    else:
+        example_str = ""
+        evidence = "(No additional evidence for closing)"
+    
+    previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
+    prompt = _build_closing_prompt(topic, evidence, example_str, previous_tail)
+    
+    try:
+        chunk = _ollama_chat(prompt)
+        chunk, repairs, placeholders = postprocess_chunk(chunk, closing_docs)
+        word_count = _count_words(chunk)
+        print(f"[Writer] Closing: {word_count} words")
+        chunks.append(chunk)
+    except Exception as e:
+        print(f"[Writer] Closing failed: {e}")
+
+    # ============================================================
+    # FINAL ASSEMBLY
+    # ============================================================
     full_text = "\n\n".join(chunks)
     
-    # Build global year->docid for final pass (using all docs)
-    global_year_to_docid = {}
-    for d in docs:
-        did = str(d.get("doc_id", "")).strip()
-        if did:
-            m = re.search(r'_(\d{4})[a-z]?$', did)
-            if m:
-                year = m.group(1)
-                # Only add if not already present (avoid ambiguity)
-                if year not in global_year_to_docid:
-                    global_year_to_docid[year] = did
-    
-    # Final repair pass on full text
+    # Global year->docid for final repair pass
+    global_year_to_docid = _build_year_to_docid(docs)
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
     total_repairs += final_repairs
     
-    # Final placeholder strip pass
     full_text = _strip_placeholder_citations(full_text)
-    
-    # Final cleanup passes
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
     
     full_text = _strip_references_section(full_text)
     full_text = _strip_continuation_markers(full_text)
-    full_text = _strip_conclusion(full_text)
     
-    # Clean up extra whitespace
     full_text = re.sub(r'\n{3,}', '\n\n', full_text)
 
-    # Collect all cited docs
     cited_docs = _collect_cited_docs(full_text, allowed_docs, author_year_to_docid)
-    
-    # Add dump citations that are in allowed_docs
     for did in all_dump_citations:
         if did in allowed_docs:
             cited_docs.add(did)
-
-    # Dedupe and sort
     cited_docids = sorted(cited_docs)
 
-    # Stats
     total_words = _count_words(full_text)
 
     ensure_dir("runs")
@@ -559,12 +643,11 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(full_text)
 
-    # Save cited docs for reference builder
     with open("runs/review_cited_docs.json", "w", encoding="utf-8") as f:
         json.dump(cited_docids, f, indent=2)
 
     print(f"[Writer] review_composed.md written ({total_words} words).")
-    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} citations_repaired={total_repairs} placeholders_stripped={total_placeholders_stripped}")
+    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} repairs={total_repairs} placeholders={total_placeholders_stripped}")
     
     return out_path
 
