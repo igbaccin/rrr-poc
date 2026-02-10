@@ -18,43 +18,35 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 
-_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES - MANDATORY:
-
-You MUST cite using EXACTLY this format: (DocId_Year: p.X)
-
-_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES - MANDATORY:
-
-You MUST cite using EXACTLY this format: (AuthorName_Year: p.X)
-
-FORMAT PATTERNS:
-- Single author: (AuthorName_YYYY: p.N)
-- Multiple authors: (FirstAuthor&SecondAuthor_YYYY: p.N)
-- Three+ authors: (FirstAuthorEtAl_YYYY: p.N)
-
-WRONG formats (NEVER use):
-- (2002: p.4) - missing author
-- Author (Year) - missing underscore and page
-- (AJR_2001) - no abbreviations
-- Author et al. (Year) - wrong format
-- (Author_Year: p.1, p.2) - only ONE page per citation
-
-CRITICAL - DO NOT FABRICATE:
-1. ONLY cite documents that appear in the evidence provided below
-2. ONLY cite page numbers that appear in the evidence provided below
-3. If you cannot find a citation in the evidence, DO NOT INVENT ONE
-4. It is better to write a shorter paragraph than to fabricate a citation
-5. Never abbreviate document IDs
-6. Never cite documents not explicitly listed in the evidence
-7. Copy document IDs CHARACTER-FOR-CHARACTER from the evidence
-
-PROSE QUALITY - Avoid overused phrases:
-- "This perspective underscores..."
-- "sheds light on..."
-- "It is worth noting..."
-- "provides valuable insights..."
-- "a pivotal role..."
-
-Make direct statements. Say what the evidence shows."""
+_SYSTEM_CITATION_INSTRUCTION = (
+    "CITATION RULES - MANDATORY:\n\n"
+    "You MUST cite using EXACTLY this format: (AuthorName_Year: p.X)\n\n"
+    "FORMAT PATTERNS:\n"
+    "- Single author: (AuthorName_YYYY: p.N)\n"
+    "- Multiple authors: (FirstAuthor&SecondAuthor_YYYY: p.N)\n"
+    "- Three+ authors: (FirstAuthorEtAl_YYYY: p.N)\n\n"
+    "WRONG formats (NEVER use):\n"
+    "- (2002: p.4) - missing author\n"
+    "- Author (Year) - missing underscore and page\n"
+    "- (AJR_2001) - no abbreviations\n"
+    "- Author et al. (Year) - wrong format\n"
+    "- (Author_Year: p.1, p.2) - only ONE page per citation\n\n"
+    "CRITICAL - DO NOT FABRICATE:\n"
+    "1. ONLY cite documents that appear in the evidence provided below\n"
+    "2. ONLY cite page numbers that appear in the evidence provided below\n"
+    "3. If you cannot find a citation in the evidence, DO NOT INVENT ONE\n"
+    "4. It is better to write a shorter paragraph than to fabricate a citation\n"
+    "5. Never abbreviate document IDs\n"
+    "6. Never cite documents not explicitly listed in the evidence\n"
+    "7. Copy document IDs CHARACTER-FOR-CHARACTER from the evidence\n\n"
+    "PROSE QUALITY - Avoid overused phrases:\n"
+    "- This perspective underscores...\n"
+    "- sheds light on...\n"
+    "- It is worth noting...\n"
+    "- provides valuable insights...\n"
+    "- a pivotal role...\n\n"
+    "Make direct statements. Say what the evidence shows."
+)
 
 
 def _get_cluster(d):
@@ -72,7 +64,7 @@ def _score_doc(d) -> float:
 def _clip(s: str, n=260) -> str:
     s = (s or "").strip().replace("\n", " ")
     s = re.sub(r"\s+", " ", s)
-    return (s[:n] + "…") if len(s) > n else s
+    return (s[:n] + "...") if len(s) > n else s
 
 
 def _format_quote(q) -> str:
@@ -83,7 +75,7 @@ def _format_quote(q) -> str:
 
 
 def _format_doc_entry(d) -> str:
-    """Format doc entry with stance label for writer context."""
+    # Format doc entry with stance label for writer context.
     did = str(d.get("doc_id", "")).strip()
     stance = d.get("stance", "tangential")
     lines = [f"[{did}] [STANCE: {stance.upper()}]"]
@@ -94,7 +86,7 @@ def _format_doc_entry(d) -> str:
 
 
 def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
-    """Create explicit list of allowed citations for this chunk."""
+    # Create explicit list of allowed citations for this chunk.
     lines = []
     for d in docs:
         did = str(d.get("doc_id", "")).strip()
@@ -105,15 +97,8 @@ def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
     return "\n".join(lines)
 
 
-# ============================================================
-# NEW: ADAPTIVE CLUSTER COUNT BASED ON EVIDENCE DENSITY
-# ============================================================
-
 def _max_clusters_for_stance(n_docs: int) -> int:
-    """
-    Determine max clusters based on evidence density.
-    More docs = more clusters; fewer docs = consolidate into one section.
-    """
+    # Determine max clusters based on evidence density.
     if n_docs >= 15:
         return 3
     elif n_docs >= 8:
@@ -131,19 +116,20 @@ def _strip_wrapping(text: str) -> str:
 
 
 def _strip_placeholder_citations(text: str) -> str:
-    """Remove placeholder citations that leaked from system prompt."""
+    # Remove placeholder citations that leaked from system prompt.
     text = re.sub(r'\s*\(DocId_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(AuthorName_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(AuthorEtAl_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)
+    text = re.sub(r'\s*\(AuthorName_YYYY:\s*p\.N\)', '', text)
+    text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_YYYY:\s*p\.N\)', '', text)
+    text = re.sub(r'\s*\(FirstAuthorEtAl_YYYY:\s*p\.N\)', '', text)
     return text
 
+
 def _fix_ajr_abbreviation(text: str) -> tuple:
-    """
-    Fix AJR abbreviation to AcemogluEtAl.
-    Returns (fixed_text, fix_count).
-    """
+    # Fix AJR abbreviation to AcemogluEtAl. Returns (fixed_text, fix_count).
     fix_count = 0
     
     def replacer(m):
@@ -165,12 +151,9 @@ def _fix_ajr_abbreviation(text: str) -> tuple:
     
     return text, fix_count
 
+
 def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
-    """
-    Normalize citation case to match corpus.
-    e.g., VanZanden_2009 to vanZanden_2009
-    Returns (fixed_text, fix_count).
-    """
+    # Normalize citation case to match corpus. Returns (fixed_text, fix_count).
     lower_to_canonical = {did.lower(): did for did in allowed_docs}
     
     fix_count = 0
@@ -193,17 +176,14 @@ def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
     
     return text, fix_count
 
+
 def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
-    """
-    Remove sentences containing citations to documents not in corpus.
-    Returns (cleaned_text, list_of_removed).
-    """
+    # Remove sentences containing citations to documents not in corpus.
     allowed_lower = {did.lower() for did in allowed_docs}
     
     removed = []
     
     def find_invalid_citations_in_text(txt):
-        """Find all invalid citations in text."""
         invalid = []
         for m in re.finditer(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', txt):
             doc_id = m.group(1)
@@ -253,7 +233,7 @@ def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
 
 
 def _strip_orphaned_citations(text: str) -> str:
-    """Remove lines that are ONLY a citation."""
+    # Remove lines that are ONLY a citation.
     lines = text.split('\n')
     cleaned = []
     for line in lines:
@@ -269,7 +249,7 @@ def _strip_orphaned_citations(text: str) -> str:
 
 
 def _strip_continuation_markers(text: str) -> str:
-    """Remove 'to be continued' and similar markers."""
+    # Remove to be continued and similar markers.
     patterns = [
         r'\.\.\.?\s*to be continued.*?\n*',
         r'\(to be continued.*?\)',
@@ -290,7 +270,7 @@ def _strip_continuation_markers(text: str) -> str:
 
 
 def _strip_conclusion(text: str) -> str:
-    """Remove conclusion paragraphs."""
+    # Remove conclusion paragraphs.
     patterns = [
         r'\n\s*In conclusion[,.].*$',
         r'\n\s*To conclude[,.].*$',
@@ -302,7 +282,7 @@ def _strip_conclusion(text: str) -> str:
 
 
 def _extract_citation_dumps(text: str):
-    """Extract citation dump lines and return (cleaned_text, dump_citations)."""
+    # Extract citation dump lines and return (cleaned_text, dump_citations).
     lines = text.split('\n')
     cleaned = []
     dump_citations = []
@@ -345,7 +325,7 @@ def _extract_citation_dumps(text: str):
 
 
 def _strip_references_section(text: str) -> str:
-    """Remove formal References/Bibliography sections."""
+    # Remove formal References/Bibliography sections.
     patterns = [
         r'\n\s*References\s*:?\s*\n.*$',
         r'\n\s*Bibliography\s*:?\s*\n.*$',
@@ -383,7 +363,7 @@ def _build_allowed_citations(docs):
 
 
 def _build_year_to_docid(docs):
-    """Build year -> doc_id mapping. Only includes unambiguous mappings."""
+    # Build year -> doc_id mapping. Only includes unambiguous mappings.
     year_to_docs = defaultdict(list)
     for d in docs:
         did = str(d.get("doc_id", "")).strip()
@@ -397,7 +377,7 @@ def _build_year_to_docid(docs):
 
 
 def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
-    """Repair (YEAR: p.X) -> (DocId_Year: p.X) using context."""
+    # Repair (YEAR: p.X) -> (DocId_Year: p.X) using context.
     repair_count = 0
     
     def replacer(m):
@@ -412,10 +392,6 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
     repaired = re.sub(r'\((\d{4}):\s*p\.(\d+)\)', replacer, text)
     return repaired, repair_count
 
-
-# ============================================================
-# STANCE-AWARE PROMPTS — REDUCED WORD TARGETS
-# ============================================================
 
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
     return f"""Write the opening section of a literature review on: {topic}
@@ -487,7 +463,7 @@ Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
 Requirements:
 - 200-300 words
 - Synthesize the counterargument - make ONE coherent point, weaving sources together
-- Frame as counterarguments: "However...", "Against this view...", "Critics argue..."
+- Signal the shift from supporting to opposing views
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
@@ -515,7 +491,7 @@ Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
 Requirements:
 - 200-300 words
 - Synthesize the nuance - make ONE coherent point, weaving sources together
-- Frame as refinements: "The relationship proves more complex when...", "Context matters because..."
+- Show how these scholars qualify or add conditions to the main argument
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
@@ -545,7 +521,7 @@ Requirements:
 - End with directions for future research
 - ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
-- Do NOT write "In conclusion" or similar
+- Do NOT write In conclusion or similar
 
 Continue:"""
 
@@ -566,7 +542,7 @@ def _ollama_chat(prompt: str):
 
 
 def _build_author_year_lookup(allowed_docs):
-    """Build reverse lookup: (author, year) -> doc_id for academic citation matching."""
+    # Build reverse lookup: (author, year) -> doc_id for academic citation matching.
     author_year_to_docid = {}
     for did in allowed_docs:
         clean = did.replace("EtAl", "").replace("&", "")
@@ -581,7 +557,7 @@ def _build_author_year_lookup(allowed_docs):
 
 
 def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
-    """Collect cited doc_ids from both correct and academic citation formats."""
+    # Collect cited doc_ids from both correct and academic citation formats.
     cited_docs = set()
     
     for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", text):
@@ -629,9 +605,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
     author_year_to_docid = _build_author_year_lookup(allowed_docs)
 
-    # ============================================================
-    # BUCKET BY STANCE FIRST, THEN BY CLUSTER
-    # ============================================================
+    # Bucket by stance first, then by cluster
     stance_buckets = defaultdict(lambda: defaultdict(list))
     for d in docs:
         stance = _get_stance(d)
@@ -647,10 +621,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     
     print(f"[Writer] Stance distribution: {dict(stance_counts)}")
 
-    # ============================================================
-    # BUILD CHUNK SEQUENCE WITH ADAPTIVE CLUSTER COUNT
-    # ============================================================
-    
+    # Build chunk sequence with adaptive cluster count
     chunk_plan = []
     
     def rank_clusters(stance):
@@ -662,7 +633,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             key=lambda kv: sum(_score_doc(x) for x in kv[1]),
             reverse=True
         )
-        # ADAPTIVE: max clusters based on evidence density
         n_docs = stance_counts.get(stance, 0)
         max_clusters = _max_clusters_for_stance(n_docs)
         return ranked[:max_clusters]
@@ -679,7 +649,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     if not chunk_plan:
         raise SystemExit("No documents to write about.")
 
-    # Report adaptive cluster allocation
     supports_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "supports")
     critiques_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "critiques")
     complicates_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "complicates")
@@ -719,9 +688,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         
         return chunk, repair_count, placeholders_stripped, ajr_fixes
 
-    # ============================================================
-    # GENERATE OPENING
-    # ============================================================
+    # Generate opening
     opening_docs = []
     for stance in ["supports", "complicates", "critiques"]:
         for cluster, cluster_docs in stance_buckets[stance].items():
@@ -742,9 +709,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     except Exception as e:
         print(f"[Writer] Opening failed: {e}")
 
-    # ============================================================
-    # GENERATE STANCE SECTIONS
-    # ============================================================
+    # Generate stance sections
     for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
         cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
         
@@ -771,9 +736,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         except Exception as e:
             print(f"[Writer] {stance}/{cluster} failed: {e}")
 
-    # ============================================================
-    # GENERATE CLOSING
-    # ============================================================
+    # Generate closing
     closing_docs = []
     for d in docs:
         if _get_stance(d) == "tangential":
@@ -799,9 +762,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     except Exception as e:
         print(f"[Writer] Closing failed: {e}")
 
-    # ============================================================
-    # FINAL ASSEMBLY
-    # ============================================================
+    # Final assembly
     full_text = "\n\n".join(chunks)
     
     global_year_to_docid = _build_year_to_docid(docs)
@@ -815,12 +776,10 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
     
-    # TIER 2: Case normalization
     full_text, case_fixes = _normalize_citation_case(full_text, allowed_docs)
     if case_fixes > 0:
         print(f"[Writer] Case normalized: {case_fixes} citations")
     
-    # TIER 3: Remove invalid citations
     full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs)
     if removed_citations:
         print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
