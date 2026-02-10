@@ -8,7 +8,7 @@ _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.30")),  # Reduced from 0.35
+    "temperature": float(os.environ.get("RRR_WRITER_T", "0.30")),
     "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
     "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
@@ -22,18 +22,20 @@ _SYSTEM_CITATION_INSTRUCTION = """CITATION RULES — MANDATORY:
 
 You MUST cite using EXACTLY this format: (DocId_Year: p.X)
 
-Examples of CORRECT citations:
-- (North_1989: p.9)
-- (AcemogluEtAl_2001: p.19)
-- (North&Weingast_1989: p.28)
-- (Broadberry&Gupta_2006: p.9)
+_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES — MANDATORY:
+
+You MUST cite using EXACTLY this format: (AuthorName_Year: p.X)
+
+FORMAT PATTERNS:
+- Single author: (AuthorName_YYYY: p.N)
+- Multiple authors: (FirstAuthor&SecondAuthor_YYYY: p.N)
+- Three+ authors: (FirstAuthorEtAl_YYYY: p.N)
 
 WRONG formats (NEVER use):
 - (2002: p.4) — missing author
-- Kuznets (1973) — must be (Kuznets_1973: p.X)
-- (AJR_2001) — no abbreviations, use full doc_id
-- (North_1981: p.X) — WRONG if North_1981 is not in evidence
-- Author et al. (Year) — WRONG format
+- Author (Year) — missing underscore and page
+- (AJR_2001) — no abbreviations
+- Author et al. (Year) — wrong format
 - (Author_Year: p.1, p.2) — only ONE page per citation
 
 CRITICAL — DO NOT FABRICATE:
@@ -41,7 +43,7 @@ CRITICAL — DO NOT FABRICATE:
 2. ONLY cite page numbers that appear in the evidence provided below
 3. If you cannot find a citation in the evidence, DO NOT INVENT ONE
 4. It is better to write a shorter paragraph than to fabricate a citation
-5. Never abbreviate document IDs (no "AJR" — use "AcemogluEtAl")
+5. Never abbreviate document IDs
 6. Never cite documents not explicitly listed in the evidence
 7. Copy document IDs CHARACTER-FOR-CHARACTER from the evidence
 
@@ -103,6 +105,23 @@ def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
     return "\n".join(lines)
 
 
+# ============================================================
+# NEW: ADAPTIVE CLUSTER COUNT BASED ON EVIDENCE DENSITY
+# ============================================================
+
+def _max_clusters_for_stance(n_docs: int) -> int:
+    """
+    Determine max clusters based on evidence density.
+    More docs = more clusters; fewer docs = consolidate into one section.
+    """
+    if n_docs >= 15:
+        return 3
+    elif n_docs >= 8:
+        return 2
+    else:
+        return 1
+
+
 def _strip_wrapping(text: str) -> str:
     t = (text or "").strip()
     if t.startswith("```"):
@@ -120,11 +139,6 @@ def _strip_placeholder_citations(text: str) -> str:
     text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)
     return text
 
-
-# ============================================================
-# NEW: TIER 1 — AJR HARDCODE FIX (per-chunk, no corpus needed)
-# ============================================================
-
 def _fix_ajr_abbreviation(text: str) -> tuple:
     """
     Fix AJR abbreviation to AcemogluEtAl.
@@ -139,10 +153,8 @@ def _fix_ajr_abbreviation(text: str) -> tuple:
         fix_count += 1
         return f"(AcemogluEtAl_{year}: p.{page})"
     
-    # Pattern: (AJR_YYYY: p.X)
     text = re.sub(r'\(AJR_(\d{4}):\s*p\.(\d+)\)', replacer, text)
     
-    # Also catch without page: (AJR_YYYY)
     def replacer_no_page(m):
         nonlocal fix_count
         year = m.group(1)
@@ -153,18 +165,12 @@ def _fix_ajr_abbreviation(text: str) -> tuple:
     
     return text, fix_count
 
-
-# ============================================================
-# NEW: TIER 2 — CASE NORMALIZATION (needs allowed_docs)
-# ============================================================
-
 def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
     """
     Normalize citation case to match corpus.
     e.g., VanZanden_2009 → vanZanden_2009
     Returns (fixed_text, fix_count).
     """
-    # Build case-insensitive lookup
     lower_to_canonical = {did.lower(): did for did in allowed_docs}
     
     fix_count = 0
@@ -178,7 +184,7 @@ def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
         doc_lower = doc_id.lower()
         if doc_lower in lower_to_canonical:
             canonical = lower_to_canonical[doc_lower]
-            if canonical != doc_id:  # Case differs
+            if canonical != doc_id:
                 fix_count += 1
                 return f"({canonical}: p.{page})"
         return full_match
@@ -187,24 +193,14 @@ def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
     
     return text, fix_count
 
-
-# ============================================================
-# NEW: TIER 3 — INVALID CITATION REMOVAL (needs allowed_docs)
-# ============================================================
-
 def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
     """
     Remove sentences containing citations to documents not in corpus.
     Returns (cleaned_text, list_of_removed).
     """
-    # Build case-insensitive lookup for validation
     allowed_lower = {did.lower() for did in allowed_docs}
     
     removed = []
-    
-    # Split into sentences (rough but effective)
-    # We use a pattern that splits on . ! ? followed by space and capital letter
-    # But we need to be careful with abbreviations like "p." and "et al."
     
     def find_invalid_citations_in_text(txt):
         """Find all invalid citations in text."""
@@ -215,30 +211,21 @@ def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
                 invalid.append((m.start(), m.end(), doc_id, m.group(2)))
         return invalid
     
-    # Find all invalid citations
     invalid_citations = find_invalid_citations_in_text(text)
     
     if not invalid_citations:
         return text, []
     
-    # For each invalid citation, find and remove the containing sentence
-    # Work backwards to preserve indices
     lines = text.split('\n')
     cleaned_lines = []
     
     for line in lines:
-        # Check if this line contains any invalid citation
         line_invalid = find_invalid_citations_in_text(line)
         
         if not line_invalid:
             cleaned_lines.append(line)
             continue
         
-        # Split line into sentences and filter
-        # Simple sentence split: look for ". " followed by capital letter
-        # But preserve the line if only part is invalid
-        
-        # For simplicity: if line contains invalid citation, try to remove just that sentence
         sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', line)
         
         kept_sentences = []
@@ -256,11 +243,9 @@ def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
         
         if kept_sentences:
             cleaned_lines.append(' '.join(kept_sentences))
-        # If no sentences kept, line is dropped entirely
     
     cleaned_text = '\n'.join(cleaned_lines)
     
-    # Clean up any double spaces or awkward gaps
     cleaned_text = re.sub(r'  +', ' ', cleaned_text)
     cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
     
@@ -397,17 +382,6 @@ def _build_allowed_citations(docs):
     return allowed_pairs, allowed_docs, allowed_pages_by_doc
 
 
-def _build_example_citations(docs, allowed_pages_by_doc):
-    """Build example citations from docs — real examples from evidence."""
-    examples = []
-    for d in docs[:3]:
-        did = str(d.get("doc_id", "")).strip()
-        pgs = sorted(list(allowed_pages_by_doc.get(did, set())))
-        if pgs:
-            examples.append(f"({did}: p.{pgs[0]})")
-    return ", ".join(examples) if examples else "(AuthorName_Year: p.X)"
-
-
 def _build_year_to_docid(docs):
     """Build year -> doc_id mapping. Only includes unambiguous mappings."""
     year_to_docs = defaultdict(list)
@@ -440,7 +414,7 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
 
 
 # ============================================================
-# STANCE-AWARE PROMPTS WITH STRICT EVIDENCE CONSTRAINTS
+# STANCE-AWARE PROMPTS — REDUCED WORD TARGETS
 # ============================================================
 
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
@@ -457,7 +431,7 @@ Evidence to synthesize:
 {evidence}
 
 Requirements:
-- 300-400 words (shorter is fine if evidence is limited)
+- 200-300 words
 - Frame the central question and why it matters
 - Introduce the key positions scholars take
 - ONLY cite documents and pages from the allowed list above
@@ -484,8 +458,8 @@ Evidence to synthesize (these scholars SUPPORT the thesis):
 {evidence}
 
 Requirements:
-- 250-350 words (shorter is fine if evidence is limited)
-- Present the mechanisms and evidence these scholars offer
+- 200-300 words
+- Synthesize the argument — make ONE coherent point, weaving sources together
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
@@ -511,8 +485,8 @@ Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
 {evidence}
 
 Requirements:
-- 250-350 words (shorter is fine if evidence is limited)
-- Present the objections, alternative explanations, or empirical challenges
+- 200-300 words
+- Synthesize the counterargument — make ONE coherent point, weaving sources together
 - Frame as counterarguments: "However...", "Against this view...", "Critics argue..."
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
@@ -539,8 +513,8 @@ Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
 {evidence}
 
 Requirements:
-- 250-350 words (shorter is fine if evidence is limited)
-- Present conditional factors, scope conditions, or contextual variations
+- 200-300 words
+- Synthesize the nuance — make ONE coherent point, weaving sources together
 - Frame as refinements: "The relationship proves more complex when...", "Context matters because..."
 - Connect smoothly to previous text
 - ONLY cite documents and pages from the allowed list above
@@ -565,7 +539,7 @@ Remaining evidence to integrate:
 {evidence}
 
 Requirements:
-- 200-300 words
+- 150-200 words
 - Synthesize the debate: where do scholars agree, where do they diverge?
 - Identify gaps in the literature or unresolved questions
 - End with directions for future research
@@ -674,7 +648,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     print(f"[Writer] Stance distribution: {dict(stance_counts)}")
 
     # ============================================================
-    # BUILD CHUNK SEQUENCE: OPENING → SUPPORTS → CRITIQUES → COMPLICATES → CLOSING
+    # BUILD CHUNK SEQUENCE WITH ADAPTIVE CLUSTER COUNT
     # ============================================================
     
     chunk_plan = []
@@ -688,8 +662,10 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             key=lambda kv: sum(_score_doc(x) for x in kv[1]),
             reverse=True
         )
-        max_per_stance = int(os.environ.get("RRR_WRITER_MAX_CLUSTERS_PER_STANCE", "3"))
-        return ranked[:max_per_stance]
+        # ADAPTIVE: max clusters based on evidence density
+        n_docs = stance_counts.get(stance, 0)
+        max_clusters = _max_clusters_for_stance(n_docs)
+        return ranked[:max_clusters]
     
     for cluster, cluster_docs in rank_clusters("supports"):
         chunk_plan.append(("supports", cluster, cluster_docs, _build_supports_prompt))
@@ -703,6 +679,11 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     if not chunk_plan:
         raise SystemExit("No documents to write about.")
 
+    # Report adaptive cluster allocation
+    supports_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "supports")
+    critiques_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "critiques")
+    complicates_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "complicates")
+    print(f"[Writer] Adaptive clusters: supports={supports_clusters}, critiques={critiques_clusters}, complicates={complicates_clusters}")
     print(f"[Writer] Generating {len(chunk_plan) + 2} sections (opening + {len(chunk_plan)} stance sections + closing)...")
 
     chunks = []
@@ -717,26 +698,21 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         
         chunk = _strip_wrapping(chunk)
         
-        # Strip placeholder citations
         chunk_before = chunk
         chunk = _strip_placeholder_citations(chunk)
         placeholders_stripped = chunk_before.count('DocId_Year') + chunk_before.count('AuthorName_Year')
         total_placeholders_stripped += placeholders_stripped
         
-        # TIER 1: Fix AJR abbreviation (hardcoded, no corpus needed)
         chunk, ajr_fixes = _fix_ajr_abbreviation(chunk)
         total_ajr_fixes += ajr_fixes
         
-        # Year-only repairs
         year_to_docid = _build_year_to_docid(chunk_docs)
         chunk, repair_count = _repair_year_only_citations(chunk, year_to_docid)
         total_repairs += repair_count
         
-        # Extract citation dumps
         chunk, dump_cites = _extract_citation_dumps(chunk)
         all_dump_citations.extend(dump_cites)
         
-        # Basic cleanup
         chunk = _strip_orphaned_citations(chunk)
         chunk = _strip_references_section(chunk)
         chunk = _strip_continuation_markers(chunk)
@@ -829,12 +805,10 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # ============================================================
     full_text = "\n\n".join(chunks)
     
-    # Global year-only repair
     global_year_to_docid = _build_year_to_docid(docs)
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
     total_repairs += final_repairs
     
-    # Final AJR fix (in case any slipped through)
     full_text, final_ajr = _fix_ajr_abbreviation(full_text)
     total_ajr_fixes += final_ajr
     
@@ -842,23 +816,18 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
     
-    # ============================================================
-    # TIER 2: CASE NORMALIZATION (needs full allowed_docs)
-    # ============================================================
+    # TIER 2: Case normalization
     full_text, case_fixes = _normalize_citation_case(full_text, allowed_docs)
     if case_fixes > 0:
         print(f"[Writer] Case normalized: {case_fixes} citations")
     
-    # ============================================================
-    # TIER 3: REMOVE INVALID CITATIONS (needs full allowed_docs)
-    # ============================================================
+    # TIER 3: Remove invalid citations
     full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs)
     if removed_citations:
         print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
         for r in removed_citations:
             print(f"         - {r['doc_id']}: p.{r['page']}")
     
-    # Final cleanup
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
     full_text = _strip_continuation_markers(full_text)
