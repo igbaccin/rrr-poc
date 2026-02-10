@@ -736,6 +736,10 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 for i, rline in enumerate(ref_lines, start=1):
                     f.write(f"{i}. {rline}\n")
 
+        except Exception as e:
+            print(f"[Layered-T2] writer failed: {e}")
+
+
 def layered_t2(args, meta_path):
     """
     Main entry point for layered T2 with automatic restart on clustering failure.
