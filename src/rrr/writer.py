@@ -8,7 +8,7 @@ _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.45")),
+    "temperature": float(os.environ.get("RRR_WRITER_T", "0.35")),
     "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
     "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
