@@ -18,7 +18,9 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"([A-Za-z0-9_&.\-]+):\s*p\.(\d+)")
 
-_SYSTEM_CITATION_INSTRUCTION = """CITATION FORMAT IS MANDATORY. You MUST cite using EXACTLY this format: (DocId_Year: p.X)
+_SYSTEM_CITATION_INSTRUCTION = """CITATION RULES — MANDATORY:
+
+You MUST cite using EXACTLY this format: (DocId_Year: p.X)
 
 Examples of CORRECT citations:
 - (North_1989: p.9)
@@ -26,39 +28,27 @@ Examples of CORRECT citations:
 - (North&Weingast_1989: p.28)
 - (Broadberry&Gupta_2006: p.9)
 
-WRONG formats (NEVER use these):
-- (2002: p.4) — WRONG, missing author
-- Kuznets (1973) — WRONG, must be (Kuznets_1973: p.X)
-- (Temin 2002: p.4) — WRONG, missing underscore
-- Author et al. (Year) — WRONG
-- (Author et al., Year) — WRONG
-- (Broadberry & Gardner 2022: p.21) — WRONG, use (Broadberry&Gardner_2022: p.21)
-- (Author_Year: p.1, p.2) — WRONG, only ONE page per citation
+WRONG formats (NEVER use):
+- (2002: p.4) — missing author
+- Kuznets (1973) — must be (Kuznets_1973: p.X)
+- (AJR_2001) — no abbreviations, use full doc_id
+- (North_1981: p.X) — WRONG if North_1981 is not in evidence
+- Author et al. (Year) — WRONG format
+- (Author_Year: p.1, p.2) — only ONE page per citation
 
-CRITICAL RULES:
-1. Copy document IDs EXACTLY as they appear in the evidence snippets
-2. ALWAYS include underscore between name and year: Author_Year
-3. ALWAYS include page number with p. prefix
-4. Do NOT invent document IDs — only cite what is in the evidence
-5. Each citation must have exactly ONE page number
-6. Do NOT end paragraphs with bare citations — integrate them into sentences
+CRITICAL — DO NOT FABRICATE:
+1. ONLY cite documents that appear in the evidence provided below
+2. ONLY cite page numbers that appear in the evidence provided below
+3. If you cannot find a citation in the evidence, DO NOT INVENT ONE
+4. It is better to write a shorter paragraph than to fabricate a citation
+5. Never abbreviate document IDs (no "AJR" — use "AcemogluEtAl")
+6. Never cite documents not explicitly listed in the evidence
 
-PROSE QUALITY — Avoid these overused phrases:
+PROSE QUALITY — Avoid overused phrases:
 - "This perspective underscores..."
-- "This finding suggests..."
 - "sheds light on..."
 - "It is worth noting..."
-- "It is important to note..."
-- "This assertion is supported by..."
-- "In this regard..."
-- "In a similar vein..."
-- "This notion aligns with..."
-- "This sentiment is echoed by..."
-- "lends support to..."
 - "provides valuable insights..."
-- "offers compelling insights..."
-- "delves into..."
-- "a crucial factor..."
 - "a pivotal role..."
 
 Make direct statements. Say what the evidence shows."""
@@ -97,6 +87,18 @@ def _format_doc_entry(d) -> str:
     qs = d.get("quotes") or []
     for q in qs[:4]:
         lines.append(f"  {_format_quote(q)}")
+    return "\n".join(lines)
+
+
+def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
+    """Create explicit list of allowed citations for this chunk."""
+    lines = []
+    for d in docs:
+        did = str(d.get("doc_id", "")).strip()
+        pages = sorted(list(allowed_pages_by_doc.get(did, set())))
+        if pages:
+            page_str = ", ".join(f"p.{p}" for p in pages[:6])
+            lines.append(f"  - {did}: {page_str}")
     return "\n".join(lines)
 
 
@@ -291,34 +293,34 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
 
 
 # ============================================================
-# STANCE-AWARE PROMPTS WITH STRICT CITATION FORMAT
+# STANCE-AWARE PROMPTS WITH STRICT EVIDENCE CONSTRAINTS
 # ============================================================
 
-def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, example_str: str):
+def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
     return f"""Write the opening section of a literature review on: {topic}
 
 This review examines a scholarly debate. {stance_summary}
 
-CITATION FORMAT — You MUST use this exact format: {example_str}
-- Format: (AuthorName_Year: p.PageNumber)
-- Copy document IDs EXACTLY from the evidence below
-- Every citation needs underscore and page number
+ALLOWED CITATIONS — You may ONLY cite from this list:
+{allowed_list}
+
+DO NOT cite any document or page not in this list. If unsure, omit the citation.
 
 Evidence to synthesize:
 {evidence}
 
 Requirements:
-- 400-500 words
+- 300-400 words (shorter is fine if evidence is limited)
 - Frame the central question and why it matters
 - Introduce the key positions scholars take
-- Cite using EXACT format: (DocId_Year: p.X)
+- ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
 Begin:"""
 
 
-def _build_supports_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
+def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
 Previous text ended with:
@@ -326,26 +328,26 @@ Previous text ended with:
 
 Now present SUPPORTING arguments for the thesis. Theme: {cluster}
 
-CITATION FORMAT — You MUST use this exact format: {example_str}
-- Format: (AuthorName_Year: p.PageNumber)
-- Copy document IDs EXACTLY from the evidence below
-- Every citation needs underscore and page number
+ALLOWED CITATIONS — You may ONLY cite from this list:
+{allowed_list}
+
+DO NOT cite any document or page not in this list. DO NOT invent citations.
 
 Evidence to synthesize (these scholars SUPPORT the thesis):
 {evidence}
 
 Requirements:
-- 350-450 words
+- 250-350 words (shorter is fine if evidence is limited)
 - Present the mechanisms and evidence these scholars offer
 - Connect smoothly to previous text
-- Cite using EXACT format: (DocId_Year: p.X)
+- ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
 Continue:"""
 
 
-def _build_critiques_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
+def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
 Previous text ended with:
@@ -353,27 +355,27 @@ Previous text ended with:
 
 Now present COUNTERARGUMENTS to the thesis. Theme: {cluster}
 
-CITATION FORMAT — You MUST use this exact format: {example_str}
-- Format: (AuthorName_Year: p.PageNumber)
-- Copy document IDs EXACTLY from the evidence below
-- Every citation needs underscore and page number
+ALLOWED CITATIONS — You may ONLY cite from this list:
+{allowed_list}
+
+DO NOT cite any document or page not in this list. DO NOT invent citations.
 
 Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
 {evidence}
 
 Requirements:
-- 350-450 words
+- 250-350 words (shorter is fine if evidence is limited)
 - Present the objections, alternative explanations, or empirical challenges
 - Frame as counterarguments: "However...", "Against this view...", "Critics argue..."
 - Connect smoothly to previous text
-- Cite using EXACT format: (DocId_Year: p.X)
+- ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
 Continue:"""
 
 
-def _build_complicates_prompt(topic: str, cluster: str, evidence: str, example_str: str, previous_tail: str):
+def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
 Previous text ended with:
@@ -381,46 +383,46 @@ Previous text ended with:
 
 Now present NUANCES and QUALIFICATIONS to the thesis. Theme: {cluster}
 
-CITATION FORMAT — You MUST use this exact format: {example_str}
-- Format: (AuthorName_Year: p.PageNumber)
-- Copy document IDs EXACTLY from the evidence below
-- Every citation needs underscore and page number
+ALLOWED CITATIONS — You may ONLY cite from this list:
+{allowed_list}
+
+DO NOT cite any document or page not in this list. DO NOT invent citations.
 
 Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
 {evidence}
 
 Requirements:
-- 350-450 words
+- 250-350 words (shorter is fine if evidence is limited)
 - Present conditional factors, scope conditions, or contextual variations
 - Frame as refinements: "The relationship proves more complex when...", "Context matters because..."
 - Connect smoothly to previous text
-- Cite using EXACT format: (DocId_Year: p.X)
+- ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
 - End mid-thought for continuation
 
 Continue:"""
 
 
-def _build_closing_prompt(topic: str, evidence: str, example_str: str, previous_tail: str):
+def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Write the closing section of this literature review on: {topic}
 
 Previous text ended with:
 ...{previous_tail}
 
-CITATION FORMAT — You MUST use this exact format: {example_str}
-- Format: (AuthorName_Year: p.PageNumber)
-- Copy document IDs EXACTLY from the evidence below
-- Every citation needs underscore and page number
+ALLOWED CITATIONS — You may ONLY cite from this list:
+{allowed_list}
+
+DO NOT cite any document or page not in this list. DO NOT invent citations.
 
 Remaining evidence to integrate:
 {evidence}
 
 Requirements:
-- 300-400 words
+- 200-300 words
 - Synthesize the debate: where do scholars agree, where do they diverge?
 - Identify gaps in the literature or unresolved questions
 - End with directions for future research
-- Cite using EXACT format: (DocId_Year: p.X)
+- ONLY cite documents and pages from the allowed list above
 - Write in flowing prose, no bullet points or headers
 - Do NOT write "In conclusion" or similar
 
@@ -594,10 +596,10 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             opening_docs.extend(sorted(cluster_docs, key=_score_doc, reverse=True)[:2])
     opening_docs = sorted(opening_docs, key=_score_doc, reverse=True)[:6]
     
-    example_str = _build_example_citations(opening_docs, allowed_pages_by_doc)
+    allowed_list = _list_allowed_citations(opening_docs, allowed_pages_by_doc)
     evidence = "\n\n".join(_format_doc_entry(d) for d in opening_docs)
     
-    prompt = _build_opening_prompt(topic, stance_summary, evidence, example_str)
+    prompt = _build_opening_prompt(topic, stance_summary, evidence, allowed_list)
     
     try:
         chunk = _ollama_chat(prompt)
@@ -614,11 +616,11 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
         cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
         
-        example_str = _build_example_citations(cluster_docs_sorted, allowed_pages_by_doc)
+        allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
         evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
         
         previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-        prompt = prompt_builder(topic, cluster, evidence, example_str, previous_tail)
+        prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail)
         
         try:
             chunk = _ollama_chat(prompt)
@@ -645,14 +647,14 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     closing_docs = sorted(closing_docs, key=_score_doc, reverse=True)[:4]
     
     if closing_docs:
-        example_str = _build_example_citations(closing_docs, allowed_pages_by_doc)
+        allowed_list = _list_allowed_citations(closing_docs, allowed_pages_by_doc)
         evidence = "\n\n".join(_format_doc_entry(d) for d in closing_docs)
     else:
-        example_str = ""
+        allowed_list = "(No additional citations for closing)"
         evidence = "(No additional evidence for closing)"
     
     previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-    prompt = _build_closing_prompt(topic, evidence, example_str, previous_tail)
+    prompt = _build_closing_prompt(topic, evidence, allowed_list, previous_tail)
     
     try:
         chunk = _ollama_chat(prompt)
