@@ -8,7 +8,7 @@ _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.45")),  # Slightly higher for prose variety
+    "temperature": float(os.environ.get("RRR_WRITER_T", "0.45")),
     "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
     "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
@@ -34,10 +34,32 @@ WRONG formats (NEVER use these):
 
 CRITICAL RULES:
 1. Copy document IDs EXACTLY as they appear in the evidence snippets
-2. Do NOT invent or guess document IDs
+2. Do NOT invent or guess document IDs — only cite what is in the evidence
 3. Only cite documents that appear in the provided evidence
 4. Each citation must have exactly ONE page number
-5. When mentioning authors in prose, derive the name from the document ID only"""
+5. When mentioning authors in prose, derive the name from the document ID only
+6. Do NOT end paragraphs with bare citations — integrate them into sentences
+
+AVOID these overused phrases — they weaken academic prose:
+- "This perspective underscores..."
+- "This finding suggests..."
+- "sheds light on..."
+- "It is worth noting..."
+- "It is important to note..."
+- "This assertion is supported by..."
+- "In this regard..."
+- "In a similar vein..."
+- "This notion aligns with..."
+- "This sentiment is echoed by..."
+- "lends support to..."
+- "provides valuable insights..."
+- "offers compelling insights..."
+- "delves into..."
+- "a crucial factor..."
+- "a pivotal role..."
+- "underscores the importance of..."
+
+Instead, make direct statements. Say what the evidence shows, not that it "underscores" or "sheds light on" something. Vary your sentence structures."""
 
 
 def _get_cluster(d):
@@ -94,6 +116,25 @@ def _strip_placeholder_citations(text: str) -> str:
     return text
 
 
+def _strip_orphaned_citations(text: str) -> str:
+    """Remove lines that are ONLY a citation."""
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Line is just a citation in parentheses with page
+        if re.match(r'^\([A-Za-z0-9_&.\-]+:\s*p\.\d+\)$', stripped):
+            continue
+        # Line is just a citation without page
+        if re.match(r'^\([A-Za-z0-9_&]+_\d{4}[a-z]?\)$', stripped):
+            continue
+        # Line is just "et al." style citation
+        if re.match(r'^\([A-Za-z]+\s+et\s+al\.?,?\s*\d{4}\)$', stripped):
+            continue
+        cleaned.append(line)
+    return '\n'.join(cleaned)
+
+
 def _strip_continuation_markers(text: str) -> str:
     """Remove 'to be continued' and similar markers."""
     patterns = [
@@ -104,6 +145,8 @@ def _strip_continuation_markers(text: str) -> str:
         r'we will delve deeper.*?\.',
         r'\.\.\.to be continued in the next section\.',
         r'Continued in next message\.\.\.?\s*',
+        r'The discussion will continue.*?\.',
+        r'In the following section,?\s*$',
     ]
     for pattern in patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
@@ -526,7 +569,9 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         chunk, dump_cites = _extract_citation_dumps(chunk)
         all_dump_citations.extend(dump_cites)
         
+        chunk = _strip_orphaned_citations(chunk)
         chunk = _strip_references_section(chunk)
+        chunk = _strip_continuation_markers(chunk)
         chunk = _strip_conclusion(chunk)
         
         return chunk, repair_count, placeholders_stripped
@@ -625,6 +670,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
     
+    full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
     full_text = _strip_continuation_markers(full_text)
     
