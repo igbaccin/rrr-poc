@@ -693,7 +693,6 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     total_ajr_fixes = 0
     
     def postprocess_chunk(chunk, chunk_docs):
-        """Per-chunk postprocessing (before join)."""
         nonlocal total_repairs, total_placeholders_stripped, all_dump_citations, total_ajr_fixes
         
         chunk = _strip_wrapping(chunk)
