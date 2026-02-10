@@ -8,7 +8,7 @@ _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.35")),
+    "temperature": float(os.environ.get("RRR_WRITER_T", "0.30")),  # Reduced from 0.35
     "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
     "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
@@ -16,7 +16,7 @@ _DEFAULT_CHAT_OPTIONS = {
 
 _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
-_CITE_RE = re.compile(r"([A-Za-z0-9_&.\-]+):\s*p\.(\d+)")
+_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 
 _SYSTEM_CITATION_INSTRUCTION = """CITATION RULES — MANDATORY:
 
@@ -43,6 +43,7 @@ CRITICAL — DO NOT FABRICATE:
 4. It is better to write a shorter paragraph than to fabricate a citation
 5. Never abbreviate document IDs (no "AJR" — use "AcemogluEtAl")
 6. Never cite documents not explicitly listed in the evidence
+7. Copy document IDs CHARACTER-FOR-CHARACTER from the evidence
 
 PROSE QUALITY — Avoid overused phrases:
 - "This perspective underscores..."
@@ -118,6 +119,152 @@ def _strip_placeholder_citations(text: str) -> str:
     text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_Year:\s*p\.[X\d]+\)', '', text)
     text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)
     return text
+
+
+# ============================================================
+# NEW: TIER 1 — AJR HARDCODE FIX (per-chunk, no corpus needed)
+# ============================================================
+
+def _fix_ajr_abbreviation(text: str) -> tuple:
+    """
+    Fix AJR abbreviation to AcemogluEtAl.
+    Returns (fixed_text, fix_count).
+    """
+    fix_count = 0
+    
+    def replacer(m):
+        nonlocal fix_count
+        year = m.group(1)
+        page = m.group(2)
+        fix_count += 1
+        return f"(AcemogluEtAl_{year}: p.{page})"
+    
+    # Pattern: (AJR_YYYY: p.X)
+    text = re.sub(r'\(AJR_(\d{4}):\s*p\.(\d+)\)', replacer, text)
+    
+    # Also catch without page: (AJR_YYYY)
+    def replacer_no_page(m):
+        nonlocal fix_count
+        year = m.group(1)
+        fix_count += 1
+        return f"(AcemogluEtAl_{year})"
+    
+    text = re.sub(r'\(AJR_(\d{4})\)', replacer_no_page, text)
+    
+    return text, fix_count
+
+
+# ============================================================
+# NEW: TIER 2 — CASE NORMALIZATION (needs allowed_docs)
+# ============================================================
+
+def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
+    """
+    Normalize citation case to match corpus.
+    e.g., VanZanden_2009 → vanZanden_2009
+    Returns (fixed_text, fix_count).
+    """
+    # Build case-insensitive lookup
+    lower_to_canonical = {did.lower(): did for did in allowed_docs}
+    
+    fix_count = 0
+    
+    def replacer(m):
+        nonlocal fix_count
+        full_match = m.group(0)
+        doc_id = m.group(1)
+        page = m.group(2)
+        
+        doc_lower = doc_id.lower()
+        if doc_lower in lower_to_canonical:
+            canonical = lower_to_canonical[doc_lower]
+            if canonical != doc_id:  # Case differs
+                fix_count += 1
+                return f"({canonical}: p.{page})"
+        return full_match
+    
+    text = re.sub(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', replacer, text)
+    
+    return text, fix_count
+
+
+# ============================================================
+# NEW: TIER 3 — INVALID CITATION REMOVAL (needs allowed_docs)
+# ============================================================
+
+def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
+    """
+    Remove sentences containing citations to documents not in corpus.
+    Returns (cleaned_text, list_of_removed).
+    """
+    # Build case-insensitive lookup for validation
+    allowed_lower = {did.lower() for did in allowed_docs}
+    
+    removed = []
+    
+    # Split into sentences (rough but effective)
+    # We use a pattern that splits on . ! ? followed by space and capital letter
+    # But we need to be careful with abbreviations like "p." and "et al."
+    
+    def find_invalid_citations_in_text(txt):
+        """Find all invalid citations in text."""
+        invalid = []
+        for m in re.finditer(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', txt):
+            doc_id = m.group(1)
+            if doc_id.lower() not in allowed_lower:
+                invalid.append((m.start(), m.end(), doc_id, m.group(2)))
+        return invalid
+    
+    # Find all invalid citations
+    invalid_citations = find_invalid_citations_in_text(text)
+    
+    if not invalid_citations:
+        return text, []
+    
+    # For each invalid citation, find and remove the containing sentence
+    # Work backwards to preserve indices
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        # Check if this line contains any invalid citation
+        line_invalid = find_invalid_citations_in_text(line)
+        
+        if not line_invalid:
+            cleaned_lines.append(line)
+            continue
+        
+        # Split line into sentences and filter
+        # Simple sentence split: look for ". " followed by capital letter
+        # But preserve the line if only part is invalid
+        
+        # For simplicity: if line contains invalid citation, try to remove just that sentence
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', line)
+        
+        kept_sentences = []
+        for sent in sentences:
+            sent_invalid = find_invalid_citations_in_text(sent)
+            if sent_invalid:
+                for _, _, doc_id, page in sent_invalid:
+                    removed.append({
+                        'doc_id': doc_id,
+                        'page': page,
+                        'sentence': sent[:100] + '...' if len(sent) > 100 else sent
+                    })
+            else:
+                kept_sentences.append(sent)
+        
+        if kept_sentences:
+            cleaned_lines.append(' '.join(kept_sentences))
+        # If no sentences kept, line is dropped entirely
+    
+    cleaned_text = '\n'.join(cleaned_lines)
+    
+    # Clean up any double spaces or awkward gaps
+    cleaned_text = re.sub(r'  +', ' ', cleaned_text)
+    cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
+    
+    return cleaned_text, removed
 
 
 def _strip_orphaned_citations(text: str) -> str:
@@ -562,30 +709,40 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     all_dump_citations = []
     total_repairs = 0
     total_placeholders_stripped = 0
+    total_ajr_fixes = 0
     
     def postprocess_chunk(chunk, chunk_docs):
-        nonlocal total_repairs, total_placeholders_stripped, all_dump_citations
+        """Per-chunk postprocessing (before join)."""
+        nonlocal total_repairs, total_placeholders_stripped, all_dump_citations, total_ajr_fixes
         
         chunk = _strip_wrapping(chunk)
         
+        # Strip placeholder citations
         chunk_before = chunk
         chunk = _strip_placeholder_citations(chunk)
         placeholders_stripped = chunk_before.count('DocId_Year') + chunk_before.count('AuthorName_Year')
         total_placeholders_stripped += placeholders_stripped
         
+        # TIER 1: Fix AJR abbreviation (hardcoded, no corpus needed)
+        chunk, ajr_fixes = _fix_ajr_abbreviation(chunk)
+        total_ajr_fixes += ajr_fixes
+        
+        # Year-only repairs
         year_to_docid = _build_year_to_docid(chunk_docs)
         chunk, repair_count = _repair_year_only_citations(chunk, year_to_docid)
         total_repairs += repair_count
         
+        # Extract citation dumps
         chunk, dump_cites = _extract_citation_dumps(chunk)
         all_dump_citations.extend(dump_cites)
         
+        # Basic cleanup
         chunk = _strip_orphaned_citations(chunk)
         chunk = _strip_references_section(chunk)
         chunk = _strip_continuation_markers(chunk)
         chunk = _strip_conclusion(chunk)
         
-        return chunk, repair_count, placeholders_stripped
+        return chunk, repair_count, placeholders_stripped, ajr_fixes
 
     # ============================================================
     # GENERATE OPENING
@@ -603,7 +760,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     
     try:
         chunk = _ollama_chat(prompt)
-        chunk, repairs, placeholders = postprocess_chunk(chunk, opening_docs)
+        chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, opening_docs)
         word_count = _count_words(chunk)
         print(f"[Writer] Opening: {word_count} words")
         chunks.append(chunk)
@@ -624,13 +781,15 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         
         try:
             chunk = _ollama_chat(prompt)
-            chunk, repairs, placeholders = postprocess_chunk(chunk, cluster_docs_sorted)
+            chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, cluster_docs_sorted)
             word_count = _count_words(chunk)
             notes = []
             if repairs > 0:
                 notes.append(f"repaired {repairs}")
             if placeholders > 0:
                 notes.append(f"stripped {placeholders}")
+            if ajr > 0:
+                notes.append(f"AJR fixed {ajr}")
             note_str = f" ({', '.join(notes)})" if notes else ""
             print(f"[Writer] {stance.upper()}/{cluster}: {word_count} words{note_str}")
             chunks.append(chunk)
@@ -658,7 +817,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     
     try:
         chunk = _ollama_chat(prompt)
-        chunk, repairs, placeholders = postprocess_chunk(chunk, closing_docs)
+        chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, closing_docs)
         word_count = _count_words(chunk)
         print(f"[Writer] Closing: {word_count} words")
         chunks.append(chunk)
@@ -670,14 +829,36 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     # ============================================================
     full_text = "\n\n".join(chunks)
     
+    # Global year-only repair
     global_year_to_docid = _build_year_to_docid(docs)
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
     total_repairs += final_repairs
+    
+    # Final AJR fix (in case any slipped through)
+    full_text, final_ajr = _fix_ajr_abbreviation(full_text)
+    total_ajr_fixes += final_ajr
     
     full_text = _strip_placeholder_citations(full_text)
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
     
+    # ============================================================
+    # TIER 2: CASE NORMALIZATION (needs full allowed_docs)
+    # ============================================================
+    full_text, case_fixes = _normalize_citation_case(full_text, allowed_docs)
+    if case_fixes > 0:
+        print(f"[Writer] Case normalized: {case_fixes} citations")
+    
+    # ============================================================
+    # TIER 3: REMOVE INVALID CITATIONS (needs full allowed_docs)
+    # ============================================================
+    full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs)
+    if removed_citations:
+        print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
+        for r in removed_citations:
+            print(f"         - {r['doc_id']}: p.{r['page']}")
+    
+    # Final cleanup
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
     full_text = _strip_continuation_markers(full_text)
@@ -701,7 +882,7 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         json.dump(cited_docids, f, indent=2)
 
     print(f"[Writer] review_composed.md written ({total_words} words).")
-    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} repairs={total_repairs} placeholders={total_placeholders_stripped}")
+    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} repairs={total_repairs} AJR={total_ajr_fixes} case={case_fixes} removed={len(removed_citations)}")
     
     return out_path
 
