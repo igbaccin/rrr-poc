@@ -382,8 +382,10 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
 # =============================================================================
 
 _PROSE_DIRECTIVE = (
-    "Write about phenomena, not authors. Sources belong in parentheses as evidence, "
-    "not as sentence subjects. Wrong: 'Smith argues that X.' Right: 'X occurs under Y conditions (Smith_1990: p.12).'"
+    "NEVER begin a sentence with an author name. "
+    "NEVER write 'X argues', 'X demonstrates', 'X highlights', 'X supports'. "
+    "State the claim, then cite: 'Structural change correlates with growth (Author_Year: p.N).' "
+    "All citations must use the (Author_Year: p.N) format. No other citation style."
 )
 
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
@@ -399,7 +401,7 @@ Evidence:
 
 {_PROSE_DIRECTIVE}
 
-Write 200-300 words. Frame the central question and its stakes. End mid-thought.
+Write 200-300 words. Establish the central question and its stakes. Introduce the main positions. End mid-thought—the argument continues.
 
 Begin:"""
 
@@ -420,7 +422,8 @@ Evidence:
 
 {_PROSE_DIRECTIVE}
 
-Write 200-300 words. Develop one coherent argument from this evidence. End mid-thought.
+DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
+Develop the argument directly. 200-300 words. End mid-thought.
 
 Continue:"""
 
@@ -441,7 +444,8 @@ Evidence:
 
 {_PROSE_DIRECTIVE}
 
-Write 200-300 words. Present the counterargument as a coherent position. End mid-thought.
+DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
+Present the counterargument directly. 200-300 words. End mid-thought.
 
 Continue:"""
 
@@ -462,7 +466,8 @@ Evidence:
 
 {_PROSE_DIRECTIVE}
 
-Write 200-300 words. Show how these qualifications reshape the main argument. End mid-thought.
+DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
+Show how these qualifications reshape the argument. 200-300 words. End mid-thought.
 
 Continue:"""
 
@@ -479,10 +484,12 @@ ALLOWED CITATIONS:
 Remaining evidence:
 {evidence}
 
-Write 150-200 words. Identify where scholars converge, where they diverge, and what remains unresolved. No "In conclusion."
+{_PROSE_DIRECTIVE}
+
+Write 150-200 words. Identify where scholars converge and diverge. State what remains unresolved. 
+Do NOT write "In conclusion" or "To summarize."
 
 Continue:"""
-
 
 def _ollama_chat(prompt: str):
     import ollama
