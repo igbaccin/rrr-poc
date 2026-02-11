@@ -8,7 +8,7 @@ _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.30")),
+    "temperature": float(os.environ.get("RRR_WRITER_T", "0.50")),  # v7: increased from 0.30
     "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
     "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
@@ -18,34 +18,17 @@ _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
 _CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 
+# v7: Streamlined system instruction - citation rules only, prose guidance moved to prompts
 _SYSTEM_CITATION_INSTRUCTION = (
-    "CITATION RULES - MANDATORY:\n\n"
-    "You MUST cite using EXACTLY this format: (AuthorName_Year: p.X)\n\n"
-    "FORMAT PATTERNS:\n"
-    "- Single author: (AuthorName_YYYY: p.N)\n"
-    "- Multiple authors: (FirstAuthor&SecondAuthor_YYYY: p.N)\n"
-    "- Three+ authors: (FirstAuthorEtAl_YYYY: p.N)\n\n"
-    "WRONG formats (NEVER use):\n"
-    "- (2002: p.4) - missing author\n"
-    "- Author (Year) - missing underscore and page\n"
-    "- (AJR_2001) - no abbreviations\n"
-    "- Author et al. (Year) - wrong format\n"
-    "- (Author_Year: p.1, p.2) - only ONE page per citation\n\n"
-    "CRITICAL - DO NOT FABRICATE:\n"
-    "1. ONLY cite documents that appear in the evidence provided below\n"
-    "2. ONLY cite page numbers that appear in the evidence provided below\n"
-    "3. If you cannot find a citation in the evidence, DO NOT INVENT ONE\n"
-    "4. It is better to write a shorter paragraph than to fabricate a citation\n"
-    "5. Never abbreviate document IDs\n"
-    "6. Never cite documents not explicitly listed in the evidence\n"
-    "7. Copy document IDs CHARACTER-FOR-CHARACTER from the evidence\n\n"
-    "PROSE QUALITY - Avoid overused phrases:\n"
-    "- This perspective underscores...\n"
-    "- sheds light on...\n"
-    "- It is worth noting...\n"
-    "- provides valuable insights...\n"
-    "- a pivotal role...\n\n"
-    "Make direct statements. Say what the evidence shows."
+    "CITATION FORMAT: (AuthorName_Year: p.N)\n"
+    "- Single author: (Smith_1990: p.12)\n"
+    "- Multiple authors: (North&Weingast_1989: p.28)\n"
+    "- Three+ authors: (AcemogluEtAl_2002: p.4)\n\n"
+    "RULES:\n"
+    "1. Only cite documents and pages from the evidence provided\n"
+    "2. Copy document IDs exactly as shown\n"
+    "3. One page per citation\n"
+    "4. If unsure, omit the citation entirely\n"
 )
 
 
@@ -125,6 +108,7 @@ def _strip_placeholder_citations(text: str) -> str:
     text = re.sub(r'\s*\(AuthorName_YYYY:\s*p\.N\)', '', text)
     text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_YYYY:\s*p\.N\)', '', text)
     text = re.sub(r'\s*\(FirstAuthorEtAl_YYYY:\s*p\.N\)', '', text)
+    text = re.sub(r'\s*\(Smith_1990:\s*p\.12\)', '', text)  # v7: catch example from system prompt
     return text
 
 
@@ -393,26 +377,29 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
     return repaired, repair_count
 
 
+# =============================================================================
+# v7: LEANER PROMPTS - Claims about phenomena, not scholars
+# =============================================================================
+
+_PROSE_DIRECTIVE = (
+    "Write about phenomena, not authors. Sources belong in parentheses as evidence, "
+    "not as sentence subjects. Wrong: 'Smith argues that X.' Right: 'X occurs under Y conditions (Smith_1990: p.12).'"
+)
+
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
-    return f"""Write the opening section of a literature review on: {topic}
+    return f"""Literature review on: {topic}
 
-This review examines a scholarly debate. {stance_summary}
+{stance_summary}
 
-ALLOWED CITATIONS - You may ONLY cite from this list:
+ALLOWED CITATIONS:
 {allowed_list}
 
-DO NOT cite any document or page not in this list. If unsure, omit the citation.
-
-Evidence to synthesize:
+Evidence:
 {evidence}
 
-Requirements:
-- 200-300 words
-- Frame the central question and why it matters
-- Introduce the key positions scholars take
-- ONLY cite documents and pages from the allowed list above
-- Write in flowing prose, no bullet points or headers
-- End mid-thought for continuation
+{_PROSE_DIRECTIVE}
+
+Write 200-300 words. Frame the central question and its stakes. End mid-thought.
 
 Begin:"""
 
@@ -420,26 +407,20 @@ Begin:"""
 def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
-Previous text ended with:
+Previous ending:
 ...{previous_tail}
 
-Now present SUPPORTING arguments for the thesis. Theme: {cluster}
+Theme: {cluster} — these sources SUPPORT the thesis.
 
-ALLOWED CITATIONS - You may ONLY cite from this list:
+ALLOWED CITATIONS:
 {allowed_list}
 
-DO NOT cite any document or page not in this list. DO NOT invent citations.
-
-Evidence to synthesize (these scholars SUPPORT the thesis):
+Evidence:
 {evidence}
 
-Requirements:
-- 200-300 words
-- Synthesize the argument - make ONE coherent point, weaving sources together
-- Connect smoothly to previous text
-- ONLY cite documents and pages from the allowed list above
-- Write in flowing prose, no bullet points or headers
-- End mid-thought for continuation
+{_PROSE_DIRECTIVE}
+
+Write 200-300 words. Develop one coherent argument from this evidence. End mid-thought.
 
 Continue:"""
 
@@ -447,27 +428,20 @@ Continue:"""
 def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
-Previous text ended with:
+Previous ending:
 ...{previous_tail}
 
-Now present COUNTERARGUMENTS to the thesis. Theme: {cluster}
+Theme: {cluster} — these sources CHALLENGE the thesis.
 
-ALLOWED CITATIONS - You may ONLY cite from this list:
+ALLOWED CITATIONS:
 {allowed_list}
 
-DO NOT cite any document or page not in this list. DO NOT invent citations.
-
-Evidence to synthesize (these scholars CHALLENGE or CRITIQUE the thesis):
+Evidence:
 {evidence}
 
-Requirements:
-- 200-300 words
-- Synthesize the counterargument - make ONE coherent point, weaving sources together
-- Signal the shift from supporting to opposing views
-- Connect smoothly to previous text
-- ONLY cite documents and pages from the allowed list above
-- Write in flowing prose, no bullet points or headers
-- End mid-thought for continuation
+{_PROSE_DIRECTIVE}
+
+Write 200-300 words. Present the counterargument as a coherent position. End mid-thought.
 
 Continue:"""
 
@@ -475,53 +449,37 @@ Continue:"""
 def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
     return f"""Continue this literature review on: {topic}
 
-Previous text ended with:
+Previous ending:
 ...{previous_tail}
 
-Now present NUANCES and QUALIFICATIONS to the thesis. Theme: {cluster}
+Theme: {cluster} — these sources ADD NUANCE to the thesis.
 
-ALLOWED CITATIONS - You may ONLY cite from this list:
+ALLOWED CITATIONS:
 {allowed_list}
 
-DO NOT cite any document or page not in this list. DO NOT invent citations.
-
-Evidence to synthesize (these scholars ADD NUANCE or COMPLICATE the thesis):
+Evidence:
 {evidence}
 
-Requirements:
-- 200-300 words
-- Synthesize the nuance - make ONE coherent point, weaving sources together
-- Show how these scholars qualify or add conditions to the main argument
-- Connect smoothly to previous text
-- ONLY cite documents and pages from the allowed list above
-- Write in flowing prose, no bullet points or headers
-- End mid-thought for continuation
+{_PROSE_DIRECTIVE}
+
+Write 200-300 words. Show how these qualifications reshape the main argument. End mid-thought.
 
 Continue:"""
 
 
 def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
-    return f"""Write the closing section of this literature review on: {topic}
+    return f"""Close this literature review on: {topic}
 
-Previous text ended with:
+Previous ending:
 ...{previous_tail}
 
-ALLOWED CITATIONS - You may ONLY cite from this list:
+ALLOWED CITATIONS:
 {allowed_list}
 
-DO NOT cite any document or page not in this list. DO NOT invent citations.
-
-Remaining evidence to integrate:
+Remaining evidence:
 {evidence}
 
-Requirements:
-- 150-200 words
-- Synthesize the debate: where do scholars agree, where do they diverge?
-- Identify gaps in the literature or unresolved questions
-- End with directions for future research
-- ONLY cite documents and pages from the allowed list above
-- Write in flowing prose, no bullet points or headers
-- Do NOT write In conclusion or similar
+Write 150-200 words. Identify where scholars converge, where they diverge, and what remains unresolved. No "In conclusion."
 
 Continue:"""
 
@@ -823,4 +781,3 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
 if __name__ == "__main__":
     compose_from_ledger()
-
