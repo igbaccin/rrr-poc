@@ -718,6 +718,13 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         
         previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
         prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail)
+
+        # DEBUG: Check Austin pages
+        if any('Austin_2008' in str(d.get('doc_id', '')) for d in cluster_docs_sorted):
+            print("=== DEBUG: AUSTIN IN THIS CHUNK ===")
+            print(f"Stance: {stance}, Cluster: {cluster}")
+            print(f"Allowed list:\n{allowed_list}")
+            print("=== END DEBUG ===")
         
         try:
             chunk = _ollama_chat(prompt)
