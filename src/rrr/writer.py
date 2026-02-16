@@ -752,7 +752,11 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     if case_fixes > 0:
         print(f"[Writer] Case normalized: {case_fixes} citations")
     
-    full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs)
+    # [BYPASS_PATCH] skip invalid-citation removal in bypass mode
+    if os.environ.get("RRR_BYPASS_VALIDATION", "0") == "1":
+        removed_citations = []
+    else:
+        full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs)
     if removed_citations:
         print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
         for r in removed_citations:
