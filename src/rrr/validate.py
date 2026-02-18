@@ -61,11 +61,7 @@ def validate_evidence_verbose(evidence, metadata_df, soft_threshold: float = 0.7
     return results
 
 # Backwards-compat wrapper (treat exact or soft_ok as ok)
-# [BYPASS_PATCH] RRR_BYPASS_VALIDATION support
 def validate_evidence(evidence, metadata_df, soft_threshold: float = 0.78):
-    # Bypass mode: accept all evidence without quote-on-page verification
-    if os.environ.get("RRR_BYPASS_VALIDATION", "0") == "1":
-        return [{"item": it, "ok": True, "reason": "bypass"} for it in evidence]
     out = []
     for r in validate_evidence_verbose(evidence, metadata_df, soft_threshold=soft_threshold):
         ok = r["verdict"] in ("exact","soft_ok")
