@@ -1,11 +1,28 @@
 from typing import List
-import os, subprocess, json, re, ast, hashlib
+import os, subprocess, json, re, ast, hashlib, time
 from rrr.utils import ensure_dir
 from rrr.stance import classify_stance
+from rrr.metrics import RunMetrics
+from rrr.paths import runs_path, logs_path
 
 _MODEL      = os.environ.get("RRR_MODEL", "mistral")
-_OPTIONS    = {"temperature": 0.0, "num_ctx": 32768}
+_OPTIONS_REASON = {
+    "temperature": 0.0,
+    "num_ctx": int(os.environ.get("RRR_REASONER_CTX", "8192")),
+    "num_predict": int(os.environ.get("RRR_REASONER_PRED", "2000")),
+}
+_OPTIONS_MECHANISM = {
+    "temperature": 0.0,
+    "num_ctx": int(os.environ.get("RRR_MECH_CTX", "4096")),
+    "num_predict": int(os.environ.get("RRR_MECH_PRED", "300")),
+}
+_OPTIONS_CLUSTER = {
+    "temperature": 0.0,
+    "num_ctx": int(os.environ.get("RRR_CLUSTER_CTX", "8192")),
+    "num_predict": int(os.environ.get("RRR_CLUSTER_PRED", "2500")),
+}
 _KEEP_ALIVE = "30m"
+_MECHANISM_PROMPT_VERSION = os.environ.get("RRR_MECH_PROMPT_VERSION", "2026-06-25-batch1")
 
 
 class ClusteringFailedError(Exception):
@@ -80,28 +97,43 @@ def _extract_json_and_summary(raw: str):
                 remainder = candidate.split("SUMMARY", 1)[-1].strip()
             return pretty, remainder
         except Exception:
-            os.makedirs("logs", exist_ok=True)
-            with open("logs/invalid_json.txt", "w", encoding="utf-8") as f:
+            ensure_dir(str(logs_path()))
+            with open(logs_path("invalid_json.txt"), "w", encoding="utf-8") as f:
                 f.write(raw)
             return None, raw.strip()
 
-def reason_over_evidence(evidence_texts: List[str], claim: str, model: str = _MODEL) -> str:
+def reason_over_evidence(evidence_texts: List[str], claim: str, model: str = _MODEL, metrics=None) -> str:
     if not evidence_texts:
         return "No evidence to reason over."
     prompt = _build_prompt(evidence_texts, claim)
+    start = time.perf_counter()
     try:
         import ollama
         res = ollama.chat(model=model,
                           messages=[{"role":"user","content":prompt}],
-                          options=_OPTIONS, keep_alive=_KEEP_ALIVE, stream=False)
+                          options=_OPTIONS_REASON, keep_alive=_KEEP_ALIVE, stream=False)
         out = res["message"]["content"].strip()
+        if metrics:
+            metrics.record_llm("reasoner", model, options=_OPTIONS_REASON,
+                               duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt), response_chars=len(out))
     except Exception as e_client:
         try:
+            sub_start = time.perf_counter()
             p = subprocess.run(["ollama","run", model],
                                input=prompt.encode("utf-8"),
                                capture_output=True, timeout=600)
             out = p.stdout.decode("utf-8").strip() or "(no output)"
+            if metrics:
+                metrics.record_llm("reasoner_subprocess", model,
+                                   duration_s=time.perf_counter() - sub_start,
+                                   prompt_chars=len(prompt), response_chars=len(out))
         except Exception as e_sub:
+            if metrics:
+                metrics.record_llm("reasoner", model, options=_OPTIONS_REASON,
+                                   success=False, duration_s=time.perf_counter() - start,
+                                   prompt_chars=len(prompt),
+                                   error=f"client {e_client}; fallback {e_sub}")
             return f"[reasoner error: client {e_client} ; fallback {e_sub}]"
     pretty_json, summary = _extract_json_and_summary(out)
     if pretty_json:
@@ -115,15 +147,16 @@ def reason_over_evidence(evidence_texts: List[str], claim: str, model: str = _MO
     else:
         return out
 
-def _mechanism_signature(topic: str, quotes) -> str:
+def _mechanism_signature(topic: str, quotes, model: str = _MODEL, prompt_version: str = _MECHANISM_PROMPT_VERSION) -> str:
     h = hashlib.sha256()
+    h.update(f"model={model}|prompt_version={prompt_version}\n".encode("utf-8"))
     h.update((topic or "").encode("utf-8"))
     for q in quotes:
         h.update(f"{q.get('doc_id','')}|{q.get('page','')}|{q.get('text','')}\n".encode("utf-8"))
     return h.hexdigest()[:16]
 
 def _mechanism_cache_path(doc_id: str, sig: str) -> str:
-    return os.path.join("runs", "cache", "mechanisms", f"{doc_id}_{sig}.json")
+    return str(runs_path("cache", "mechanisms", f"{doc_id}_{sig}.json"))
 
 def _load_mechanism_cache(doc_id: str, sig: str):
     try:
@@ -133,7 +166,7 @@ def _load_mechanism_cache(doc_id: str, sig: str):
         return None
 
 def _save_mechanism_cache(doc_id: str, sig: str, obj):
-    ensure_dir(os.path.join("runs", "cache", "mechanisms"))
+    ensure_dir(str(runs_path("cache", "mechanisms")))
     with open(_mechanism_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
@@ -171,7 +204,7 @@ def _try_parse_cluster_json(raw: str, n_mechs: int, all_mechs: list):
     
     return mech_to_cluster
 
-def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
+def _cluster_mechanisms(doc_summaries: list, topic: str, metrics=None) -> dict:
     """
     Cluster mechanisms into themes.
     
@@ -224,17 +257,23 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
     for attempt in range(MAX_RETRIES):
         try:
             import ollama
+            start = time.perf_counter()
             res = ollama.chat(
                 model=_MODEL,
                 messages=[{"role": "user", "content": cluster_prompt}],
-                options={"temperature": 0.0, "num_ctx": 16384, "num_predict": 6000},
+                options=_OPTIONS_CLUSTER,
                 keep_alive=_KEEP_ALIVE,
                 stream=False
             )
             raw = res["message"]["content"].strip()
+            if metrics:
+                metrics.record_llm("cluster", _MODEL, options=_OPTIONS_CLUSTER,
+                                   duration_s=time.perf_counter() - start,
+                                   prompt_chars=len(cluster_prompt),
+                                   response_chars=len(raw))
             
-            ensure_dir("logs")
-            with open(f"logs/cluster_raw_attempt{attempt+1}.txt", "w", encoding="utf-8") as f:
+            ensure_dir(str(logs_path()))
+            with open(logs_path(f"cluster_raw_attempt{attempt+1}.txt"), "w", encoding="utf-8") as f:
                 f.write(raw)
             
             mech_to_cluster = _try_parse_cluster_json(raw, n_mechs, all_mechs)
@@ -246,6 +285,9 @@ def _cluster_mechanisms(doc_summaries: list, topic: str) -> dict:
             
         except Exception as e:
             print(f"[Clustering] Attempt {attempt+1}/{MAX_RETRIES} error: {e}")
+            if metrics:
+                metrics.record_llm("cluster", _MODEL, options=_OPTIONS_CLUSTER,
+                                   success=False, error=e)
             continue
     
     if mech_to_cluster is None:
@@ -387,6 +429,41 @@ def _cite_harvard(row):
     return cite
 
 
+def _plan_probes(plan_obj: dict, topic: str, score_query: str) -> list:
+    probes = []
+    for item in plan_obj.get("probes", []) or []:
+        text = re.sub(r"\s+", " ", str(item or "").strip())
+        if text and text not in probes:
+            probes.append(text)
+    for item in [score_query, topic]:
+        text = re.sub(r"\s+", " ", str(item or "").strip())
+        if text and text not in probes:
+            probes.append(text)
+    return probes[:8] or [topic]
+
+
+def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int, metrics=None) -> list:
+    merged = {}
+    per_probe_topk = max(1, topk)
+    for probe in probes:
+        candidates = retrieve_fn(probe, topk=per_probe_topk, doc_id=doc_id)
+        if metrics:
+            metrics.inc("retrieval_probe_calls")
+            metrics.inc("retrieved_pages_raw", len(candidates))
+        for c in candidates:
+            key = (c.get("doc_id"), c.get("page"))
+            score = float(c.get("bm25_score", 0.0) or 0.0)
+            existing = merged.get(key)
+            if not existing or score > float(existing.get("bm25_score", 0.0) or 0.0):
+                item = dict(c)
+                item["matched_probes"] = [probe]
+                merged[key] = item
+            else:
+                existing.setdefault("matched_probes", []).append(probe)
+    ranked = sorted(merged.values(), key=lambda x: float(x.get("bm25_score", 0.0) or 0.0), reverse=True)
+    return ranked[:max(1, topk)]
+
+
 def _layered_t2_inner(args, meta_path, restart_attempt=0):
     """
     Inner implementation of layered_t2.
@@ -399,13 +476,20 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     from rrr.utils import ensure_dir, write_run, normalize_space
 
     topic = args.topic
-    df = pd.read_csv(meta_path)
-    df["doc_id"] = df["doc_id"].astype(str)
+    metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
+    metrics.set("restart_attempt", restart_attempt)
+
+    with metrics.stage("load_metadata"):
+        df = pd.read_csv(meta_path)
+        df["doc_id"] = df["doc_id"].astype(str)
 
     refs = {str(r["doc_id"]): _cite_harvard(r) for _, r in df.iterrows()}
     all_doc_ids = df["doc_id"].tolist()
+    metrics.set("metadata_path", str(meta_path))
+    metrics.set("docs_total", len(all_doc_ids))
 
-    ensure_dir("runs"); ensure_dir("runs/layered_docs")
+    ensure_dir(str(runs_path()))
+    ensure_dir(str(runs_path("layered_docs")))
 
     PER_DOC_TOPK = int(os.environ.get("RRR_PER_DOC_TOPK", "30"))
     MAX_SENTS_PER_PAGE = int(os.environ.get("RRR_MAX_SENTS_PAGE", "8"))
@@ -417,24 +501,38 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from rrr.query_planner import plan as plan_query
-    plan_obj = plan_query(topic)
+    with metrics.stage("planning"):
+        plan_obj = plan_query(topic, metrics=metrics)
     score_query = " ".join(plan_obj.get("keywords_must", []) + plan_obj.get("keywords_any", []))
     score_query = score_query.strip() or topic
+    probes = _plan_probes(plan_obj, topic, score_query)
+    plan_obj["active_probes"] = probes
+    metrics.set("planner_mode", plan_obj.get("planner_meta", {}).get("mode", "unknown"))
+    metrics.set("planner_probe_count", len(probes))
     print(f"[Layered-T2] score_query={score_query}")
+    print(f"[Layered-T2] probes={len(probes)}")
 
     MAX_WORKERS = int(os.environ.get("RRR_CONCURRENCY", "4"))
 
     print(f"[Layered-T2] starting per-document sweep over {len(all_doc_ids)} docs (concurrency={MAX_WORKERS})")
 
     def process_doc(did):
-        candidates = retrieve(score_query, topk=PER_DOC_TOPK, doc_id=did)
+        metrics.inc("docs_processed")
+        candidates = _retrieve_doc_with_probes(retrieve, did, probes, PER_DOC_TOPK, metrics=metrics)
+        metrics.inc("retrieved_pages_kept", len(candidates))
 
         quotes = []
         for c in candidates:
             txt = c.get("text", "").strip()
             if not txt:
                 continue
-            scored_sents = select_sentences(txt, topic, max_sentences=MAX_SENTS_PER_PAGE, min_chars=MIN_CHARS)
+            scored_sents = select_sentences(
+                txt,
+                topic,
+                max_sentences=MAX_SENTS_PER_PAGE,
+                min_chars=MIN_CHARS,
+                probes=probes,
+            )
             for sent, score in scored_sents:
                 s_norm = normalize_space(sent)
                 if len(s_norm) < MIN_CHARS:
@@ -446,6 +544,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                     "text": s_norm,
                     "score": score
                 })
+        metrics.inc("candidate_quotes", len(quotes))
 
         seen = {}
         for q in quotes:
@@ -455,16 +554,22 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         quotes = list(seen.values())
 
         if len(quotes) < MIN_DOC_SNIPS:
+            metrics.inc("docs_rejected_min_quotes")
             return None
 
         val = validate_evidence(quotes, df)
+        metrics.inc("validation_items", len(val))
+        metrics.inc("validation_ok", sum(1 for v in val if v["ok"]))
+        metrics.inc("validation_failed", sum(1 for v in val if not v["ok"]))
         valid_quotes = [v["item"] for v in val if v["ok"]]
         if len(valid_quotes) < MIN_DOC_SNIPS:
+            metrics.inc("docs_rejected_validation")
             return None
 
         valid_quotes = sorted(valid_quotes, key=lambda x: x.get("score", 0), reverse=True)
         EV_CAP = int(os.environ.get("RRR_EV_PER_DOC_CAP", "8"))
         valid_quotes = valid_quotes[:EV_CAP]
+        metrics.inc("valid_quotes_kept", len(valid_quotes))
 
         def _clip(s, n=220):
             return (s[:n] + "…") if len(s) > n else s
@@ -473,7 +578,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         # ============================================================
         # STANCE: Classify from abstract (cached by doc_id + topic)
         # ============================================================
-        abstract_stance = classify_stance(did, topic)
+        abstract_stance = classify_stance(did, topic, metrics=metrics)
 
         # ============================================================
         # MECHANISMS: Extract from snippets (unchanged logic)
@@ -499,28 +604,51 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
         sig = _mechanism_signature(topic, valid_quotes)
         cached = _load_mechanism_cache(did, sig)
-        if cached and "mechanisms" in cached:
+        if cached and cached.get("mechanisms"):
+            metrics.cache_event("mechanism", "hits")
             mechanisms = cached.get("mechanisms", [])
         else:
+            metrics.cache_event("mechanism", "misses")
             try:
                 import ollama
+                start = time.perf_counter()
                 res = ollama.chat(
                     model=_MODEL,
                     messages=[{"role": "user", "content": mechanism_prompt}],
-                    options=_OPTIONS, keep_alive=_KEEP_ALIVE, stream=False
+                    options=_OPTIONS_MECHANISM, keep_alive=_KEEP_ALIVE, stream=False
                 )
                 mech_raw = res["message"]["content"].strip()
+                metrics.record_llm("mechanism", _MODEL, options=_OPTIONS_MECHANISM,
+                                   duration_s=time.perf_counter() - start,
+                                   prompt_chars=len(mechanism_prompt),
+                                   response_chars=len(mech_raw))
                 try:
                     mech_obj = json.loads(mech_raw[mech_raw.find("{"):])
                     mechanisms = mech_obj.get("mechanisms", [])
                 except Exception:
                     mechanisms = []
-            except Exception:
+            except Exception as e:
                 mechanisms = []
-            _save_mechanism_cache(did, sig, {"mechanisms": mechanisms})
+                metrics.record_llm("mechanism", _MODEL, options=_OPTIONS_MECHANISM,
+                                   success=False, error=e)
+            if mechanisms:
+                _save_mechanism_cache(
+                    did,
+                    sig,
+                    {
+                        "mechanisms": mechanisms,
+                        "model": _MODEL,
+                        "prompt_version": _MECHANISM_PROMPT_VERSION,
+                    },
+                )
+                metrics.cache_event("mechanism", "writes")
+            else:
+                metrics.cache_event("mechanism", "skips")
+        metrics.inc("mechanisms_extracted", len(mechanisms))
 
         avg_score = sum(q.get("score", 0) for q in valid_quotes) / len(valid_quotes) if valid_quotes else 0
 
+        metrics.inc("docs_kept")
         return {
             "doc_id": did,
             "citation": refs.get(did, did),
@@ -531,15 +659,17 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         }
 
     doc_summaries = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(process_doc, did): did for did in all_doc_ids}
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res:
-                doc_summaries.append(res)
+    with metrics.stage("per_document_sweep"):
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(process_doc, did): did for did in all_doc_ids}
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res:
+                    doc_summaries.append(res)
 
     print("[Layered-T2] clustering mechanisms...")
-    mech_to_cluster = _cluster_mechanisms(doc_summaries, topic)
+    with metrics.stage("clustering"):
+        mech_to_cluster = _cluster_mechanisms(doc_summaries, topic, metrics=metrics)
     
     for doc in doc_summaries:
         primary = None
@@ -552,21 +682,26 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     for entry in doc_summaries:
         did = entry["doc_id"]
-        with open(os.path.join("runs", "layered_docs", f"{did}.json"), "w", encoding="utf-8") as f:
+        with open(runs_path("layered_docs", f"{did}.json"), "w", encoding="utf-8") as f:
             json.dump(entry, f, indent=2, ensure_ascii=False)
 
     kept = len(doc_summaries)
+    metrics.set("docs_represented", kept)
     print(f"[Layered-T2] per-document sweep complete: {kept} docs summarised")
 
     # Print stance distribution
     from collections import Counter
     stance_counts = Counter(d.get("stance", "tangential") for d in doc_summaries)
+    metrics.set("stance_distribution", dict(stance_counts))
     print(f"[Layered-T2] stance distribution: {dict(stance_counts)}")
 
     if kept < GLOBAL_MIN_DOCS:
         print("[Layered-T2] refusal=insufficient_global_evidence")
         write_run("T2_LAYERED_GLOBAL", topic, {"docs_seen": len(all_doc_ids), "docs_represented": kept},
                   {"refusal": True, "reason": "insufficient_global_evidence"})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", "insufficient_global_evidence")
+        metrics.save()
         return
 
     import collections
@@ -615,18 +750,23 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
         return "\n".join(lines)
 
-    ensure_dir("runs")
+    ensure_dir(str(runs_path()))
     
     ledger_data = {
         "topic": topic,
+        "plan": plan_obj,
+        "bypass_condition": os.environ.get("RRR_BYPASS_VALIDATION", "0") == "1",
         "docs": doc_summaries,
         "restarts_required": restart_attempt
     }
-    with open(os.path.join("runs","review_ledger.json"), "w", encoding="utf-8") as f:
-        json.dump(ledger_data, f, indent=2, ensure_ascii=False)
+    with metrics.stage("write_ledger"):
+        with open(runs_path("review_ledger.json"), "w", encoding="utf-8") as f:
+            json.dump(ledger_data, f, indent=2, ensure_ascii=False)
+        with open(runs_path("plan.json"), "w", encoding="utf-8") as f:
+            json.dump(plan_obj, f, indent=2, ensure_ascii=False)
 
     narrative_md = _render_review_narrative(topic, doc_summaries, len(all_doc_ids))
-    with open(os.path.join("runs","review_narrative.md"), "w", encoding="utf-8") as f:
+    with open(runs_path("review_narrative.md"), "w", encoding="utf-8") as f:
         f.write(narrative_md)
 
     if not getattr(args, "narrative_only", False):
@@ -643,7 +783,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 for q in entry["quotes"][:MD_QUOTE_CAP]:
                     md_lines.append(f"- p.{q['page']} [score={q.get('score',0):.0f}]: \"{q['text']}\"")
             md_lines.append("")
-        with open(os.path.join("runs","T2_review.md"), "w", encoding="utf-8") as f:
+        with open(runs_path("T2_review.md"), "w", encoding="utf-8") as f:
             f.write("\n".join(md_lines))
 
     if os.environ.get("RRR_WRITE_REVIEW", "0") != "1":
@@ -657,7 +797,8 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         from rrr.writer import compose_from_ledger
         print("[Layered-T2] composing long-form literature review...")
         try:
-            composed_path = compose_from_ledger(os.path.join("runs", "review_ledger.json"))
+            with metrics.stage("writing"):
+                composed_path = compose_from_ledger(str(runs_path("review_ledger.json")), metrics=metrics)
             print(f"[Layered-T2] composed review written at: {composed_path}")
 
             with open(composed_path, "r", encoding="utf-8") as f:
@@ -687,7 +828,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                         allowed_docs.add(qdid)
                         allowed_pages_by_doc.setdefault(qdid, set()).add(pg)
 
-            cited_docs_path = os.path.join("runs", "review_cited_docs.json")
+            cited_docs_path = str(runs_path("review_cited_docs.json"))
             if os.path.isfile(cited_docs_path):
                 with open(cited_docs_path, "r", encoding="utf-8") as f:
                     cited_docids = json.load(f)
@@ -697,14 +838,17 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 cited_docids = list(cited_docs)
 
             if not cited_docids:
-                ensure_dir("runs")
-                with open(os.path.join("runs", "review_reference_build.failures.txt"), "w", encoding="utf-8") as f:
+                ensure_dir(str(runs_path()))
+                with open(runs_path("review_reference_build.failures.txt"), "w", encoding="utf-8") as f:
                     f.write("No valid citations found in review_composed.md.\n")
                 print("\n" + "="*80)
                 print("REFERENCES (cited in review)")
                 print("="*80 + "\n")
                 print("[REFUSAL] No citations found. See runs/review_reference_build.failures.txt")
                 print("\n" + "="*80 + "\n")
+                metrics.set("refusal", True)
+                metrics.set("refusal_reason", "no_citations_found")
+                metrics.save()
                 return
 
             raw_ref_lines = [(did, refs.get(did, did)) for did in cited_docids]
@@ -731,13 +875,17 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 print(f"{i}. {rline}")
             print("\n" + "="*80 + "\n")
 
-            ensure_dir("runs")
-            with open(os.path.join("runs", "review_references.txt"), "w", encoding="utf-8") as f:
+            ensure_dir(str(runs_path()))
+            with open(runs_path("review_references.txt"), "w", encoding="utf-8") as f:
                 for i, rline in enumerate(ref_lines, start=1):
                     f.write(f"{i}. {rline}\n")
 
         except Exception as e:
             print(f"[Layered-T2] writer failed: {e}")
+            metrics.set("writer_error", str(e))
+
+    metrics.set("refusal", False)
+    metrics.save()
 
 
 def layered_t2(args, meta_path):
@@ -759,7 +907,7 @@ def layered_t2(args, meta_path):
             if restart_attempt < MAX_RESTARTS - 1:
                 print(f"[Layered-T2] Restarting full pipeline...")
                 import shutil
-                cache_path = os.path.join("runs", "cache", "mechanisms")
+                cache_path = str(runs_path("cache", "mechanisms"))
                 if os.path.isdir(cache_path):
                     shutil.rmtree(cache_path)
                 continue

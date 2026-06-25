@@ -40,7 +40,7 @@ def t1(args, meta_path):
         if not c["text"].strip(): continue
         sents = select_sentences(c["text"], args.claim, max_sentences=6)
         if not sents: continue
-        filtered.append({"doc_id": c["doc_id"], "page": c["page"], "text": " ".join(sents)})
+        filtered.append({"doc_id": c["doc_id"], "page": c["page"], "text": " ".join(s for s, _ in sents)})
     distinct_docs = {e["doc_id"] for e in filtered}
     total_snips = sum(ev["text"].count(". ") + 1 for ev in filtered)
     if len(distinct_docs) < MIN_DOCS or total_snips < MIN_SNIPS:
@@ -74,7 +74,7 @@ def t2(args, meta_path):
         if not c['text'].strip(): continue
         sents = select_sentences(c['text'], topic, max_sentences=8)
         if not sents: continue
-        filtered.append({"doc_id": c['doc_id'], "page": c['page'], "text": " ".join(sents)})
+        filtered.append({"doc_id": c['doc_id'], "page": c['page'], "text": " ".join(s for s, _ in sents)})
     distinct_docs = {e["doc_id"] for e in filtered}
     total_snips = sum(ev["text"].count(". ") + 1 for ev in filtered)
     if len(distinct_docs) < MIN_DOCS or total_snips < MIN_SNIPS:

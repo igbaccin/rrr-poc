@@ -1,6 +1,7 @@
 import argparse, os, pandas as pd, re
 from pdfminer.high_level import extract_text
 from rrr.utils import sha256_file, ensure_dir, save_json
+from rrr.paths import data_path
 from multiprocessing import Pool, cpu_count
 
 # Reference section markers (case-insensitive check done separately)
@@ -97,7 +98,7 @@ def _process_one(row_dict):
 
     # Clear old pages for this doc before writing new ones
     import glob
-    old_pages = glob.glob(f"data/page_text/{doc_id}_page_*.txt")
+    old_pages = glob.glob(str(data_path("page_text", f"{doc_id}_page_*.txt")))
     for old in old_pages:
         os.remove(old)
 
@@ -120,8 +121,8 @@ def _process_one(row_dict):
         
         # Write only content pages
         for i, ptxt in enumerate(content_pages, start=1):
-            outp = os.path.join("data/page_text", f"{doc_id}_page_{i}.txt")
-            ensure_dir(os.path.dirname(outp))
+            outp = data_path("page_text", f"{doc_id}_page_{i}.txt")
+            ensure_dir(os.path.dirname(str(outp)))
             with open(outp, "w", encoding="utf-8") as f:
                 f.write(ptxt)
         
@@ -133,7 +134,7 @@ def _process_one(row_dict):
             "total_pages": len(pages),
             "ref_pages_excluded": ref_pages
         }
-        save_json(meta, f"data/{doc_id}.json")
+        save_json(meta, str(data_path(f"{doc_id}.json")))
         
         status_note = f" (excl. {ref_pages} ref pages)" if ref_pages > 0 else ""
         return {"doc_id": doc_id, "ok": True, "pages": len(content_pages), "hash": h[:12], "ref_excluded": ref_pages}

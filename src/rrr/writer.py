@@ -3,6 +3,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from rrr.utils import ensure_dir
+from rrr.paths import runs_path
 
 _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
@@ -62,6 +63,11 @@ def _format_doc_entry(d) -> str:
     did = str(d.get("doc_id", "")).strip()
     stance = d.get("stance", "tangential")
     lines = [f"[{did}] [STANCE: {stance.upper()}]"]
+    mechanisms = [str(m).strip() for m in d.get("mechanisms", []) if str(m).strip()]
+    if mechanisms:
+        lines.append("  Mechanisms:")
+        for m in mechanisms[:2]:
+            lines.append(f"  - {_clip(m, n=180)}")
     qs = d.get("quotes") or []
     for q in qs[:4]:
         lines.append(f"  {_format_quote(q)}")
@@ -161,9 +167,11 @@ def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
     return text, fix_count
 
 
-def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
-    # Remove sentences containing citations to documents not in corpus.
+def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) -> tuple:
+    # Remove sentences containing citations outside the validated evidence set.
     allowed_lower = {did.lower() for did in allowed_docs}
+    lower_to_canonical = {did.lower(): did for did in allowed_docs}
+    allowed_pairs = set(allowed_pairs or [])
     
     removed = []
     
@@ -171,8 +179,13 @@ def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
         invalid = []
         for m in re.finditer(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', txt):
             doc_id = m.group(1)
+            page = int(m.group(2))
             if doc_id.lower() not in allowed_lower:
-                invalid.append((m.start(), m.end(), doc_id, m.group(2)))
+                invalid.append((m.start(), m.end(), doc_id, page, "unknown_doc"))
+                continue
+            canonical = lower_to_canonical.get(doc_id.lower(), doc_id)
+            if allowed_pairs and (canonical, page) not in allowed_pairs:
+                invalid.append((m.start(), m.end(), canonical, page, "invalid_page"))
         return invalid
     
     invalid_citations = find_invalid_citations_in_text(text)
@@ -190,16 +203,17 @@ def _remove_invalid_citations(text: str, allowed_docs: set) -> tuple:
             cleaned_lines.append(line)
             continue
         
-        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', line)
+        sentences = re.split(r'(?<=[.!?])\s+', line)
         
         kept_sentences = []
         for sent in sentences:
             sent_invalid = find_invalid_citations_in_text(sent)
             if sent_invalid:
-                for _, _, doc_id, page in sent_invalid:
+                for _, _, doc_id, page, reason in sent_invalid:
                     removed.append({
                         'doc_id': doc_id,
                         'page': page,
+                        'reason': reason,
                         'sentence': sent[:100] + '...' if len(sent) > 100 else sent
                     })
             else:
@@ -491,19 +505,140 @@ Do NOT write "In conclusion" or "To summarize."
 
 Continue:"""
 
-def _ollama_chat(prompt: str):
+
+# Batch-one prompt definitions. These names intentionally shadow the earlier
+# prompt builders so the writer uses mechanisms and stance-specific structures.
+def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
+    return f"""Literature review on: {topic}
+
+{stance_summary}
+
+ALLOWED CITATIONS:
+{allowed_list}
+
+Evidence:
+{evidence}
+
+{_PROSE_DIRECTIVE}
+
+Write 200-300 words. Establish the central question and its stakes. Introduce the main positions. End mid-thought, since the argument continues.
+
+Begin:"""
+
+
+def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
+    return f"""Continue this literature review on: {topic}
+
+Previous ending:
+...{previous_tail}
+
+Theme: {cluster}. These sources SUPPORT the thesis through corroborating mechanisms, measurements, or historical conditions.
+
+ALLOWED CITATIONS:
+{allowed_list}
+
+Evidence:
+{evidence}
+
+{_PROSE_DIRECTIVE}
+
+DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
+Lead with the shared mechanism, then connect the strongest quoted evidence to the historical claim. 200-300 words. End mid-thought.
+
+Continue:"""
+
+
+def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
+    return f"""Continue this literature review on: {topic}
+
+Previous ending:
+...{previous_tail}
+
+Theme: {cluster}. These sources CHALLENGE the thesis by identifying weak assumptions, alternative causes, or contrary evidence.
+
+ALLOWED CITATIONS:
+{allowed_list}
+
+Evidence:
+{evidence}
+
+{_PROSE_DIRECTIVE}
+
+DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
+Name the vulnerable assumption, develop the counter-evidence, and keep citations tied to concrete pages. 200-300 words. End mid-thought.
+
+Continue:"""
+
+
+def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
+    return f"""Continue this literature review on: {topic}
+
+Previous ending:
+...{previous_tail}
+
+Theme: {cluster}. These sources COMPLICATE the thesis by setting scope conditions, contingencies, or measurement limits.
+
+ALLOWED CITATIONS:
+{allowed_list}
+
+Evidence:
+{evidence}
+
+{_PROSE_DIRECTIVE}
+
+DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
+Show how the scope condition changes the interpretation without treating the evidence as a simple rejection. 200-300 words. End mid-thought.
+
+Continue:"""
+
+
+def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
+    return f"""Close this literature review on: {topic}
+
+Previous ending:
+...{previous_tail}
+
+ALLOWED CITATIONS:
+{allowed_list}
+
+Section claims and supporting evidence:
+{evidence}
+
+{_PROSE_DIRECTIVE}
+
+Write 150-200 words. Identify where scholars converge and diverge. State what remains unresolved.
+Do NOT write "In conclusion" or "To summarize."
+
+Continue:"""
+
+
+def _ollama_chat(prompt: str, metrics=None, stage="writer"):
     import ollama
-    res = ollama.chat(
-        model=_MODEL,
-        messages=[
-            {"role": "system", "content": _SYSTEM_CITATION_INSTRUCTION},
-            {"role": "user", "content": prompt}
-        ],
-        options=_DEFAULT_CHAT_OPTIONS,
-        keep_alive=_KEEP_ALIVE,
-        stream=False,
-    )
-    return (res.get("message", {}).get("content") or "").strip()
+    import time
+    start = time.perf_counter()
+    try:
+        res = ollama.chat(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_CITATION_INSTRUCTION},
+                {"role": "user", "content": prompt}
+            ],
+            options=_DEFAULT_CHAT_OPTIONS,
+            keep_alive=_KEEP_ALIVE,
+            stream=False,
+        )
+    except Exception as e:
+        if metrics:
+            metrics.record_llm(stage, _MODEL, options=_DEFAULT_CHAT_OPTIONS,
+                               success=False, duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt), error=e)
+        raise
+    out = (res.get("message", {}).get("content") or "").strip()
+    if metrics:
+        metrics.record_llm(stage, _MODEL, options=_DEFAULT_CHAT_OPTIONS,
+                           duration_s=time.perf_counter() - start,
+                           prompt_chars=len(prompt), response_chars=len(out))
+    return out
 
 
 def _build_author_year_lookup(allowed_docs):
@@ -552,7 +687,8 @@ def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
     return cited_docs
 
 
-def compose_from_ledger(ledger_path="runs/review_ledger.json"):
+def compose_from_ledger(ledger_path=None, metrics=None):
+    ledger_path = ledger_path or str(runs_path("review_ledger.json"))
     if not os.path.isfile(ledger_path):
         raise SystemExit(f"Ledger not found: {ledger_path}")
 
@@ -619,8 +755,16 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     complicates_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "complicates")
     print(f"[Writer] Adaptive clusters: supports={supports_clusters}, critiques={critiques_clusters}, complicates={complicates_clusters}")
     print(f"[Writer] Generating {len(chunk_plan) + 2} sections (opening + {len(chunk_plan)} stance sections + closing)...")
+    if metrics:
+        metrics.set("writer_chunk_plan", {
+            "supports": supports_clusters,
+            "critiques": critiques_clusters,
+            "complicates": complicates_clusters,
+            "total_stance_sections": len(chunk_plan),
+        })
 
     chunks = []
+    section_claims = []
     all_dump_citations = []
     total_repairs = 0
     total_placeholders_stripped = 0
@@ -666,13 +810,17 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     prompt = _build_opening_prompt(topic, stance_summary, evidence, allowed_list)
     
     try:
-        chunk = _ollama_chat(prompt)
+        chunk = _ollama_chat(prompt, metrics=metrics, stage="writer_opening")
         chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, opening_docs)
         word_count = _count_words(chunk)
         print(f"[Writer] Opening: {word_count} words")
         chunks.append(chunk)
+        if metrics:
+            metrics.inc("writer_sections_succeeded")
     except Exception as e:
         print(f"[Writer] Opening failed: {e}")
+        if metrics:
+            metrics.inc("writer_sections_failed")
 
     # Generate stance sections
     for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
@@ -684,15 +832,8 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
         previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
         prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail)
 
-        # DEBUG: Check Austin pages
-        if any('Austin_2008' in str(d.get('doc_id', '')) for d in cluster_docs_sorted):
-            print("=== DEBUG: AUSTIN IN THIS CHUNK ===")
-            print(f"Stance: {stance}, Cluster: {cluster}")
-            print(f"Allowed list:\n{allowed_list}")
-            print("=== END DEBUG ===")
-        
         try:
-            chunk = _ollama_chat(prompt)
+            chunk = _ollama_chat(prompt, metrics=metrics, stage=f"writer_{stance}")
             chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, cluster_docs_sorted)
             word_count = _count_words(chunk)
             notes = []
@@ -705,34 +846,66 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
             note_str = f" ({', '.join(notes)})" if notes else ""
             print(f"[Writer] {stance.upper()}/{cluster}: {word_count} words{note_str}")
             chunks.append(chunk)
+            top_mechs = []
+            for d in cluster_docs_sorted:
+                for m in d.get("mechanisms", []) or []:
+                    m = str(m).strip()
+                    if m and m not in top_mechs:
+                        top_mechs.append(m)
+            section_claims.append({
+                "stance": stance,
+                "cluster": cluster,
+                "docs": [d.get("doc_id") for d in cluster_docs_sorted],
+                "mechanisms": top_mechs[:4],
+                "word_count": word_count,
+            })
+            if metrics:
+                metrics.inc("writer_sections_succeeded")
         except Exception as e:
             print(f"[Writer] {stance}/{cluster} failed: {e}")
+            if metrics:
+                metrics.inc("writer_sections_failed")
 
     # Generate closing
-    closing_docs = []
-    for d in docs:
-        if _get_stance(d) == "tangential":
-            closing_docs.append(d)
-    closing_docs = sorted(closing_docs, key=_score_doc, reverse=True)[:4]
+    used_doc_ids = []
+    for claim in section_claims:
+        for did in claim.get("docs", []):
+            if did and did not in used_doc_ids:
+                used_doc_ids.append(did)
+    closing_docs = [d for d in docs if d.get("doc_id") in set(used_doc_ids)]
+    closing_docs = sorted(closing_docs, key=_score_doc, reverse=True)[:6]
     
+    allowed_list = _list_allowed_citations(closing_docs, allowed_pages_by_doc)
+    if not allowed_list:
+        allowed_list = "(Use only citations already present in the preceding text.)"
+    claim_lines = []
+    for claim in section_claims:
+        mechs = "; ".join(claim.get("mechanisms", [])[:3]) or "no mechanism recorded"
+        docs_line = ", ".join(str(d) for d in claim.get("docs", [])[:5])
+        claim_lines.append(
+            f"- {claim['stance'].upper()} / {claim['cluster']}: mechanisms: {mechs}. Documents: {docs_line}."
+        )
+    evidence_parts = ["Section claims:"] + claim_lines
     if closing_docs:
-        allowed_list = _list_allowed_citations(closing_docs, allowed_pages_by_doc)
-        evidence = "\n\n".join(_format_doc_entry(d) for d in closing_docs)
-    else:
-        allowed_list = "(No additional citations for closing)"
-        evidence = "(No additional evidence for closing)"
+        evidence_parts.append("\nRepresentative evidence:")
+        evidence_parts.extend(_format_doc_entry(d) for d in closing_docs)
+    evidence = "\n".join(evidence_parts)
     
     previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
     prompt = _build_closing_prompt(topic, evidence, allowed_list, previous_tail)
     
     try:
-        chunk = _ollama_chat(prompt)
+        chunk = _ollama_chat(prompt, metrics=metrics, stage="writer_closing")
         chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, closing_docs)
         word_count = _count_words(chunk)
         print(f"[Writer] Closing: {word_count} words")
         chunks.append(chunk)
+        if metrics:
+            metrics.inc("writer_sections_succeeded")
     except Exception as e:
         print(f"[Writer] Closing failed: {e}")
+        if metrics:
+            metrics.inc("writer_sections_failed")
 
     # Final assembly
     full_text = "\n\n".join(chunks)
@@ -752,11 +925,17 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
     if case_fixes > 0:
         print(f"[Writer] Case normalized: {case_fixes} citations")
     
-    full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs)
+    if os.environ.get("RRR_BYPASS_VALIDATION", "0") == "1":
+        removed_citations = []
+        print("[Writer] Citation removal skipped because RRR_BYPASS_VALIDATION=1")
+        if metrics:
+            metrics.set("writer_bypass_validation", True)
+    else:
+        full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs, allowed_pairs=allowed_pairs)
     if removed_citations:
         print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
         for r in removed_citations:
-            print(f"         - {r['doc_id']}: p.{r['page']}")
+            print(f"         - {r['doc_id']}: p.{r['page']} ({r.get('reason', 'invalid')})")
     
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
@@ -772,18 +951,32 @@ def compose_from_ledger(ledger_path="runs/review_ledger.json"):
 
     total_words = _count_words(full_text)
 
-    ensure_dir("runs")
-    out_path = "runs/review_composed.md"
+    ensure_dir(str(runs_path()))
+    out_path = runs_path("review_composed.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(full_text)
 
-    with open("runs/review_cited_docs.json", "w", encoding="utf-8") as f:
+    with open(runs_path("review_cited_docs.json"), "w", encoding="utf-8") as f:
         json.dump(cited_docids, f, indent=2)
 
     print(f"[Writer] review_composed.md written ({total_words} words).")
     print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} repairs={total_repairs} AJR={total_ajr_fixes} case={case_fixes} removed={len(removed_citations)}")
+    if metrics:
+        metrics.set("writer_stats", {
+            "chunks_written": len(chunks),
+            "distinct_docs_cited": len(cited_docids),
+            "word_count": total_words,
+            "repairs": total_repairs,
+            "ajr_fixes": total_ajr_fixes,
+            "case_fixes": case_fixes,
+            "removed_citations": len(removed_citations),
+            "citation_dump_docs": len(all_dump_citations),
+            "section_claims": section_claims,
+        })
+        metrics.inc("writer_citation_repairs", total_repairs)
+        metrics.inc("writer_removed_citations", len(removed_citations))
     
-    return out_path
+    return str(out_path)
 
 
 if __name__ == "__main__":

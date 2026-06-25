@@ -3,8 +3,23 @@ from rapidfuzz import fuzz
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
-def _score(sentence: str, claim: str) -> float:
-    return fuzz.token_set_ratio(sentence, claim)
+def _query_list(claim: str, probes=None):
+    queries = []
+    for item in probes or []:
+        text = re.sub(r"\s+", " ", str(item or "").strip())
+        if text and text not in queries:
+            queries.append(text)
+    fallback = re.sub(r"\s+", " ", str(claim or "").strip())
+    if fallback and fallback not in queries:
+        queries.append(fallback)
+    return queries
+
+
+def _score(sentence: str, claim: str, probes=None) -> float:
+    queries = _query_list(claim, probes)
+    if not queries:
+        return 0.0
+    return max(fuzz.token_set_ratio(sentence, q) for q in queries)
 
 def _is_biblio(s: str) -> bool:
     """Reject sentences that look like bibliography/reference list entries."""
@@ -40,7 +55,7 @@ def _is_biblio(s: str) -> bool:
     
     return False
 
-def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_chars: int = 40):
+def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_chars: int = 40, probes=None):
     """
     Returns list of (sentence, score) tuples, sorted by score descending.
     """
@@ -57,7 +72,7 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
 
     scored = []
     for s in sentences:
-        sc = _score(s, claim)
+        sc = _score(s, claim, probes=probes)
         if sc >= min_score:
             scored.append((s, sc))
 

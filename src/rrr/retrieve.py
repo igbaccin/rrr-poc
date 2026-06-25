@@ -1,5 +1,6 @@
 import os, pickle, numpy as np, re
 from functools import lru_cache
+from rrr.paths import indices_path, page_text_path, require_file, require_indices_dir, require_page_text_dir
 
 _tok = re.compile(r"[A-Za-z0-9]+")
 def _tokenize(txt: str):
@@ -7,9 +8,10 @@ def _tokenize(txt: str):
 
 @lru_cache(maxsize=1)
 def _load_bm25_and_ids():
-    with open("indices/bm25.pkl","rb") as f:
+    require_indices_dir()
+    with open(require_file(indices_path("bm25.pkl"), "BM25 index"),"rb") as f:
         bm = pickle.load(f)
-    page_ids = np.load("indices/page_ids.npy", allow_pickle=True).tolist()
+    page_ids = np.load(require_file(indices_path("page_ids.npy"), "BM25 page-id index"), allow_pickle=True).tolist()
     return bm, page_ids
 
 def _split_pid(pid):
@@ -39,21 +41,23 @@ def retrieve(query: str, topk=20, doc_id=None):
         return retrieve_breadth(query, docs_k=max(10, topk//2), pages_per_doc=2)
 
 def retrieve_doc_pages(query: str, doc_id: str, pages_per_doc=4):
+    require_page_text_dir()
     bm, page_ids, toks, scores = _scores_for_query_cached(query)
     pairs = [(i, scores[i]) for i, pid in enumerate(page_ids) if pid.startswith(f"{doc_id}_page_")]
     pairs.sort(key=lambda x: x[1], reverse=True)
     out = []
-    for i, _ in pairs[:max(1, pages_per_doc)]:
+    for i, score in pairs[:max(1, pages_per_doc)]:
         pid = page_ids[i]; did, page = _split_pid(pid)
-        txt_path = f"data/page_text/{did}_page_{page}.txt"
+        txt_path = page_text_path(did, page)
         snippet = ""
-        if os.path.exists(txt_path):
+        if txt_path.exists():
             with open(txt_path, encoding="utf-8") as f:
                 snippet = f.read()
-        out.append({"doc_id": did, "page": page, "text": snippet})
+        out.append({"doc_id": did, "page": page, "text": snippet, "bm25_score": float(score)})
     return out
 
 def retrieve_breadth(query: str, docs_k=20, pages_per_doc=2):
+    require_page_text_dir()
     bm, page_ids, toks, scores = _scores_for_query_cached(query)
 
     # Build doc -> [(page_index, score)]
@@ -72,12 +76,12 @@ def retrieve_breadth(query: str, docs_k=20, pages_per_doc=2):
     for did, entries in doc_rank:
         entries.sort(key=lambda x: x[1], reverse=True)
         take = min(pages_per_doc, per_doc_cap)
-        for i, _s in entries[:max(1, take)]:
+        for i, score in entries[:max(1, take)]:
             pid = page_ids[i]; _did, page = _split_pid(pid)
-            txt_path = f"data/page_text/{_did}_page_{page}.txt"
+            txt_path = page_text_path(_did, page)
             snippet = ""
-            if os.path.exists(txt_path):
+            if txt_path.exists():
                 with open(txt_path, encoding="utf-8") as f:
                     snippet = f.read()
-            out.append({"doc_id": _did, "page": page, "text": snippet})
+            out.append({"doc_id": _did, "page": page, "text": snippet, "bm25_score": float(score)})
     return out
