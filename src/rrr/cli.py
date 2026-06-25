@@ -1,6 +1,6 @@
 import argparse, uuid, pandas as pd, os, json
 from rrr.retrieve import retrieve
-from rrr.reasoner import reason_over_evidence, layered_t2
+from rrr.reasoner import reason_over_evidence, layered_t2, parse_reasoned_json
 from rrr.utils import write_run
 from rrr.evidence_filter import select_sentences
 from rrr.validate import validate_evidence
@@ -86,11 +86,15 @@ def t2(args, meta_path):
         header = f"[{e['doc_id']} p.{e['page']}]"
         evidence_texts.append(header + "\n- " + e["text"])
     reasoned = reason_over_evidence(evidence_texts, topic)
-    try:
-        json_part = reasoned[reasoned.find("{"):]
-        obj = json.loads(json_part)
-    except Exception:
-        obj = None
+    obj = parse_reasoned_json(reasoned)
+    if obj is None:
+        print("[T2] refusal=reasoner_json_parse_failed")
+        write_run("T2", topic, filtered, {
+            "refusal": True,
+            "reason": "reasoner_json_parse_failed",
+            "raw_reasoned": reasoned,
+        })
+        return
     if obj and isinstance(obj, dict) and obj.get("positions"):
         to_validate = []
         for pos in obj["positions"]:

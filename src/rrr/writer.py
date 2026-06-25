@@ -1,9 +1,11 @@
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from rrr.utils import ensure_dir
 from rrr.paths import runs_path
+from rrr.render import CITE_RE, parse_citations, render_citation
 
 _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
@@ -17,7 +19,24 @@ _DEFAULT_CHAT_OPTIONS = {
 
 _TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
 
-_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
+_PAGE_ONLY_RE = re.compile(r"\((?:pp?\.)\s*\d+(?:\s*(?:,|-|and)\s*(?:pp?\.)?\s*\d+)*\)", re.IGNORECASE)
+_AUTHOR_NAME_RE = r"(?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)[A-Z][A-Za-z&.\-]+)"
+_DOC_WITHOUT_PAGE_RE = re.compile(r"\((?=[^)]*[A-Za-z0-9_&.\-]+_\d{4})(?![^)]*:\s*p\.)[^)]*\)")
+_AUTHOR_YEAR_PAREN_RE = re.compile(rf"\(({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?),\s*(\d{{4}})\)")
+_AUTHOR_YEAR_TEXT_RE = re.compile(rf"\b({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?)\s+\((\d{{4}})\)")
+_AUTHOR_YEAR_POSSESSIVE_RE = re.compile(rf"\b({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?)'s\s+\((\d{{4}})\)")
+_MULTIPAGE_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.\d+\s*,\s*p\.\d+[^)]*\)")
+_GENERIC_STYLE_RE = re.compile(
+    r"\b("
+    r"complex interplay|valuable insights|policy-making|future research|further research|"
+    r"further investigation|nuanced perspective|the stakes are high|this analysis will|"
+    r"delving deeper|underscores? the need|further exploration|ongoing research|"
+    r"shed light|complex and influenced by various factors"
+    r")\b",
+    re.IGNORECASE,
+)
+_MIN_SECTION_CITED_DOCS = int(os.environ.get("RRR_WRITER_MIN_SECTION_CITED_DOCS", "2"))
+_ENFORCE_COVERAGE = os.environ.get("RRR_WRITER_ENFORCE_COVERAGE", "1") != "0"
 
 # v7: Streamlined system instruction - citation rules only, prose guidance moved to prompts
 _SYSTEM_CITATION_INSTRUCTION = (
@@ -29,7 +48,9 @@ _SYSTEM_CITATION_INSTRUCTION = (
     "1. Only cite documents and pages from the evidence provided\n"
     "2. Copy document IDs exactly as shown\n"
     "3. One page per citation\n"
-    "4. If unsure, omit the citation entirely\n"
+    "4. Never write page-only citations such as (p.3)\n"
+    "5. Never write author-year citations such as Author (1990) or (Author, 1990)\n"
+    "6. If unsure, omit the citation entirely\n"
 )
 
 
@@ -55,7 +76,9 @@ def _format_quote(q) -> str:
     did = str(q.get("doc_id", "")).strip()
     pg = int(q.get("page", 0) or 0)
     tx = _clip(q.get("text", ""), n=260)
-    return f'"{tx}" ({did}: p.{pg})'
+    eid = str(q.get("evidence_id", "")).strip()
+    prefix = f"[{eid}] " if eid else ""
+    return f'{prefix}"{tx}" {render_citation(did, pg)}'
 
 
 def _format_doc_entry(d) -> str:
@@ -77,13 +100,51 @@ def _format_doc_entry(d) -> str:
 def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
     # Create explicit list of allowed citations for this chunk.
     lines = []
+    evidence_lines = []
     for d in docs:
         did = str(d.get("doc_id", "")).strip()
+        for q in d.get("quotes", []) or []:
+            eid = str(q.get("evidence_id", "")).strip()
+            page = int(q.get("page", 0) or 0)
+            if eid and did and page:
+                evidence_lines.append(f"  - [{eid}] -> {render_citation(did, page)}")
+        if evidence_lines:
+            continue
         pages = sorted(list(allowed_pages_by_doc.get(did, set())))
         if pages:
             page_str = ", ".join(f"p.{p}" for p in pages[:6])
             lines.append(f"  - {did}: {page_str}")
+    if evidence_lines:
+        return "\n".join(evidence_lines[:32])
     return "\n".join(lines)
+
+
+def _build_evidence_id_map(docs):
+    evidence = {}
+    for d in docs:
+        for q in d.get("quotes", []) or []:
+            eid = str(q.get("evidence_id", "")).strip()
+            did = str(q.get("doc_id", "")).strip()
+            page = int(q.get("page", 0) or 0)
+            if eid and did and page:
+                evidence[eid] = {"doc_id": did, "page": page}
+    return evidence
+
+
+def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
+    replacements = 0
+
+    def repl(match):
+        nonlocal replacements
+        eid = match.group(1).upper()
+        ev = evidence_map.get(eid)
+        if not ev:
+            return match.group(0)
+        replacements += 1
+        return render_citation(ev["doc_id"], ev["page"])
+
+    rendered = re.sub(r"\[([Ee]\d{4})\]", lambda m: repl(m), text or "")
+    return rendered, replacements
 
 
 def _max_clusters_for_stance(n_docs: int) -> int:
@@ -116,6 +177,18 @@ def _strip_placeholder_citations(text: str) -> str:
     text = re.sub(r'\s*\(FirstAuthorEtAl_YYYY:\s*p\.N\)', '', text)
     text = re.sub(r'\s*\(Smith_1990:\s*p\.12\)', '', text)  # v7: catch example from system prompt
     return text
+
+
+def _split_sentences_for_cleanup(line: str):
+    sentinel = "__RRR_DOT__"
+
+    def protect(m):
+        return m.group(0).replace(".", sentinel)
+
+    protected = re.sub(r"\bet\s+al\.", protect, line, flags=re.IGNORECASE)
+    protected = re.sub(r"\b(?:e\.g|i\.e|cf)\.", protect, protected, flags=re.IGNORECASE)
+    parts = re.split(r'(?<=[.!?])\s+', protected)
+    return [p.replace(sentinel, ".") for p in parts if p.strip()]
 
 
 def _fix_ajr_abbreviation(text: str) -> tuple:
@@ -177,7 +250,9 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
     
     def find_invalid_citations_in_text(txt):
         invalid = []
-        for m in re.finditer(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', txt):
+        strict_spans = []
+        for m in CITE_RE.finditer(txt):
+            strict_spans.append((m.start(), m.end()))
             doc_id = m.group(1)
             page = int(m.group(2))
             if doc_id.lower() not in allowed_lower:
@@ -186,6 +261,22 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
             canonical = lower_to_canonical.get(doc_id.lower(), doc_id)
             if allowed_pairs and (canonical, page) not in allowed_pairs:
                 invalid.append((m.start(), m.end(), canonical, page, "invalid_page"))
+
+        def outside_strict(match):
+            return not any(s <= match.start() < e for s, e in strict_spans)
+
+        loose_patterns = [
+            (_MULTIPAGE_CITE_RE, "multi_page_citation"),
+            (_PAGE_ONLY_RE, "page_only_citation"),
+            (_DOC_WITHOUT_PAGE_RE, "doc_without_page"),
+            (_AUTHOR_YEAR_PAREN_RE, "author_year_citation"),
+            (_AUTHOR_YEAR_TEXT_RE, "author_year_citation"),
+            (_AUTHOR_YEAR_POSSESSIVE_RE, "author_year_citation"),
+        ]
+        for pattern, reason in loose_patterns:
+            for m in pattern.finditer(txt):
+                if outside_strict(m):
+                    invalid.append((m.start(), m.end(), m.group(0), 0, reason))
         return invalid
     
     invalid_citations = find_invalid_citations_in_text(text)
@@ -203,7 +294,7 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
             cleaned_lines.append(line)
             continue
         
-        sentences = re.split(r'(?<=[.!?])\s+', line)
+        sentences = _split_sentences_for_cleanup(line)
         
         kept_sentences = []
         for sent in sentences:
@@ -230,6 +321,29 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
     return cleaned_text, removed
 
 
+def _remove_style_violations(text: str) -> tuple:
+    removed = []
+    cleaned_lines = []
+    for line in text.split('\n'):
+        if not _GENERIC_STYLE_RE.search(line):
+            cleaned_lines.append(line)
+            continue
+
+        kept = []
+        for sent in _split_sentences_for_cleanup(line):
+            if _GENERIC_STYLE_RE.search(sent):
+                removed.append(_clip(sent, n=180))
+            else:
+                kept.append(sent)
+        if kept:
+            cleaned_lines.append(' '.join(kept))
+
+    cleaned_text = '\n'.join(cleaned_lines)
+    cleaned_text = re.sub(r'  +', ' ', cleaned_text)
+    cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
+    return cleaned_text.strip(), removed
+
+
 def _strip_orphaned_citations(text: str) -> str:
     # Remove lines that are ONLY a citation.
     lines = text.split('\n')
@@ -248,6 +362,10 @@ def _strip_orphaned_citations(text: str) -> str:
 
 def _strip_continuation_markers(text: str) -> str:
     # Remove to be continued and similar markers.
+    text = re.sub(r'(?im)^\s*Coverage repair:\s*$', '', text)
+    text = re.sub(r'(?i)\bThe previous draft failed the citation coverage rule\.\s*', '', text)
+    text = re.sub(r'(?i)\bWrite the section again using only the allowed citations above\.\s*', '', text)
+    text = re.sub(r'(?im)^\s*(Requirements|Previous draft|Rewrite):\s*$', '', text)
     patterns = [
         r'\.\.\.?\s*to be continued.*?\n*',
         r'\(to be continued.*?\)',
@@ -287,10 +405,18 @@ def _extract_citation_dumps(text: str):
     
     for line in lines:
         stripped = line.strip()
+
+        if stripped.startswith('[') and stripped.endswith(']'):
+            inner = stripped[1:-1]
+            cite_matches = re.findall(r'([A-Za-z0-9_&.\-]+):\s*p\.\d+', inner)
+            page_refs = re.findall(r'\bp\.\d+\b', inner)
+            if cite_matches and (len(cite_matches) >= 2 or len(page_refs) >= 3):
+                dump_citations.extend(cite_matches)
+                continue
         
         if stripped.startswith('(') and stripped.endswith(')') and ',' in stripped:
             inner = stripped[1:-1]
-            cite_matches = re.findall(r'[A-Za-z0-9_&]+_\d{4}[a-z]?:\s*p\.\d+', inner)
+            cite_matches = re.findall(r'[A-Za-z0-9_&.\-]+_\d{4}[a-z]?:\s*p\.\d+', inner)
             if len(cite_matches) >= 2:
                 for m in cite_matches:
                     did = m.split(':')[0]
@@ -337,6 +463,108 @@ def _strip_references_section(text: str) -> str:
 
 def _count_words(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text or ""))
+
+
+def _writer_enforcement_enabled() -> bool:
+    return _ENFORCE_COVERAGE and os.environ.get("RRR_BYPASS_VALIDATION", "0") != "1"
+
+
+def _writer_parallel_workers(n_chunks: int) -> int:
+    if n_chunks <= 1 or os.environ.get("RRR_WRITER_PARALLEL", "1") == "0":
+        return 1
+    raw = os.environ.get("RRR_WRITER_PARALLELISM") or os.environ.get("RRR_CONCURRENCY") or "2"
+    try:
+        workers = int(raw)
+    except Exception:
+        workers = 1
+    return max(1, min(workers, n_chunks))
+
+
+def _strict_cited_doc_ids(text: str, allowed_pairs=None) -> set:
+    allowed_pairs = set(allowed_pairs or [])
+    cited = set()
+    for c in parse_citations(text):
+        pair = (c["doc_id"], c["page"])
+        if not allowed_pairs or pair in allowed_pairs:
+            cited.add(c["doc_id"])
+    return cited
+
+
+def _coverage_requirement(chunk_docs, section_kind: str) -> int:
+    n_docs = len([d for d in chunk_docs if d.get("doc_id")])
+    if n_docs <= 0:
+        return 0
+    if section_kind == "closing":
+        return 1
+    return min(max(1, _MIN_SECTION_CITED_DOCS), n_docs)
+
+
+def _audit_section_coverage(text: str, chunk_docs, section_kind: str):
+    chunk_pairs, chunk_allowed_docs, _ = _build_allowed_citations(chunk_docs)
+    cited = _strict_cited_doc_ids(text, allowed_pairs=chunk_pairs)
+    required = _coverage_requirement(chunk_docs, section_kind)
+    return {
+        "section": section_kind,
+        "required_cited_docs": required,
+        "cited_doc_count": len(cited),
+        "cited_docs": sorted(cited),
+        "provided_doc_count": len(chunk_allowed_docs),
+        "ok": len(cited) >= required,
+    }
+
+
+def _append_coverage_fallback(text: str, chunk_docs, required_docs: int, allowed_pairs=None) -> tuple:
+    allowed_pairs = set(allowed_pairs or [])
+    cited = _strict_cited_doc_ids(text, allowed_pairs=allowed_pairs)
+    if len(cited) >= required_docs:
+        return text, 0
+
+    additions = []
+    for d in chunk_docs:
+        did = str(d.get("doc_id", "")).strip()
+        if not did or did in cited:
+            continue
+        quote = None
+        for q in d.get("quotes", []) or []:
+            pg = int(q.get("page", 0) or 0)
+            if pg and (not allowed_pairs or (did, pg) in allowed_pairs):
+                quote = q
+                break
+        if not quote:
+            continue
+        pg = int(quote.get("page", 0) or 0)
+        tx = _clip(quote.get("text", ""), n=180)
+        additions.append(f'A further source records "{tx}" {render_citation(did, pg)}.')
+        cited.add(did)
+        if len(cited) >= required_docs:
+            break
+
+    if not additions:
+        return text, 0
+
+    patched = (text or "").rstrip()
+    if patched:
+        patched += "\n\n"
+    patched += " ".join(additions)
+    return patched.strip(), len(additions)
+
+
+def _coverage_retry_prompt(original_prompt: str, prior_chunk: str, required_docs: int) -> str:
+    return f"""{original_prompt}
+
+Coverage repair:
+The previous draft failed the citation coverage rule. Write the section again using only the allowed citations above.
+
+Requirements:
+- Cite at least {required_docs} different provided documents when that many are available.
+- Every paragraph must include at least one strict citation in the form (DocId: p.N).
+- Do not use page-only citations, author-year citations, or citations without pages.
+- Preserve the same substantive role and word range.
+
+Previous draft:
+{prior_chunk}
+
+Rewrite:"""
 
 
 def _build_allowed_citations(docs):
@@ -396,10 +624,14 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
 # =============================================================================
 
 _PROSE_DIRECTIVE = (
-    "NEVER begin a sentence with an author name. "
-    "NEVER write 'X argues', 'X demonstrates', 'X highlights', 'X supports'. "
-    "State the claim, then cite: 'Structural change correlates with growth (Author_Year: p.N).' "
-    "All citations must use the (Author_Year: p.N) format. No other citation style."
+    "Write in the register of historical demography and economic history, with attention to population processes, "
+    "institutions, labor regimes, prices, measurement, state capacity, and source limits. "
+    "Do not begin sentences with author names, and do not write 'X argues', 'X demonstrates', 'X highlights', or 'X supports'. "
+    "State the substantive claim, then cite a validated page. "
+    "Avoid generic survey phrases such as 'the literature suggests', 'complex interplay', 'future research', and 'further investigation'. "
+    "Do not use em dashes. "
+    "You may cite an evidence ID such as [E0001]; it will be rendered into a validated page citation. "
+    "Otherwise all citations must use the (Author_Year: p.N) format. No other citation style."
 )
 
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
@@ -705,6 +937,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         raise SystemExit("No allowed citations found in ledger.")
 
     author_year_to_docid = _build_author_year_lookup(allowed_docs)
+    evidence_id_map = _build_evidence_id_map(docs)
 
     # Bucket by stance first, then by cluster
     stance_buckets = defaultdict(lambda: defaultdict(list))
@@ -769,11 +1002,19 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     total_repairs = 0
     total_placeholders_stripped = 0
     total_ajr_fixes = 0
+    total_removed_citations = 0
+    total_style_removed = 0
+    total_coverage_fallbacks = 0
+    total_evidence_id_renders = 0
+    section_coverage = []
     
     def postprocess_chunk(chunk, chunk_docs):
         nonlocal total_repairs, total_placeholders_stripped, all_dump_citations, total_ajr_fixes
+        nonlocal total_removed_citations, total_style_removed, total_evidence_id_renders
         
         chunk = _strip_wrapping(chunk)
+        chunk, evidence_renders = _render_evidence_id_citations(chunk, evidence_id_map)
+        total_evidence_id_renders += evidence_renders
         
         chunk_before = chunk
         chunk = _strip_placeholder_citations(chunk)
@@ -794,8 +1035,62 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         chunk = _strip_references_section(chunk)
         chunk = _strip_continuation_markers(chunk)
         chunk = _strip_conclusion(chunk)
+        if _writer_enforcement_enabled():
+            chunk_allowed_pairs, chunk_allowed_docs, _ = _build_allowed_citations(chunk_docs)
+            chunk, removed = _remove_invalid_citations(
+                chunk,
+                chunk_allowed_docs,
+                allowed_pairs=chunk_allowed_pairs,
+            )
+            total_removed_citations += len(removed)
+
+        chunk, style_removed = _remove_style_violations(chunk)
+        total_style_removed += len(style_removed)
         
-        return chunk, repair_count, placeholders_stripped, ajr_fixes
+        return chunk, repair_count, placeholders_stripped, ajr_fixes, len(style_removed)
+
+    def finalize_covered_chunk(raw, prompt, chunk_docs, section_kind, stage):
+        nonlocal total_coverage_fallbacks
+        chunk, repairs, placeholders, ajr, style_removed = postprocess_chunk(raw, chunk_docs)
+        audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+        if audit["ok"] or not _writer_enforcement_enabled():
+            return chunk, repairs, placeholders, ajr, style_removed, audit
+        if metrics:
+            metrics.inc("writer_section_coverage_retries")
+        retry_prompt = _coverage_retry_prompt(prompt, chunk, audit["required_cited_docs"])
+        raw = _ollama_chat(retry_prompt, metrics=metrics, stage=f"{stage}_coverage_retry")
+        chunk, repairs2, placeholders2, ajr2, style_removed2 = postprocess_chunk(raw, chunk_docs)
+        audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+        if not audit["ok"]:
+            chunk_allowed_pairs, _, _ = _build_allowed_citations(chunk_docs)
+            chunk, fallback_count = _append_coverage_fallback(
+                chunk,
+                chunk_docs,
+                audit["required_cited_docs"],
+                allowed_pairs=chunk_allowed_pairs,
+            )
+            if fallback_count:
+                total_coverage_fallbacks += fallback_count
+                if metrics:
+                    metrics.inc("writer_section_coverage_fallbacks", fallback_count)
+                audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+        if not audit["ok"]:
+            raise ValueError(
+                f"citation coverage failed for {section_kind}: "
+                f"{audit['cited_doc_count']}/{audit['required_cited_docs']} cited docs"
+            )
+        return (
+            chunk,
+            repairs + repairs2,
+            placeholders + placeholders2,
+            ajr + ajr2,
+            style_removed + style_removed2,
+            audit,
+        )
+
+    def generate_covered_chunk(prompt, chunk_docs, section_kind, stage):
+        raw = _ollama_chat(prompt, metrics=metrics, stage=stage)
+        return finalize_covered_chunk(raw, prompt, chunk_docs, section_kind, stage)
 
     # Generate opening
     opening_docs = []
@@ -810,10 +1105,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     prompt = _build_opening_prompt(topic, stance_summary, evidence, allowed_list)
     
     try:
-        chunk = _ollama_chat(prompt, metrics=metrics, stage="writer_opening")
-        chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, opening_docs)
+        chunk, repairs, placeholders, ajr, style_removed, audit = generate_covered_chunk(
+            prompt,
+            opening_docs,
+            "opening",
+            "writer_opening",
+        )
         word_count = _count_words(chunk)
-        print(f"[Writer] Opening: {word_count} words")
+        print(f"[Writer] Opening: {word_count} words; cited_docs={audit['cited_doc_count']}")
+        section_coverage.append(audit)
         chunks.append(chunk)
         if metrics:
             metrics.inc("writer_sections_succeeded")
@@ -823,48 +1123,126 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             metrics.inc("writer_sections_failed")
 
     # Generate stance sections
+    stance_jobs = []
+    parallel_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
     for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
         cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
-        
         allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
         evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
-        
-        previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-        prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail)
+        prompt = prompt_builder(topic, cluster, evidence, allowed_list, parallel_tail)
+        stance_jobs.append({
+            "index": i,
+            "stance": stance,
+            "cluster": cluster,
+            "docs": cluster_docs_sorted,
+            "prompt": prompt,
+            "stage": f"writer_{stance}",
+        })
 
-        try:
-            chunk = _ollama_chat(prompt, metrics=metrics, stage=f"writer_{stance}")
-            chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, cluster_docs_sorted)
-            word_count = _count_words(chunk)
-            notes = []
-            if repairs > 0:
-                notes.append(f"repaired {repairs}")
-            if placeholders > 0:
-                notes.append(f"stripped {placeholders}")
-            if ajr > 0:
-                notes.append(f"AJR fixed {ajr}")
-            note_str = f" ({', '.join(notes)})" if notes else ""
-            print(f"[Writer] {stance.upper()}/{cluster}: {word_count} words{note_str}")
-            chunks.append(chunk)
-            top_mechs = []
-            for d in cluster_docs_sorted:
-                for m in d.get("mechanisms", []) or []:
-                    m = str(m).strip()
-                    if m and m not in top_mechs:
-                        top_mechs.append(m)
-            section_claims.append({
+    def record_stance_chunk(job, chunk, word_count):
+        top_mechs = []
+        for d in job["docs"]:
+            for m in d.get("mechanisms", []) or []:
+                m = str(m).strip()
+                if m and m not in top_mechs:
+                    top_mechs.append(m)
+        section_claims.append({
+            "stance": job["stance"],
+            "cluster": job["cluster"],
+            "docs": [d.get("doc_id") for d in job["docs"]],
+            "mechanisms": top_mechs[:4],
+            "word_count": word_count,
+        })
+        chunks.append(chunk)
+
+    def log_stance_chunk(job, word_count, repairs, placeholders, ajr, style_removed, audit):
+        notes = []
+        if repairs > 0:
+            notes.append(f"repaired {repairs}")
+        if placeholders > 0:
+            notes.append(f"stripped {placeholders}")
+        if ajr > 0:
+            notes.append(f"AJR fixed {ajr}")
+        if style_removed > 0:
+            notes.append(f"style stripped {style_removed}")
+        if audit.get("cited_doc_count", 0) > 0:
+            notes.append(f"cited {audit['cited_doc_count']}")
+        note_str = f" ({', '.join(notes)})" if notes else ""
+        print(f"[Writer] {job['stance'].upper()}/{job['cluster']}: {word_count} words{note_str}")
+
+    parallel_workers = _writer_parallel_workers(len(stance_jobs))
+    if metrics:
+        metrics.set("writer_parallel_workers", parallel_workers)
+
+    if parallel_workers > 1:
+        print(f"[Writer] Parallel stance chunks: workers={parallel_workers}")
+        raw_by_index = {}
+        with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
+            futures = {
+                pool.submit(_ollama_chat, job["prompt"], metrics=metrics, stage=job["stage"]): job["index"]
+                for job in stance_jobs
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    raw_by_index[idx] = future.result()
+                except Exception as e:
+                    raw_by_index[idx] = e
+
+        for job in stance_jobs:
+            try:
+                raw = raw_by_index.get(job["index"])
+                if isinstance(raw, Exception):
+                    raise raw
+                chunk, repairs, placeholders, ajr, style_removed, audit = finalize_covered_chunk(
+                    raw,
+                    job["prompt"],
+                    job["docs"],
+                    job["stance"],
+                    job["stage"],
+                )
+                section_coverage.append(audit)
+                word_count = _count_words(chunk)
+                log_stance_chunk(job, word_count, repairs, placeholders, ajr, style_removed, audit)
+                record_stance_chunk(job, chunk, word_count)
+                if metrics:
+                    metrics.inc("writer_sections_succeeded")
+            except Exception as e:
+                print(f"[Writer] {job['stance']}/{job['cluster']} failed: {e}")
+                if metrics:
+                    metrics.inc("writer_sections_failed")
+    else:
+        for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
+            cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
+            allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
+            evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
+            previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
+            prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail)
+            job = {
+                "index": i,
                 "stance": stance,
                 "cluster": cluster,
-                "docs": [d.get("doc_id") for d in cluster_docs_sorted],
-                "mechanisms": top_mechs[:4],
-                "word_count": word_count,
-            })
-            if metrics:
-                metrics.inc("writer_sections_succeeded")
-        except Exception as e:
-            print(f"[Writer] {stance}/{cluster} failed: {e}")
-            if metrics:
-                metrics.inc("writer_sections_failed")
+                "docs": cluster_docs_sorted,
+                "prompt": prompt,
+                "stage": f"writer_{stance}",
+            }
+            try:
+                chunk, repairs, placeholders, ajr, style_removed, audit = generate_covered_chunk(
+                    job["prompt"],
+                    job["docs"],
+                    job["stance"],
+                    job["stage"],
+                )
+                section_coverage.append(audit)
+                word_count = _count_words(chunk)
+                log_stance_chunk(job, word_count, repairs, placeholders, ajr, style_removed, audit)
+                record_stance_chunk(job, chunk, word_count)
+                if metrics:
+                    metrics.inc("writer_sections_succeeded")
+            except Exception as e:
+                print(f"[Writer] {job['stance']}/{job['cluster']} failed: {e}")
+                if metrics:
+                    metrics.inc("writer_sections_failed")
 
     # Generate closing
     used_doc_ids = []
@@ -895,10 +1273,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     prompt = _build_closing_prompt(topic, evidence, allowed_list, previous_tail)
     
     try:
-        chunk = _ollama_chat(prompt, metrics=metrics, stage="writer_closing")
-        chunk, repairs, placeholders, ajr = postprocess_chunk(chunk, closing_docs)
+        chunk, repairs, placeholders, ajr, style_removed, audit = generate_covered_chunk(
+            prompt,
+            closing_docs,
+            "closing",
+            "writer_closing",
+        )
         word_count = _count_words(chunk)
-        print(f"[Writer] Closing: {word_count} words")
+        print(f"[Writer] Closing: {word_count} words; cited_docs={audit['cited_doc_count']}")
+        section_coverage.append(audit)
         chunks.append(chunk)
         if metrics:
             metrics.inc("writer_sections_succeeded")
@@ -909,6 +1292,8 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     # Final assembly
     full_text = "\n\n".join(chunks)
+    full_text, final_evidence_renders = _render_evidence_id_citations(full_text, evidence_id_map)
+    total_evidence_id_renders += final_evidence_renders
     
     global_year_to_docid = _build_year_to_docid(docs)
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
@@ -932,10 +1317,17 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             metrics.set("writer_bypass_validation", True)
     else:
         full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs, allowed_pairs=allowed_pairs)
+        total_removed_citations += len(removed_citations)
     if removed_citations:
         print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
         for r in removed_citations:
-            print(f"         - {r['doc_id']}: p.{r['page']} ({r.get('reason', 'invalid')})")
+            if r.get("page"):
+                print(f"         - {r['doc_id']}: p.{r['page']} ({r.get('reason', 'invalid')})")
+            else:
+                print(f"         - {r['doc_id']} ({r.get('reason', 'invalid')})")
+
+    full_text, final_style_removed = _remove_style_violations(full_text)
+    total_style_removed += len(final_style_removed)
     
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
@@ -960,7 +1352,12 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         json.dump(cited_docids, f, indent=2)
 
     print(f"[Writer] review_composed.md written ({total_words} words).")
-    print(f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} repairs={total_repairs} AJR={total_ajr_fixes} case={case_fixes} removed={len(removed_citations)}")
+    print(
+        f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} "
+        f"repairs={total_repairs} AJR={total_ajr_fixes} case={case_fixes} "
+        f"removed={total_removed_citations} style_removed={total_style_removed} "
+        f"coverage_fallbacks={total_coverage_fallbacks} evidence_id_renders={total_evidence_id_renders}"
+    )
     if metrics:
         metrics.set("writer_stats", {
             "chunks_written": len(chunks),
@@ -969,12 +1366,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "repairs": total_repairs,
             "ajr_fixes": total_ajr_fixes,
             "case_fixes": case_fixes,
-            "removed_citations": len(removed_citations),
+            "removed_citations": total_removed_citations,
+            "style_sentences_removed": total_style_removed,
+            "coverage_fallbacks": total_coverage_fallbacks,
+            "evidence_id_renders": total_evidence_id_renders,
             "citation_dump_docs": len(all_dump_citations),
             "section_claims": section_claims,
+            "section_coverage": section_coverage,
         })
         metrics.inc("writer_citation_repairs", total_repairs)
-        metrics.inc("writer_removed_citations", len(removed_citations))
+        metrics.inc("writer_removed_citations", total_removed_citations)
+        metrics.inc("writer_style_sentences_removed", total_style_removed)
+        metrics.inc("writer_evidence_id_renders", total_evidence_id_renders)
     
     return str(out_path)
 

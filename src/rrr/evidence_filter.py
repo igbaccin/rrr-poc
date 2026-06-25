@@ -1,5 +1,6 @@
 import os, re
 from rapidfuzz import fuzz
+from rrr.text import normalize_text, sentence_spans
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
@@ -59,7 +60,10 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
     """
     Returns list of (sentence, score) tuples, sorted by score descending.
     """
-    sentences = [s.strip() for s in _SENT_SPLIT.split(page_text) if len(s.strip()) >= min_chars]
+    spans = sentence_spans(page_text, min_chars=min_chars)
+    sentences = [s["text"].strip() for s in spans]
+    if not sentences:
+        sentences = [normalize_text(s).strip() for s in _SENT_SPLIT.split(page_text) if len(s.strip()) >= min_chars]
     if not sentences:
         return []
 
@@ -81,11 +85,22 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
+    diversity_weight = float(os.environ.get("RRR_SENT_DIVERSITY_WEIGHT", "0.15"))
     chosen = []
     seen_texts = []
-    for s, sc in scored:
+    remaining = scored[:]
+    while remaining and len(chosen) < max_sentences:
+        best_idx = 0
+        best_value = None
+        for idx, (s, sc) in enumerate(remaining):
+            similarity_penalty = max((fuzz.token_set_ratio(s, t) for t in seen_texts), default=0)
+            value = sc - diversity_weight * similarity_penalty
+            if best_value is None or value > best_value:
+                best_idx = idx
+                best_value = value
+        s, sc = remaining.pop(best_idx)
         if all(fuzz.token_set_ratio(s, t) < 92 for t in seen_texts):
-            chosen.append((s, sc))  # Return tuple with score
+            chosen.append((s, sc))
             seen_texts.append(s)
         if len(chosen) >= max_sentences:
             break

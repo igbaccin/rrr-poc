@@ -22,13 +22,20 @@ Import:
 import os, re, json, glob, sys
 
 CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
+_AUTHOR_NAME_RE = r"(?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)[A-Z][A-Za-z&.\-]+)"
 
 # E3 patterns: citation-like strings that fail the strict format
 _E3_PATTERNS = [
-    re.compile(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)"),              # (Author_Year) no page
-    re.compile(r"[A-Z][a-z]+\s+et\s+al\.?\s*\(\d{4}\)"),           # Author et al. (Year)
-    re.compile(r"\([A-Z][a-z]+,\s*\d{4}\)"),                        # (Author, Year)
-    re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\s*,\s*p\.\d+\)"),  # multi-page in one cite
+    ("doc_without_page", re.compile(r"\((?=[^)]*[A-Za-z0-9_&.\-]+_\d{4})(?![^)]*:\s*p\.)[^)]*\)")),
+    ("page_only", re.compile(r"\((?:pp?\.)\s*\d+(?:\s*(?:,|-|and)\s*(?:pp?\.)?\s*\d+)*\)", re.IGNORECASE)),
+    ("author_year_text", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?\s*\(\d{{4}}\)")),
+    ("author_year_possessive", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?'s\s*\(\d{{4}}\)")),
+    ("author_year_parenthetical", re.compile(rf"\({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?,\s*\d{{4}}\)")),
+    ("multi_page_citation", re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\s*,\s*p\.\d+[^)]*\)")),
+    ("square_bracket_dump", re.compile(
+        r"^\s*\[[^\]\n]*[A-Za-z0-9_&.\-]+:\s*p\.\d+[^\]\n]*(?:;\s*[A-Za-z0-9_&.\-]+:\s*p\.\d+|,\s*p\.\d+)[^\]\n]*\]\s*$",
+        re.MULTILINE,
+    )),
 ]
 
 
@@ -113,11 +120,14 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data"):
 
     # E3: loose citation patterns outside strict format
     e3 = 0
+    e3_details = []
     strict_spans = [(c["start"], c["end"]) for c in citations]
-    for pat in _E3_PATTERNS:
+    for reason, pat in _E3_PATTERNS:
         for m in pat.finditer(text):
             if not any(s <= m.start() < e for s, e in strict_spans):
                 e3 += 1
+                ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
+                e3_details.append({"reason": reason, "raw": m.group(0), "context": ctx})
 
     word_count = len(re.findall(r"\b\w+\b", text))
 
@@ -129,6 +139,7 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data"):
         "word_count": word_count,
         "e1_details": e1_details,
         "e2_details": e2_details,
+        "e3_details": e3_details,
     }
 
 
@@ -192,3 +203,7 @@ if __name__ == "__main__":
             for d in result["e2_details"]:
                 print(f"  {d['doc_id']}: cited p.{d['cited_page']}, "
                       f"max p.{d['max_valid_page']} (+{d['overshoot']})")
+        if result.get("e3_details"):
+            print("\nE3 details:")
+            for d in result["e3_details"][:20]:
+                print(f"  {d['reason']}: {d['raw']}")

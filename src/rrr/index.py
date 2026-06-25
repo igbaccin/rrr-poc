@@ -1,15 +1,12 @@
-import argparse, os, glob, pickle, numpy as np, pandas as pd, re
+import argparse, os, glob, pickle, numpy as np, pandas as pd
 from rank_bm25 import BM25Okapi
 from rrr.utils import ensure_dir
 from rrr.paths import data_path, indices_path
-
-_tok = re.compile(r"[A-Za-z0-9]+")
-def _tokenize(txt: str):
-    return _tok.findall((txt or "").lower())
+from rrr.text import page_sort_key, tokenize
 
 def _iter_pages_for(doc_id):
     pattern = str(data_path("page_text", f"{doc_id}_page_*.txt"))
-    for tpath in sorted(glob.glob(pattern)):
+    for tpath in sorted(glob.glob(pattern), key=page_sort_key):
         yield tpath
 
 def build_bm25(doc_id_list):
@@ -18,7 +15,7 @@ def build_bm25(doc_id_list):
         for tpath in _iter_pages_for(doc_id):
             with open(tpath, "r", encoding="utf-8") as f:
                 txt = f.read()
-            toks = _tokenize(txt)
+            toks = tokenize(txt)
             docs.append(toks); page_ids.append(os.path.basename(tpath).replace(".txt",""))
     bm = BM25Okapi(docs)
     return bm, page_ids

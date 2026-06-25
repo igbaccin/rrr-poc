@@ -2,6 +2,7 @@ import argparse, os, pandas as pd, re
 from pdfminer.high_level import extract_text
 from rrr.utils import sha256_file, ensure_dir, save_json
 from rrr.paths import data_path
+from rrr.text import normalize_text, sentence_spans
 from multiprocessing import Pool, cpu_count
 
 # Reference section markers (case-insensitive check done separately)
@@ -87,9 +88,7 @@ def extract_pages(pdf_path: str):
     text = extract_text(pdf_path)
     pages = text.split("\x0c")
     pages = [p.strip() for p in pages if p.strip()]
-    # clean CID / control characters
-    pages = [re.sub(r'\(cid:\d+\)', '', p) for p in pages]
-    pages = [re.sub(r'[\x00-\x1f\x7f-\x9f]', '', p) for p in pages]
+    pages = [normalize_text(p) for p in pages]
     return pages
 
 def _process_one(row_dict):
@@ -125,6 +124,18 @@ def _process_one(row_dict):
             ensure_dir(os.path.dirname(str(outp)))
             with open(outp, "w", encoding="utf-8") as f:
                 f.write(ptxt)
+            meta_dir = data_path("page_meta")
+            ensure_dir(str(meta_dir))
+            save_json(
+                {
+                    "doc_id": doc_id,
+                    "page": i,
+                    "page_type": "content",
+                    "char_count": len(ptxt),
+                    "sentences": sentence_spans(ptxt),
+                },
+                str(meta_dir / f"{doc_id}_page_{i}.json"),
+            )
         
         meta = {
             "doc_id": doc_id,

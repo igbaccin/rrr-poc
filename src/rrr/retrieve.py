@@ -1,10 +1,7 @@
-import os, pickle, numpy as np, re
+import os, pickle, numpy as np
 from functools import lru_cache
 from rrr.paths import indices_path, page_text_path, require_file, require_indices_dir, require_page_text_dir
-
-_tok = re.compile(r"[A-Za-z0-9]+")
-def _tokenize(txt: str):
-    return _tok.findall((txt or "").lower())
+from rrr.text import tokenize
 
 @lru_cache(maxsize=1)
 def _load_bm25_and_ids():
@@ -28,7 +25,7 @@ from functools import lru_cache
 def _scores_for_query_cached(query: str):
     """Compute BM25 scores once per topic, then reuse."""
     bm, page_ids = _load_bm25_and_ids()
-    toks = _tokenize(query)
+    toks = tokenize(query)
     scores = bm.get_scores(toks)
     return bm, page_ids, toks, scores
 

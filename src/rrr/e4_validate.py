@@ -6,6 +6,7 @@ without appropriate framing (and vice versa).
 """
 import re
 from typing import Dict, List, Tuple
+from rrr.render import parse_citations
 
 CRITIQUE_PATTERNS = [
     r'\b(challenges?|challenged|challenging)\b',
@@ -32,11 +33,11 @@ SUPPORT_PATTERNS = [
 
 def _extract_citation_contexts(text: str, window: int = 300) -> List[Tuple[str, int, str]]:
     results = []
-    for m in re.finditer(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', text):
-        doc_id = m.group(1)
-        page = int(m.group(2))
-        start = max(0, m.start() - window)
-        end = min(len(text), m.end() + window)
+    for citation in parse_citations(text):
+        doc_id = citation["doc_id"]
+        page = citation["page"]
+        start = max(0, citation["start"] - window)
+        end = min(len(text), citation["end"] + window)
         context = text[start:end]
         results.append((doc_id, page, context))
     return results

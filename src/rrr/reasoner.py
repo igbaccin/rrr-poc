@@ -1,9 +1,12 @@
 from typing import List
 import os, subprocess, json, re, ast, hashlib, time
 from rrr.utils import ensure_dir
-from rrr.stance import classify_stance
+from rrr.stance import classify_evidence_stance
 from rrr.metrics import RunMetrics
+from rrr.manifest import write_run_manifest
 from rrr.paths import runs_path, logs_path
+from rrr.text import tokenize
+from rapidfuzz import fuzz
 
 _MODEL      = os.environ.get("RRR_MODEL", "mistral")
 _OPTIONS_REASON = {
@@ -59,7 +62,7 @@ def _build_prompt(evidence_texts: List[str], claim: str) -> str:
         "- The entire reply must be a SINGLE JSON object. No commentary, no explanations, no preambles.\n"
         "- If you cannot fill a field, use an empty string or empty array [] - never omit the key.\n"
         "- Do not add text before or after the JSON. The system will reject any non-JSON tokens.\n\n"
-        "After printing the JSON, output the word SUMMARY on a new line and then write your 2–6-sentence summary.\n"
+        "After printing the JSON, output the word SUMMARY on a new line and then write your 2â€“6-sentence summary.\n"
     )
     return prompt
 
@@ -101,6 +104,16 @@ def _extract_json_and_summary(raw: str):
             with open(logs_path("invalid_json.txt"), "w", encoding="utf-8") as f:
                 f.write(raw)
             return None, raw.strip()
+
+
+def parse_reasoned_json(raw: str):
+    pretty, _summary = _extract_json_and_summary(raw or "")
+    if not pretty:
+        return None
+    try:
+        return json.loads(pretty)
+    except Exception:
+        return None
 
 def reason_over_evidence(evidence_texts: List[str], claim: str, model: str = _MODEL, metrics=None) -> str:
     if not evidence_texts:
@@ -204,11 +217,66 @@ def _try_parse_cluster_json(raw: str, n_mechs: int, all_mechs: list):
     
     return mech_to_cluster
 
+
+def _label_from_tokens(tokens):
+    if not tokens:
+        return "Other"
+    words = []
+    for tok in tokens:
+        if tok not in words:
+            words.append(tok)
+        if len(words) >= 4:
+            break
+    return " ".join(w.capitalize() for w in words) or "Other"
+
+
+def _fallback_cluster_mechanisms(all_mechs: list, topic: str, metrics=None) -> dict:
+    topic_tokens = set(tokenize(topic))
+    clusters = []
+    mech_to_cluster = {}
+
+    for mech in all_mechs:
+        toks = set(tokenize(mech)) - topic_tokens
+        if not toks:
+            toks = set(tokenize(mech))
+        best_idx = None
+        best_score = 0.0
+        for idx, cluster in enumerate(clusters):
+            denom = len(toks | cluster["tokens"]) or 1
+            score = len(toks & cluster["tokens"]) / denom
+            if score > best_score:
+                best_idx = idx
+                best_score = score
+        if best_idx is None or (best_score < 0.18 and len(clusters) < 8):
+            clusters.append({"tokens": set(toks), "items": [mech]})
+        else:
+            clusters[best_idx]["tokens"].update(toks)
+            clusters[best_idx]["items"].append(mech)
+
+    for cluster in clusters:
+        counts = {}
+        for item in cluster["items"]:
+            for tok in tokenize(item):
+                if tok not in topic_tokens:
+                    counts[tok] = counts.get(tok, 0) + 1
+        ranked = sorted(counts, key=lambda t: (-counts[t], t))
+        label = _label_from_tokens(ranked)
+        for item in cluster["items"]:
+            mech_to_cluster[item] = label
+
+    if metrics:
+        metrics.inc("cluster_fallbacks")
+        metrics.set("cluster_mode", "local_token_overlap")
+        metrics.set("cluster_fallback_cluster_count", len(clusters))
+    return mech_to_cluster
+
+
 def _cluster_mechanisms(doc_summaries: list, topic: str, metrics=None) -> dict:
     """
     Cluster mechanisms into themes.
-    
-    Raises ClusteringFailedError after MAX_RETRIES failures - caller should restart pipeline.
+
+    Uses the LLM clusterer first, then falls back to deterministic token-overlap
+    clusters so a clustering failure does not restart the whole pipeline.
     """
     mech_to_docs = {}
     for doc in doc_summaries:
@@ -221,12 +289,16 @@ def _cluster_mechanisms(doc_summaries: list, topic: str, metrics=None) -> dict:
                 mech_to_docs[m].append(did)
     
     if not mech_to_docs:
+        if metrics:
+            metrics.set("cluster_mode", "none")
         return {}
     
     all_mechs = list(mech_to_docs.keys())
     n_mechs = len(all_mechs)
     
     if n_mechs <= 3:
+        if metrics:
+            metrics.set("cluster_mode", "identity")
         return {m: m[:60] for m in all_mechs}
     
     cluster_prompt = (
@@ -291,7 +363,10 @@ def _cluster_mechanisms(doc_summaries: list, topic: str, metrics=None) -> dict:
             continue
     
     if mech_to_cluster is None:
-        raise ClusteringFailedError(f"Clustering failed after {MAX_RETRIES} attempts")
+        print(f"[Clustering] LLM clustering failed after {MAX_RETRIES} attempts; using deterministic fallback")
+        mech_to_cluster = _fallback_cluster_mechanisms(all_mechs, topic, metrics=metrics)
+    elif metrics:
+        metrics.set("cluster_mode", "llm")
     
     for m in all_mechs:
         if m not in mech_to_cluster:
@@ -352,16 +427,16 @@ def _clean_latex(s: str) -> str:
         return s
     s = s.replace('{', '').replace('}', '')
     replacements = [
-        (r"\\'e", 'é'), (r"\\`e", 'è'), (r'\\"e', 'ë'), (r'\\^e', 'ê'),
-        (r"\\'a", 'á'), (r"\\`a", 'à'), (r'\\"a', 'ä'), (r'\\^a', 'â'),
-        (r"\\'o", 'ó'), (r"\\`o", 'ò'), (r'\\"o', 'ö'), (r'\\^o', 'ô'),
-        (r"\\'u", 'ú'), (r"\\`u", 'ù'), (r'\\"u', 'ü'), (r'\\^u', 'û'),
-        (r"\\'i", 'í'), (r"\\`i", 'ì'), (r'\\"i', 'ï'), (r'\\^i', 'î'),
-        (r'\\c{c}', 'ç'), (r'\\c{C}', 'Ç'),
-        (r'\\c{s}', 'ş'), (r'\\c{S}', 'Ş'),
-        (r'\\v{s}', 'š'), (r'\\v{S}', 'Š'),
-        (r'\\~n', 'ñ'), (r'\\~N', 'Ñ'),
-        (r'\\ss', 'ß'),
+        (r"\\'e", 'Ã©'), (r"\\`e", 'Ã¨'), (r'\\"e', 'Ã«'), (r'\\^e', 'Ãª'),
+        (r"\\'a", 'Ã¡'), (r"\\`a", 'Ã '), (r'\\"a', 'Ã¤'), (r'\\^a', 'Ã¢'),
+        (r"\\'o", 'Ã³'), (r"\\`o", 'Ã²'), (r'\\"o', 'Ã¶'), (r'\\^o', 'Ã´'),
+        (r"\\'u", 'Ãº'), (r"\\`u", 'Ã¹'), (r'\\"u', 'Ã¼'), (r'\\^u', 'Ã»'),
+        (r"\\'i", 'Ã­'), (r"\\`i", 'Ã¬'), (r'\\"i', 'Ã¯'), (r'\\^i', 'Ã®'),
+        (r'\\c{c}', 'Ã§'), (r'\\c{C}', 'Ã‡'),
+        (r'\\c{s}', 'ÅŸ'), (r'\\c{S}', 'Åž'),
+        (r'\\v{s}', 'Å¡'), (r'\\v{S}', 'Å '),
+        (r'\\~n', 'Ã±'), (r'\\~N', 'Ã‘'),
+        (r'\\ss', 'ÃŸ'),
         (r"\\'", ''), (r'\\`', ''), (r'\\"', ''), (r'\\^', ''),
         (r'\\c', ''), (r'\\v', ''), (r'\\~', ''),
     ]
@@ -442,6 +517,180 @@ def _plan_probes(plan_obj: dict, topic: str, score_query: str) -> list:
     return probes[:8] or [topic]
 
 
+def _doc_admit_signature(topic: str, probes: list, doc_ids: list, settings: dict) -> str:
+    h = hashlib.sha256()
+    h.update((topic or "").encode("utf-8"))
+    h.update(json.dumps(probes, sort_keys=True).encode("utf-8"))
+    h.update(json.dumps(doc_ids, sort_keys=True).encode("utf-8"))
+    h.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _doc_admit_cache_path(sig: str):
+    return runs_path("cache", "doc_admit", f"{sig}.json")
+
+
+def _load_doc_admit_cache(sig: str):
+    obj = _load_doc_admit_cache_obj(sig)
+    if not obj:
+        return None
+    docs = obj.get("docs", [])
+    return docs if isinstance(docs, list) else None
+
+
+def _load_doc_admit_cache_obj(sig: str):
+    try:
+        with open(_doc_admit_cache_path(sig), encoding="utf-8") as f:
+            obj = json.load(f)
+        docs = obj.get("docs", [])
+        return obj if isinstance(docs, list) else None
+    except Exception:
+        return None
+
+
+def _save_doc_admit_cache(sig: str, docs: list, meta: dict, rejections: list = None):
+    ensure_dir(str(runs_path("cache", "doc_admit")))
+    with open(_doc_admit_cache_path(sig), "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "docs": docs, "rejections": rejections or []}, f, indent=2, ensure_ascii=False)
+
+
+def _best_probe_for_sentence(sentence: str, probes: list) -> str:
+    if not probes:
+        return ""
+    return max(probes, key=lambda p: fuzz.token_set_ratio(sentence, p))
+
+
+def _rerank_quotes_for_diversity(quotes: list, cap: int) -> list:
+    if cap <= 0 or len(quotes) <= cap:
+        return sorted(quotes, key=lambda x: x.get("score", 0), reverse=True)
+    remaining = sorted(quotes, key=lambda x: x.get("score", 0), reverse=True)
+    chosen = []
+    seen_pages = set()
+    seen_texts = []
+    while remaining and len(chosen) < cap:
+        best_idx = 0
+        best_value = None
+        for idx, q in enumerate(remaining):
+            text = q.get("text", "")
+            page_penalty = 8 if q.get("page") in seen_pages else 0
+            similarity_penalty = max((fuzz.token_set_ratio(text, s) for s in seen_texts), default=0) * 0.10
+            probe_bonus = 3 if q.get("best_probe") and q.get("best_probe") not in {x.get("best_probe") for x in chosen} else 0
+            value = float(q.get("score", 0)) + probe_bonus - page_penalty - similarity_penalty
+            if best_value is None or value > best_value:
+                best_idx = idx
+                best_value = value
+        q = remaining.pop(best_idx)
+        chosen.append(q)
+        seen_pages.add(q.get("page"))
+        seen_texts.append(q.get("text", ""))
+    return chosen
+
+
+def _select_budget_docs(docs: list, budget: int, probes: list, metrics=None) -> list:
+    if budget <= 0 or len(docs) <= budget:
+        if metrics:
+            metrics.set("doc_budget_requested", budget)
+            metrics.set("doc_budget_selected", len(docs))
+            metrics.set("doc_budget_exhaustive", True)
+        return sorted(docs, key=lambda x: x.get("avg_score", 0), reverse=True)
+
+    selected = []
+    remaining = sorted(docs, key=lambda x: x.get("avg_score", 0), reverse=True)
+    covered_probes = set()
+
+    while remaining and len(selected) < budget:
+        best_idx = 0
+        best_value = None
+        selected_doc_ids = {d.get("doc_id") for d in selected}
+        for idx, doc in enumerate(remaining):
+            doc_probes = set(doc.get("probe_hits", []))
+            new_probe_bonus = 5 * len(doc_probes - covered_probes)
+            score = float(doc.get("avg_score", 0))
+            evidence_bonus = min(len(doc.get("quotes", [])), 8)
+            duplicate_penalty = 20 if doc.get("doc_id") in selected_doc_ids else 0
+            value = score + new_probe_bonus + evidence_bonus - duplicate_penalty
+            if best_value is None or value > best_value:
+                best_idx = idx
+                best_value = value
+        doc = remaining.pop(best_idx)
+        selected.append(doc)
+        covered_probes.update(doc.get("probe_hits", []))
+
+    selected = sorted(selected, key=lambda x: x.get("avg_score", 0), reverse=True)
+    if metrics:
+        metrics.set("doc_budget_requested", budget)
+        metrics.set("doc_budget_selected", len(selected))
+        metrics.set("doc_budget_exhaustive", False)
+        metrics.set("doc_budget_probe_coverage", len(covered_probes))
+        metrics.inc("docs_budget_dropped", max(0, len(docs) - len(selected)))
+    return selected
+
+
+def _assign_evidence_ids(doc_summaries: list):
+    counter = 1
+    for doc in sorted(doc_summaries, key=lambda d: d.get("doc_id", "")):
+        for q in doc.get("quotes", []) or []:
+            q["evidence_id"] = f"E{counter:04d}"
+            counter += 1
+    return counter - 1
+
+
+def _mean_score(docs: list) -> float:
+    vals = [float(d.get("avg_score", 0) or 0) for d in docs or []]
+    return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+
+def _compute_topic_fit(topic: str, probes: list, all_doc_ids: list, admitted_docs: list,
+                       selected_docs: list, doc_summaries: list = None, rejections: list = None):
+    total = len(all_doc_ids) or 1
+    represented = doc_summaries or []
+    admitted_probe_hits = set()
+    selected_probe_hits = set()
+    for doc in admitted_docs or []:
+        admitted_probe_hits.update(doc.get("probe_hits", []) or [])
+    for doc in selected_docs or []:
+        selected_probe_hits.update(doc.get("probe_hits", []) or [])
+
+    probe_count = len(probes) or 1
+    rejection_counts = {}
+    for item in rejections or []:
+        reason = item.get("reason", "unknown")
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    summary = {
+        "topic": topic,
+        "docs_total": len(all_doc_ids),
+        "docs_admitted": len(admitted_docs or []),
+        "docs_selected_for_llm": len(selected_docs or []),
+        "docs_represented": len(represented),
+        "admission_share": round(len(admitted_docs or []) / total, 4),
+        "selection_share": round(len(selected_docs or []) / total, 4),
+        "represented_share": round(len(represented) / total, 4),
+        "admitted_probe_coverage": round(len(admitted_probe_hits) / probe_count, 4),
+        "selected_probe_coverage": round(len(selected_probe_hits) / probe_count, 4),
+        "mean_admitted_score": _mean_score(admitted_docs),
+        "mean_selected_score": _mean_score(selected_docs),
+        "rejection_counts": rejection_counts,
+        "warnings": [],
+    }
+
+    if summary["admission_share"] < 0.25:
+        summary["warnings"].append("low_admitted_document_share")
+    if summary["selected_probe_coverage"] < 0.5:
+        summary["warnings"].append("narrow_probe_coverage")
+    if summary["mean_selected_score"] and summary["mean_selected_score"] < 45:
+        summary["warnings"].append("low_mean_evidence_score")
+    if represented and summary["represented_share"] < 0.15:
+        summary["warnings"].append("low_represented_document_share")
+    return summary
+
+
+def _write_json_run(name: str, obj):
+    ensure_dir(str(runs_path()))
+    with open(runs_path(name), "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
 def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int, metrics=None) -> list:
     merged = {}
     per_probe_topk = max(1, topk)
@@ -468,11 +717,11 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     """
     Inner implementation of layered_t2.
     """
-    import os, json
+    import os, json, threading
     import pandas as pd
     from rrr.retrieve import retrieve
     from rrr.evidence_filter import select_sentences
-    from rrr.validate import validate_evidence
+    from rrr.validate import validate_evidence_verbose
     from rrr.utils import ensure_dir, write_run, normalize_space
 
     topic = args.topic
@@ -497,6 +746,12 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     MIN_DOC_SNIPS = int(os.environ.get("RRR_MIN_DOC_SNIPS", "3"))
     GLOBAL_MIN_DOCS = int(os.environ.get("RRR_GLOBAL_MIN_DOCS", "5"))
     MD_QUOTE_CAP = int(os.environ.get("RRR_MD_QUOTE_CAP", "8"))
+    DOC_BUDGET = int(os.environ.get("RRR_DOC_BUDGET", "24"))
+    DOC_ADMIT_CACHE = os.environ.get("RRR_DOC_ADMIT_CACHE", "1") != "0"
+    DOC_ADMIT_REPLAY = os.environ.get("RRR_DOC_ADMIT_REPLAY", "0") == "1"
+    EV_CAP = int(os.environ.get("RRR_EV_PER_DOC_CAP", "8"))
+    metrics.set("doc_admit_cache_enabled", int(DOC_ADMIT_CACHE))
+    metrics.set("doc_admit_replay", int(DOC_ADMIT_REPLAY))
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -512,19 +767,75 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     print(f"[Layered-T2] score_query={score_query}")
     print(f"[Layered-T2] probes={len(probes)}")
 
-    MAX_WORKERS = int(os.environ.get("RRR_CONCURRENCY", "4"))
+    admit_settings = {
+        "per_doc_topk": PER_DOC_TOPK,
+        "max_sents_per_page": MAX_SENTS_PER_PAGE,
+        "min_chars": MIN_CHARS,
+        "min_doc_snips": MIN_DOC_SNIPS,
+        "ev_cap": EV_CAP,
+        "min_sent_score": os.environ.get("RRR_MIN_SENT_SCORE", "40"),
+        "bypass_validation": os.environ.get("RRR_BYPASS_VALIDATION", "0"),
+    }
+    admit_sig = _doc_admit_signature(topic, probes, all_doc_ids, admit_settings)
+    write_run_manifest(
+        "T2_LAYERED_GLOBAL",
+        topic,
+        meta_path,
+        _MODEL,
+        plan=plan_obj,
+        extra={"admit_settings": admit_settings, "restart_attempt": restart_attempt},
+    )
 
-    print(f"[Layered-T2] starting per-document sweep over {len(all_doc_ids)} docs (concurrency={MAX_WORKERS})")
+    MAX_WORKERS = int(os.environ.get("RRR_CONCURRENCY", "4"))
+    admission_rejections = []
+    rejection_lock = threading.Lock()
+
+    def summarize_candidates(candidates):
+        out = []
+        for c in candidates[:10]:
+            out.append({
+                "page": int(c.get("page", 0) or 0),
+                "bm25_score": round(float(c.get("bm25_score", 0.0) or 0.0), 4),
+                "matched_probe_count": len(c.get("matched_probes", []) or []),
+                "matched_probes": (c.get("matched_probes", []) or [])[:4],
+            })
+        return out
+
+    def record_rejection(did, reason, candidates=None, **details):
+        item = {
+            "doc_id": did,
+            "citation": refs.get(did, did),
+            "reason": reason,
+            "thresholds": {
+                "min_doc_snips": MIN_DOC_SNIPS,
+                "min_chars": MIN_CHARS,
+                "min_sent_score": admit_settings["min_sent_score"],
+                "per_doc_topk": PER_DOC_TOPK,
+                "max_sents_per_page": MAX_SENTS_PER_PAGE,
+            },
+            "candidate_pages": summarize_candidates(candidates or []),
+        }
+        item.update(details)
+        with rejection_lock:
+            admission_rejections.append(item)
+
+    print(f"[Layered-T2] starting evidence admission over {len(all_doc_ids)} docs (concurrency={MAX_WORKERS})")
 
     def process_doc(did):
         metrics.inc("docs_processed")
         candidates = _retrieve_doc_with_probes(retrieve, did, probes, PER_DOC_TOPK, metrics=metrics)
         metrics.inc("retrieved_pages_kept", len(candidates))
+        if not candidates:
+            record_rejection(did, "no_retrieved_pages", candidates=[])
+            metrics.inc("docs_rejected_no_pages")
+            return None
 
         quotes = []
+        page_sentence_counts = {}
         for c in candidates:
             txt = c.get("text", "").strip()
             if not txt:
+                page_sentence_counts[int(c.get("page", 0) or 0)] = 0
                 continue
             scored_sents = select_sentences(
                 txt,
@@ -533,16 +844,20 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 min_chars=MIN_CHARS,
                 probes=probes,
             )
+            page_sentence_counts[int(c.get("page", 0) or 0)] = len(scored_sents)
             for sent, score in scored_sents:
                 s_norm = normalize_space(sent)
                 if len(s_norm) < MIN_CHARS:
                     continue
+                best_probe = _best_probe_for_sentence(s_norm, c.get("matched_probes") or probes)
                 quotes.append({
                     "type": "quote",
                     "doc_id": did,
                     "page": int(c["page"]),
                     "text": s_norm,
-                    "score": score
+                    "score": score,
+                    "best_probe": best_probe,
+                    "matched_probes": c.get("matched_probes", []),
                 })
         metrics.inc("candidate_quotes", len(quotes))
 
@@ -555,37 +870,72 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
         if len(quotes) < MIN_DOC_SNIPS:
             metrics.inc("docs_rejected_min_quotes")
+            record_rejection(
+                did,
+                "insufficient_candidate_sentences",
+                candidates=candidates,
+                selected_sentence_count=len(quotes),
+                page_sentence_counts=page_sentence_counts,
+            )
             return None
 
-        val = validate_evidence(quotes, df)
+        verbose_val = validate_evidence_verbose(quotes, df)
+        val = [{"item": v["item"], "ok": v["verdict"] in ("exact", "soft_ok", "bypass"), "reason": v["reason"]} for v in verbose_val]
         metrics.inc("validation_items", len(val))
         metrics.inc("validation_ok", sum(1 for v in val if v["ok"]))
         metrics.inc("validation_failed", sum(1 for v in val if not v["ok"]))
         valid_quotes = [v["item"] for v in val if v["ok"]]
         if len(valid_quotes) < MIN_DOC_SNIPS:
             metrics.inc("docs_rejected_validation")
+            reason_counts = {}
+            for v in verbose_val:
+                reason = v.get("reason") or v.get("verdict") or "unknown"
+                if v.get("verdict") not in ("exact", "soft_ok", "bypass"):
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            record_rejection(
+                did,
+                "insufficient_validated_quotes",
+                candidates=candidates,
+                selected_sentence_count=len(quotes),
+                validation_items=len(val),
+                validation_ok=len(valid_quotes),
+                validation_failed=len(val) - len(valid_quotes),
+                validation_reason_counts=reason_counts,
+            )
             return None
 
-        valid_quotes = sorted(valid_quotes, key=lambda x: x.get("score", 0), reverse=True)
-        EV_CAP = int(os.environ.get("RRR_EV_PER_DOC_CAP", "8"))
-        valid_quotes = valid_quotes[:EV_CAP]
+        valid_quotes = _rerank_quotes_for_diversity(valid_quotes, EV_CAP)
         metrics.inc("valid_quotes_kept", len(valid_quotes))
 
-        def _clip(s, n=220):
-            return (s[:n] + "…") if len(s) > n else s
-        ev_texts = [f"[{q['doc_id']} p.{q['page']}]\n- {_clip(q['text'])}" for q in valid_quotes]
+        avg_score = sum(q.get("score", 0) for q in valid_quotes) / len(valid_quotes) if valid_quotes else 0
+        probe_hits = []
+        for q in valid_quotes:
+            for probe in q.get("matched_probes", []) or [q.get("best_probe")]:
+                if probe and probe not in probe_hits:
+                    probe_hits.append(probe)
 
-        # ============================================================
-        # STANCE: Classify from abstract (cached by doc_id + topic)
-        # ============================================================
-        abstract_stance = classify_stance(did, topic, metrics=metrics)
+        metrics.inc("docs_admitted")
+        return {
+            "doc_id": did,
+            "citation": refs.get(did, did),
+            "quotes": valid_quotes,
+            "avg_score": round(avg_score, 2),
+            "probe_hits": probe_hits,
+        }
 
-        # ============================================================
-        # MECHANISMS: Extract from snippets (unchanged logic)
-        # ============================================================
+    def enrich_doc(doc):
+        did = doc["doc_id"]
+        valid_quotes = doc.get("quotes", [])
+        ev_texts = []
+        for q in valid_quotes:
+            text = q.get("text", "")
+            clipped = (text[:220] + "...") if len(text) > 220 else text
+            ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
+
+        evidence_stance = classify_evidence_stance(did, topic, valid_quotes, metrics=metrics)
+
         topic_words = set(w.lower() for w in re.findall(r'\b\w{4,}\b', topic))
         topic_words_str = ", ".join(sorted(topic_words))
-
         mechanism_prompt = (
             "Extract the key causal mechanisms from this document using ONLY the quotes provided.\n\n"
             f"Topic:\n{topic}\n\n"
@@ -645,23 +995,70 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             else:
                 metrics.cache_event("mechanism", "skips")
         metrics.inc("mechanisms_extracted", len(mechanisms))
-
-        avg_score = sum(q.get("score", 0) for q in valid_quotes) / len(valid_quotes) if valid_quotes else 0
-
         metrics.inc("docs_kept")
-        return {
-            "doc_id": did,
-            "citation": refs.get(did, did),
-            "stance": abstract_stance,  # FROM ABSTRACT
-            "mechanisms": mechanisms,
-            "quotes": valid_quotes,
-            "avg_score": round(avg_score, 2)
-        }
+
+        enriched = dict(doc)
+        enriched["stance"] = evidence_stance
+        enriched["mechanisms"] = mechanisms
+        return enriched
+
+    admitted_docs = None
+    if DOC_ADMIT_CACHE and DOC_ADMIT_REPLAY:
+        cached_admit = _load_doc_admit_cache_obj(admit_sig)
+        if cached_admit is not None:
+            admitted_docs = cached_admit.get("docs", [])
+            admission_rejections.extend(cached_admit.get("rejections", []) or [])
+            metrics.cache_event("doc_admit", "hits")
+            metrics.set("doc_admit_cache_key", admit_sig)
+        else:
+            metrics.cache_event("doc_admit", "misses")
+    elif DOC_ADMIT_CACHE:
+        metrics.cache_event("doc_admit", "skips")
+        metrics.set("doc_admit_cache_key", admit_sig)
+
+    if admitted_docs is None:
+        admitted_docs = []
+        with metrics.stage("evidence_admission"):
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                futures = {pool.submit(process_doc, did): did for did in all_doc_ids}
+                for fut in as_completed(futures):
+                    res = fut.result()
+                    if res:
+                        admitted_docs.append(res)
+        admitted_docs = sorted(admitted_docs, key=lambda x: x.get("avg_score", 0), reverse=True)
+        admission_rejections = sorted(admission_rejections, key=lambda x: x.get("doc_id", ""))
+        if DOC_ADMIT_CACHE:
+            _save_doc_admit_cache(admit_sig, admitted_docs, admit_settings, rejections=admission_rejections)
+            metrics.cache_event("doc_admit", "writes")
+            metrics.set("doc_admit_cache_key", admit_sig)
+    _write_json_run("admission_rejections.json", {
+        "topic": topic,
+        "cache_key": admit_sig,
+        "rejections": admission_rejections,
+    })
+    metrics.set("docs_rejected_total", len(admission_rejections))
+
+    metrics.set("docs_admitted_total", len(admitted_docs))
+    selected_docs = _select_budget_docs(admitted_docs, DOC_BUDGET, probes, metrics=metrics)
+    metrics.set("docs_selected_for_llm", len(selected_docs))
+    topic_fit = _compute_topic_fit(
+        topic,
+        probes,
+        all_doc_ids,
+        admitted_docs,
+        selected_docs,
+        rejections=admission_rejections,
+    )
+    _write_json_run("topic_fit.json", topic_fit)
+    metrics.set("topic_fit_warnings", topic_fit.get("warnings", []))
+    metrics.set("topic_fit_admission_share", topic_fit.get("admission_share"))
+    metrics.set("topic_fit_selected_probe_coverage", topic_fit.get("selected_probe_coverage"))
+    print(f"[Layered-T2] admitted={len(admitted_docs)} selected_for_llm={len(selected_docs)} budget={DOC_BUDGET}")
 
     doc_summaries = []
     with metrics.stage("per_document_sweep"):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(process_doc, did): did for did in all_doc_ids}
+            futures = {pool.submit(enrich_doc, doc): doc.get("doc_id") for doc in selected_docs}
             for fut in as_completed(futures):
                 res = fut.result()
                 if res:
@@ -680,6 +1077,9 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 break
         doc["cluster"] = mech_to_cluster.get(primary, "Other") if primary else "Other"
 
+    evidence_id_count = _assign_evidence_ids(doc_summaries)
+    metrics.set("evidence_ids_assigned", evidence_id_count)
+
     for entry in doc_summaries:
         did = entry["doc_id"]
         with open(runs_path("layered_docs", f"{did}.json"), "w", encoding="utf-8") as f:
@@ -687,6 +1087,18 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     kept = len(doc_summaries)
     metrics.set("docs_represented", kept)
+    topic_fit = _compute_topic_fit(
+        topic,
+        probes,
+        all_doc_ids,
+        admitted_docs,
+        selected_docs,
+        doc_summaries=doc_summaries,
+        rejections=admission_rejections,
+    )
+    _write_json_run("topic_fit.json", topic_fit)
+    metrics.set("topic_fit_warnings", topic_fit.get("warnings", []))
+    metrics.set("topic_fit_represented_share", topic_fit.get("represented_share"))
     print(f"[Layered-T2] per-document sweep complete: {kept} docs summarised")
 
     # Print stance distribution
@@ -701,6 +1113,14 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                   {"refusal": True, "reason": "insufficient_global_evidence"})
         metrics.set("refusal", True)
         metrics.set("refusal_reason", "insufficient_global_evidence")
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL",
+            topic,
+            meta_path,
+            _MODEL,
+            plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit, "refusal": "insufficient_global_evidence"},
+        )
         metrics.save()
         return
 
@@ -756,6 +1176,14 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         "topic": topic,
         "plan": plan_obj,
         "bypass_condition": os.environ.get("RRR_BYPASS_VALIDATION", "0") == "1",
+        "topic_fit": topic_fit,
+        "admission": {
+            "cache_key": admit_sig,
+            "settings": admit_settings,
+            "docs_admitted": len(admitted_docs),
+            "docs_rejected": len(admission_rejections),
+            "docs_selected_for_llm": len(selected_docs),
+        },
         "docs": doc_summaries,
         "restarts_required": restart_attempt
     }
@@ -848,6 +1276,14 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 print("\n" + "="*80 + "\n")
                 metrics.set("refusal", True)
                 metrics.set("refusal_reason", "no_citations_found")
+                write_run_manifest(
+                    "T2_LAYERED_GLOBAL",
+                    topic,
+                    meta_path,
+                    _MODEL,
+                    plan=plan_obj,
+                    extra={"admit_settings": admit_settings, "topic_fit": topic_fit, "refusal": "no_citations_found"},
+                )
                 metrics.save()
                 return
 
@@ -885,6 +1321,24 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             metrics.set("writer_error", str(e))
 
     metrics.set("refusal", False)
+    write_run_manifest(
+        "T2_LAYERED_GLOBAL",
+        topic,
+        meta_path,
+        _MODEL,
+        plan=plan_obj,
+        extra={
+            "admit_settings": admit_settings,
+            "topic_fit": topic_fit,
+            "outputs": [
+                "review_ledger.json",
+                "review_narrative.md",
+                "topic_fit.json",
+                "admission_rejections.json",
+                "run_metrics.json",
+            ],
+        },
+    )
     metrics.save()
 
 
