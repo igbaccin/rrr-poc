@@ -217,8 +217,13 @@ def _format_doc_entry(d) -> str:
         lines.append("  Mechanisms:")
         for m in mechanisms[:2]:
             lines.append(f"  - {_clip(m, n=180)}")
+    # v12: cap quotes per doc shown to the writer. The v11.1 smoke produced
+    # paragraphs that leaned on a single source for four consecutive citations
+    # because the prompt surfaced four pages from that doc. Capping at 2
+    # forces the writer to integrate at least one other source per claim.
+    quotes_per_doc = int(os.environ.get("RRR_WRITER_QUOTES_PER_DOC", "2"))
     qs = d.get("quotes") or []
-    for q in qs[:4]:
+    for q in qs[:max(1, quotes_per_doc)]:
         lines.append(f"  {_format_quote(q)}")
     return "\n".join(lines)
 
@@ -829,6 +834,45 @@ def _remove_style_violations(text: str) -> tuple:
     return cleaned_text.strip(), removed
 
 
+# v12: detect meta-commentary about the review/paper itself. The closing
+# section of v11.2 leaked sentences like "The literature reviewed here
+# converges on...". Catch-and-strip rather than catch-and-warn because these
+# are pure noise — the substantive claim sits in the next sentence.
+_META_COMMENTARY_RE = re.compile(
+    r"\b("
+    r"the literature reviewed (?:here|above)?"
+    r"|this (?:review|paper|essay|article|analysis|discussion|investigation)"
+    r"|the (?:sources|works|studies|papers) (?:cited|reviewed|discussed|surveyed)"
+    r"|as (?:discussed|noted|shown|argued|established) (?:above|earlier)"
+    r"|in (?:this|the (?:foregoing|preceding)) (?:review|paper|essay|article|section|discussion)"
+    r"|we (?:will|shall) (?:examine|explore|investigate|consider|argue|show|discuss|analyse|analyze)"
+    r"|this (?:section|paragraph) (?:examines|explores|investigates|considers|argues|shows|discusses)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_meta_commentary(text: str) -> tuple:
+    """v12: drop sentences that talk about the review itself rather than the
+    substantive question. Returns (cleaned_text, list_of_removed_snippets)."""
+    if not text:
+        return text, []
+    removed = []
+    cleaned_paragraphs = []
+    for para in text.split("\n\n"):
+        kept_sents = []
+        for sent in _split_sentences_for_cleanup(para):
+            if _META_COMMENTARY_RE.search(sent):
+                removed.append(_clip(sent, n=200))
+            else:
+                kept_sents.append(sent)
+        if kept_sents:
+            cleaned_paragraphs.append(" ".join(kept_sents))
+    cleaned = "\n\n".join(cleaned_paragraphs)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), removed
+
+
 def _strip_orphaned_citations(text: str) -> str:
     # Remove lines that are ONLY a citation.
     lines = text.split('\n')
@@ -955,7 +999,11 @@ def _writer_enforcement_enabled() -> bool:
 
 
 def _writer_parallel_workers(n_chunks: int) -> int:
-    if n_chunks <= 1 or os.environ.get("RRR_WRITER_PARALLEL", "1") == "0":
+    # v12: default flipped from "1" to "0". Sequential writing with the v11.2
+    # claims-so-far context produces tighter cross-section coherence (0 twin
+    # openers vs 3 in parallel) at minimal runtime cost (+10-15s). Set
+    # RRR_WRITER_PARALLEL=1 to opt back into parallel.
+    if n_chunks <= 1 or os.environ.get("RRR_WRITER_PARALLEL", "0") == "0":
         return 1
     raw = os.environ.get("RRR_WRITER_PARALLELISM") or os.environ.get("RRR_CONCURRENCY") or "2"
     try:
@@ -1119,7 +1167,16 @@ _PROSE_DIRECTIVE = (
     "parenthetical reference rather than presenting each as a separate witness — e.g. "
     "'the institutional turn is established across the literature ([E0001]; [E0007]; [E0014]).' "
     "Save the named, narrative form 'Author (Year, p.N) argues that...' for moments when one "
-    "source's specific argument is the subject of the sentence."
+    "source's specific argument is the subject of the sentence. "
+    # v12: prevent single-author paragraphs (van-Zanden-monoculture failure).
+    "Each paragraph must integrate at least two DISTINCT documents. Do not cite "
+    "the same document for more than two consecutive citations; introduce another "
+    "source before returning. "
+    # v12: prevent meta-commentary about the review itself.
+    "Make claims directly about the substantive question. Do NOT write meta-statements "
+    "such as 'this review', 'the literature reviewed here', 'the sources cited', "
+    "'as discussed above', 'this paper argues', 'we will examine', or any other "
+    "reference to the review document itself."
 )
 
 # v8 (R4): single canonical set of prompt builders. The previous file had two
@@ -1477,7 +1534,9 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     skipped_citation = 0
     skipped_empty = 0
     skipped_topic_paraphrase = 0
+    skipped_tail_echo = 0
     interior_set = set(interior_indices)
+    prev_tail_by_index = {e["index"]: e["prev_tail"] for e in extracts}
     cite_token_re = re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\)")
 
     # v11.1: topic-paraphrase guard. Compute the topic's content-token set once,
@@ -1535,6 +1594,23 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         if topic_tokens and overlap >= paraphrase_threshold:
             skipped_topic_paraphrase += 1
             continue
+        # v12: reject if the rewrite is an echo of the previous section's tail.
+        # The original failure: the LLM "flows from prev_tail" by literally
+        # copying it as the new opener, producing visible duplicate sentences
+        # at every section boundary. Same shape as the topic-paraphrase guard
+        # but referenced against prev_tail.
+        prev_tail = prev_tail_by_index.get(idx, "")
+        if prev_tail:
+            prev_tail_tokens = _content_tokens(prev_tail)
+            tail_overlap = len(rewrite_tokens & prev_tail_tokens)
+            # Threshold: shared >= 6 content tokens, OR rewrite tokens are a
+            # strict subset of prev_tail tokens with at least 4 shared. The
+            # subset check catches paraphrases that change a few words.
+            if (tail_overlap >= 6) or (
+                tail_overlap >= 4 and rewrite_tokens and rewrite_tokens.issubset(prev_tail_tokens)
+            ):
+                skipped_tail_echo += 1
+                continue
         sents[0] = rewritten
         new_chunks[idx] = " ".join(sents)
         applied += 1
@@ -1544,10 +1620,12 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         metrics.set("writer_stitch_skipped_citation_change", skipped_citation)
         metrics.set("writer_stitch_skipped_empty", skipped_empty)
         metrics.set("writer_stitch_skipped_topic_paraphrase", skipped_topic_paraphrase)
-    if applied or skipped_topic_paraphrase:
+        metrics.set("writer_stitch_skipped_tail_echo", skipped_tail_echo)
+    if applied or skipped_topic_paraphrase or skipped_tail_echo:
         print(f"[Writer] Cross-section stitch: rewrote {applied} section "
               f"opener(s) (skipped {skipped_citation} citation drift, "
-              f"{skipped_topic_paraphrase} topic paraphrase)")
+              f"{skipped_topic_paraphrase} topic paraphrase, "
+              f"{skipped_tail_echo} tail echo)")
     return new_chunks
 
 
@@ -1625,7 +1703,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     with open(ledger_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    topic = data.get("topic", "(no topic)")
+    topic_display = data.get("topic", "(no topic)")
+    # v12: writer prompts use the reformulated topic question. Falls back to
+    # raw topic when the planner didn't (or couldn't) reformulate.
+    topic = (data.get("plan", {}) or {}).get("topic_question") or topic_display
+    topic_dimensions = (data.get("plan", {}) or {}).get("topic_dimensions") or []
+    if topic != topic_display:
+        print(f"[Writer] using reformulated topic: '{topic}'")
+        if topic_dimensions:
+            print(f"[Writer] topic dimensions: {topic_dimensions}")
     docs = data.get("docs", [])
     if not isinstance(docs, list) or not docs:
         raise SystemExit("Ledger empty or malformed (no docs).")
@@ -2192,6 +2278,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
     full_text = _strip_continuation_markers(full_text)
+
+    # v12: drop sentences that talk about the review itself ("the literature
+    # reviewed here converges...", "this review will examine..."). Runs after
+    # the structural strips and before the citation surface rewrite so the
+    # detector sees the canonical form, not the display form.
+    full_text, meta_removed = _strip_meta_commentary(full_text)
+    if meta_removed and metrics:
+        metrics.inc("writer_meta_commentary_stripped", len(meta_removed))
+    if meta_removed:
+        print(f"[Writer] Stripped {len(meta_removed)} meta-commentary sentence(s):")
+        for s in meta_removed[:3]:
+            print(f"         - {s}")
 
     full_text = re.sub(r'\n{3,}', '\n\n', full_text)
 

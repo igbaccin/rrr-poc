@@ -130,6 +130,86 @@ def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None):
         return []
 
 
+# v12: topic reformulation. Normalises any user-typed topic into a
+# scholarly-question form for internal use, while leaving the user's original
+# string on the rendered output's title. The pipeline currently threads the
+# raw topic into every writer prompt, which produces meta-commentary and
+# defend/attack framing when the user writes a strong thesis. Reformulating
+# upstream eliminates that pressure.
+_TOPIC_REFORM_OPTIONS = {
+    "temperature": float(os.environ.get("RRR_TOPIC_REFORM_T", "0.0")),
+    "num_ctx": int(os.environ.get("RRR_TOPIC_REFORM_CTX", "2048")),
+    "num_predict": int(os.environ.get("RRR_TOPIC_REFORM_PRED", "400")),
+}
+
+
+def _reformulate_topic(topic: str, model: str, metrics=None):
+    """v12: turn the user's raw topic into a scholarly investigation question.
+
+    Returns a dict {topic_question, topic_dimensions} or None on any failure
+    (caller falls back to using the raw topic for both surfaces).
+    """
+    start = time.perf_counter()
+    try:
+        import ollama
+        prompt = (
+            "Read the user's research topic. Produce a normalised internal "
+            "version that the literature-review writer will use as its frame.\n\n"
+            "Goals:\n"
+            "1. Convert any thesis or assertion into a scholarly investigation "
+            "question. The writer must investigate, not defend or attack.\n"
+            "   - 'X causes Y' becomes 'What is the role of X in Y?'\n"
+            "   - 'Did Z happen?' stays as is.\n"
+            "   - A bare phrase like 'X and Y' becomes 'What is the role of X "
+            "in shaping Y?' (fill in the implicit verb).\n"
+            "2. Name 3-5 dimensions of disagreement the literature would have "
+            "around this question (e.g. mechanism, scope conditions, "
+            "measurement, period, region).\n\n"
+            "Topic from user:\n" + topic + "\n\n"
+            "Return ONLY a JSON object with two keys:\n"
+            "  topic_question: a single sentence ending with '?'\n"
+            "  topic_dimensions: array of 3-5 short phrases (2-5 words each)"
+        )
+        res = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options=_TOPIC_REFORM_OPTIONS,
+            keep_alive="5m",
+            format="json",
+            stream=False,
+        )
+        raw = (res.get("message", {}).get("content") or "").strip()
+        start_idx = raw.find("{")
+        end_idx = raw.rfind("}")
+        if start_idx < 0 or end_idx <= start_idx:
+            return None
+        obj = json.loads(raw[start_idx:end_idx + 1])
+        question = str(obj.get("topic_question", "")).strip()
+        if not question:
+            return None
+        if not question.endswith("?"):
+            question = question.rstrip(".") + "?"
+        dimensions = obj.get("topic_dimensions", [])
+        if not isinstance(dimensions, list):
+            dimensions = []
+        dimensions = [str(d).strip() for d in dimensions if str(d).strip()][:5]
+        duration_s = time.perf_counter() - start
+        if metrics:
+            metrics.record_llm(
+                "topic_reformulation", model, options=_TOPIC_REFORM_OPTIONS,
+                duration_s=duration_s, prompt_chars=len(prompt),
+                response_chars=len(raw),
+            )
+        return {"topic_question": question[:300], "topic_dimensions": dimensions}
+    except Exception as e:
+        if metrics:
+            metrics.record_llm(
+                "topic_reformulation", model, options=_TOPIC_REFORM_OPTIONS,
+                success=False, duration_s=time.perf_counter() - start, error=e,
+            )
+        return None
+
+
 def _merge_probes_with_terms(probes, terms, cap=None):
     """v9 (R7): merge stage-1 probes and stage-2 technical terms; reject
     near-duplicates via substring containment (avoids adding the rapidfuzz
@@ -204,6 +284,20 @@ def plan(topic: str, metrics=None):
                 obj["planner_meta"]["terms_of_art_count"] = len(terms)
                 obj["planner_meta"]["probes_added_by_terms"] = added
                 print(f"[Planner] stage2 terms_of_art={len(terms)} probes_added={added} total_probes={len(obj['probes'])}")
+
+        # v12: topic reformulation. Falls back to raw topic on failure so the
+        # rest of the pipeline never breaks on a None topic_question.
+        obj["topic_display"] = topic
+        obj["topic_question"] = topic
+        if os.environ.get("RRR_TOPIC_REFORMULATION", "1") != "0":
+            reform = _reformulate_topic(topic, model, metrics=metrics)
+            if reform:
+                obj["topic_question"] = reform["topic_question"]
+                obj["topic_dimensions"] = reform["topic_dimensions"]
+                obj["planner_meta"]["topic_reformulated"] = True
+                print(f"[Planner] topic_question='{reform['topic_question']}'")
+                if reform["topic_dimensions"]:
+                    print(f"[Planner] topic_dimensions={reform['topic_dimensions']}")
 
         print(f"[Planner] mode={obj['planner_meta']['mode']} n_must={len(obj['keywords_must'])} n_any={len(obj['keywords_any'])} n_probes={len(obj['probes'])}")
         if metrics:
