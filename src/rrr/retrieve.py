@@ -1,7 +1,7 @@
 import os, pickle, numpy as np
 from functools import lru_cache
 from rrr.paths import indices_path, page_text_path, require_file, require_indices_dir, require_page_text_dir
-from rrr.text import tokenize
+from rrr.text import tokenize, tokenize_query
 
 @lru_cache(maxsize=1)
 def _load_bm25_and_ids():
@@ -23,9 +23,13 @@ from functools import lru_cache
 
 @lru_cache(maxsize=8)
 def _scores_for_query_cached(query: str):
-    """Compute BM25 scores once per topic, then reuse."""
+    """Compute BM25 scores once per topic, then reuse.
+
+    v8: uses tokenize_query (preserves hyphens, smaller stoplist) so multi-word
+    concepts like 'rule of law', 'long-run growth' don't collapse before scoring.
+    """
     bm, page_ids = _load_bm25_and_ids()
-    toks = tokenize(query)
+    toks = tokenize_query(query)
     scores = bm.get_scores(toks)
     return bm, page_ids, toks, scores
 
@@ -42,6 +46,9 @@ def retrieve_doc_pages(query: str, doc_id: str, pages_per_doc=4):
     bm, page_ids, toks, scores = _scores_for_query_cached(query)
     pairs = [(i, scores[i]) for i, pid in enumerate(page_ids) if pid.startswith(f"{doc_id}_page_")]
     pairs.sort(key=lambda x: x[1], reverse=True)
+    # v8: drop zero-score pages so they don't occupy candidate slots that
+    # downstream filters then waste LLM calls trying to extract signal from.
+    pairs = [p for p in pairs if p[1] > 0.0]
     out = []
     for i, score in pairs[:max(1, pages_per_doc)]:
         pid = page_ids[i]; did, page = _split_pid(pid)

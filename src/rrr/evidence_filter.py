@@ -53,8 +53,33 @@ def _is_biblio(s: str) -> bool:
     # "eds." with year or page info
     if re.search(r'\beds\.?\b', s_lower) and re.search(r'\d{4}|\d+[-–]\d+', s):
         return True
-    
+
     return False
+
+
+# v10.3 #3: corruption signals from PDF extraction artefacts. Two patterns are
+# common in the corpus: spaced-letter sequences ("H O P K I N S") that result
+# from per-glyph extraction on small-cap text, and run-on words
+# ("technologycompatible") that result from a missing space at a column break.
+_SPACED_LETTERS_RE = re.compile(r"(?:\b[A-Za-z]\s+){4,}[A-Za-z]\b")
+_RUNON_TOKEN_RE = re.compile(r"\b[A-Za-z]{26,}\b")
+
+def _quote_corruption_signals(s: str) -> int:
+    """Return the number of corruption signals detected in s.
+
+    0 = clean, 1+ = at least one PDF-extraction artefact present. The cap on
+    long alpha tokens is set above the longest plausible English compound word
+    so it triggers on the run-on pattern but not on real terminology.
+    """
+    if not s:
+        return 0
+    signals = 0
+    if _SPACED_LETTERS_RE.search(s):
+        signals += 1
+    if _RUNON_TOKEN_RE.search(s):
+        signals += 1
+    return signals
+
 
 def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_chars: int = 40, probes=None):
     """
@@ -71,6 +96,15 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
     sentences = [s for s in sentences if not _is_biblio(s)]
     if not sentences:
         return []
+
+    # v10.3 #3: drop sentences with PDF-extraction artefacts when the knob is
+    # on. Default 0 = off (backwards-compatible). 1 = drop sentences with any
+    # corruption signal; 2 = drop only when multiple signals fire.
+    quote_quality_min = int(os.environ.get("RRR_WRITER_QUOTE_QUALITY_MIN", "0"))
+    if quote_quality_min > 0:
+        sentences = [s for s in sentences if _quote_corruption_signals(s) < quote_quality_min]
+        if not sentences:
+            return []
 
     min_score = int(os.environ.get("RRR_MIN_SENT_SCORE", "40"))
 

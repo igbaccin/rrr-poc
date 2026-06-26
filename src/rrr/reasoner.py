@@ -9,9 +9,14 @@ from rrr.text import tokenize
 from rapidfuzz import fuzz
 
 _MODEL      = os.environ.get("RRR_MODEL", "mistral")
+# v8 (R12): harmonise per-stage num_ctx down from 8192 to 4096 for the small
+# reasoner/cluster prompts. Under OLLAMA_MAX_LOADED_MODELS=1 each ctx change
+# forces a KV-cache reinit. Cluster prompt observed ~2400 chars (well inside
+# 4096). Mechanism already at 4096. Net effect: removes 3-5s of reinit time at
+# each stage transition (~6-10s/run). Override per-stage envs to revert.
 _OPTIONS_REASON = {
     "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_REASONER_CTX", "8192")),
+    "num_ctx": int(os.environ.get("RRR_REASONER_CTX", "4096")),
     "num_predict": int(os.environ.get("RRR_REASONER_PRED", "2000")),
 }
 _OPTIONS_MECHANISM = {
@@ -21,11 +26,88 @@ _OPTIONS_MECHANISM = {
 }
 _OPTIONS_CLUSTER = {
     "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_CLUSTER_CTX", "8192")),
+    "num_ctx": int(os.environ.get("RRR_CLUSTER_CTX", "4096")),
     "num_predict": int(os.environ.get("RRR_CLUSTER_PRED", "2500")),
 }
 _KEEP_ALIVE = "30m"
-_MECHANISM_PROMPT_VERSION = os.environ.get("RRR_MECH_PROMPT_VERSION", "2026-06-25-batch1")
+# v8 (R2): bump prompt version so v7 caches don't collide with v8 mechanism format.
+_MECHANISM_PROMPT_VERSION = os.environ.get("RRR_MECH_PROMPT_VERSION", "2026-06-25-v8")
+# v9 (R3): version key for fused stance+mechanism cache entries (separate from
+# mechanism cache so a v8 mechanism cache hit cannot serve a v9 caller missing
+# stance/rationale/contested).
+_FUSED_PROMPT_VERSION = os.environ.get("RRR_FUSED_PROMPT_VERSION", "2026-06-25-v9-fused")
+# v9 (R3): structured-output options for the fused call. num_predict bumped
+# vs mechanism because the JSON contains stance + rationale + mechanism +
+# contested + mechanisms[] (richer payload).
+_OPTIONS_FUSED = {
+    "temperature": 0.0,
+    "num_ctx": int(os.environ.get("RRR_FUSED_CTX", "4096")),
+    "num_predict": int(os.environ.get("RRR_FUSED_PRED", "500")),
+}
+_FUSED_STANCE_TOKENS = {"supports", "critiques", "complicates", "tangential"}
+
+# v11-C: cluster-level synthesis call. One LLM pass per (stance, cluster) bucket
+# of >=2 docs producing {shared_mechanism, supporting_doc_ids, qualifying_doc_ids,
+# contested_dimension}. Lets the writer say "established across the literature
+# (X; Y; Z)" instead of one-citation-per-claim.
+_CLUSTER_SYNTH_PROMPT_VERSION = os.environ.get(
+    "RRR_CLUSTER_SYNTH_PROMPT_VERSION", "2026-06-26-v11c"
+)
+_OPTIONS_CLUSTER_SYNTH = {
+    "temperature": 0.0,
+    "num_ctx": int(os.environ.get("RRR_CLUSTER_SYNTH_CTX", "8192")),
+    "num_predict": int(os.environ.get("RRR_CLUSTER_SYNTH_PRED", "600")),
+}
+
+
+# v8 (R2): sanitiser for mechanism strings. The mechanism LLM call returns free
+# text that often embeds citation-like substrings; mistral occasionally mis-types
+# years (baseline had "North_1689" for "North_1989"). Mechanisms bypass
+# validate.py because they are not citation-validated; sanitising here closes
+# the only fabrication leak that touches review_narrative.md.
+_MECH_PAREN_CITE_RE = re.compile(
+    r"\(\s*([A-Za-z0-9_&.\-]+)_(\d{4})(?:\s*[:p\.]+\s*(\d+))?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _canonicalise_mech_citation(mechanism: str, allowed_doc_ids: set) -> str:
+    """Strip parentheticals from a mechanism string when the doc_id does not
+    match any document in the allowed set. Preserves valid corpus IDs.
+
+    The writer renders citations separately via the ledger evidence_id map, so
+    parentheticals in the mechanism text are mostly noise anyway. We choose to
+    DROP rather than rewrite so a misspelled year cannot leak as a confident
+    citation.
+    """
+    if not mechanism:
+        return mechanism
+
+    def repl(m):
+        candidate = f"{m.group(1)}_{m.group(2)}"
+        # Allow exact match against known corpus docs (including the doc that
+        # this mechanism came from). Anything else we drop.
+        if candidate in allowed_doc_ids:
+            page = m.group(3)
+            if page:
+                return f"({candidate}: p.{page})"
+            return f"({candidate})"
+        return ""
+
+    cleaned = _MECH_PAREN_CITE_RE.sub(repl, mechanism)
+    # Collapse the whitespace gaps the deletions leave behind.
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([.,;:])", r"\1", cleaned)
+    return cleaned
+
+
+def _canonicalise_mech_list(mechanisms, allowed_doc_ids: set):
+    out = []
+    for m in mechanisms or []:
+        s = _canonicalise_mech_citation(str(m).strip(), allowed_doc_ids)
+        if s:
+            out.append(s)
+    return out
 
 
 class ClusteringFailedError(Exception):
@@ -182,6 +264,368 @@ def _save_mechanism_cache(doc_id: str, sig: str, obj):
     ensure_dir(str(runs_path("cache", "mechanisms")))
     with open(_mechanism_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+# v9 (R3): cache for fused stance+mechanism call. Keyed on (topic, quotes, model,
+# fused_prompt_version). Stored separately from mechanism cache so a v8
+# mechanism-only cache entry cannot serve a v9 caller that needs stance.
+def _fused_signature(topic: str, quotes, model: str = _MODEL,
+                     prompt_version: str = _FUSED_PROMPT_VERSION) -> str:
+    h = hashlib.sha256()
+    h.update((topic or "").encode("utf-8"))
+    for q in quotes or []:
+        h.update(b"\x00")
+        h.update(str(q.get("doc_id", "")).encode("utf-8"))
+        h.update(str(q.get("page", 0)).encode("utf-8"))
+        h.update((q.get("text", "") or "")[:400].encode("utf-8"))
+    h.update(b"\x01" + (model or "").encode("utf-8"))
+    h.update(b"\x02" + (prompt_version or "").encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _fused_cache_path(doc_id: str, sig: str) -> str:
+    return str(runs_path("cache", "fused", f"{doc_id}_{sig}.json"))
+
+
+def _load_fused_cache(doc_id: str, sig: str):
+    try:
+        with open(_fused_cache_path(doc_id, sig), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_fused_cache(doc_id: str, sig: str, obj):
+    ensure_dir(str(runs_path("cache", "fused")))
+    with open(_fused_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def _build_fused_prompt(topic: str, ev_texts):
+    return (
+        "Read the topic and the quoted evidence from this document. In ONE "
+        "JSON object decide all of the following:\n\n"
+        "1. stance: which of {supports, critiques, complicates, tangential} best "
+        "describes how this document's quoted evidence relates to the topic.\n"
+        "2. rationale: one short sentence (<=200 characters) explaining the stance.\n"
+        "3. mechanism: a single sentence (<=120 characters) naming the central "
+        "causal mechanism this document offers in relation to the topic, or empty "
+        "string if none.\n"
+        "4. contested: a single sentence (<=160 characters) naming what this "
+        "document treats as contested or in need of qualification, or empty if "
+        "nothing.\n"
+        "5. mechanisms: a list of 1-3 specific mechanism strings (8-15 words each), "
+        "each answering HOW or THROUGH WHAT, using nouns concrete to this "
+        "document's evidence.\n\n"
+        "Stance definitions:\n"
+        "- supports: the quoted evidence corroborates the topic's claim through "
+        "measurement, mechanism, or historical case.\n"
+        "- critiques: the quoted evidence directly challenges or refutes the "
+        "topic's claim.\n"
+        "- complicates: the quoted evidence qualifies the topic's claim with "
+        "scope conditions, contingencies, or measurement limits.\n"
+        "- tangential: the quoted evidence is only marginally related.\n\n"
+        "Topic:\n" + topic + "\n\n"
+        "Quotes:\n" + "\n\n---\n\n".join(ev_texts) + "\n\n"
+        "Return ONLY a single JSON object with exactly these five keys."
+    )
+
+
+def _validate_fused_result(obj, allowed_doc_ids: set):
+    """Return a normalised fused dict, or None if the response is unusable."""
+    if not isinstance(obj, dict):
+        return None
+    stance = str(obj.get("stance", "")).strip().lower().strip("`'\" .,:;()[]{}")
+    if stance not in _FUSED_STANCE_TOKENS:
+        return None
+    rationale = str(obj.get("rationale", "") or "").strip()[:300]
+    mechanism = str(obj.get("mechanism", "") or "").strip()[:200]
+    contested = str(obj.get("contested", "") or "").strip()[:300]
+    raw_mechs = obj.get("mechanisms", []) or []
+    if not isinstance(raw_mechs, list):
+        raw_mechs = []
+    mechanisms = []
+    for m in raw_mechs[:3]:
+        s = str(m).strip()
+        if s:
+            mechanisms.append(s[:240])
+    # Sanitise embedded parentheticals (R2) so a mis-typed year cannot leak.
+    mechanism = _canonicalise_mech_citation(mechanism, allowed_doc_ids)
+    contested = _canonicalise_mech_citation(contested, allowed_doc_ids)
+    rationale = _canonicalise_mech_citation(rationale, allowed_doc_ids)
+    mechanisms = _canonicalise_mech_list(mechanisms, allowed_doc_ids)
+    return {
+        "stance": stance,
+        "rationale": rationale,
+        "mechanism": mechanism,
+        "contested": contested,
+        "mechanisms": mechanisms,
+    }
+
+
+def _fused_stance_and_mechanism(doc_id: str, topic: str, valid_quotes,
+                                allowed_doc_ids: set, metrics=None):
+    """v9 (R3): single LLM call returning stance + rationale + mechanism +
+    contested + mechanisms[]. Returns a normalised dict on success, or None on
+    any failure (caller falls back to the two-call stance+mechanism path).
+    """
+    ev_texts = []
+    for q in valid_quotes:
+        text = q.get("text", "") or ""
+        clipped = (text[:220] + "...") if len(text) > 220 else text
+        ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
+    prompt = _build_fused_prompt(topic, ev_texts)
+
+    try:
+        import ollama
+        start = time.perf_counter()
+        res = ollama.chat(
+            model=_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=_OPTIONS_FUSED,
+            keep_alive=_KEEP_ALIVE,
+            format="json",
+            stream=False,
+        )
+        raw = (res.get("message", {}).get("content") or "").strip()
+        if metrics:
+            metrics.record_llm("fused_stance_mech", _MODEL, options=_OPTIONS_FUSED,
+                               duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt),
+                               response_chars=len(raw))
+    except Exception as e:
+        if metrics:
+            metrics.record_llm("fused_stance_mech", _MODEL, options=_OPTIONS_FUSED,
+                               success=False, error=e)
+        return None
+
+    # Tolerant JSON parsing (model occasionally wraps with prose)
+    try:
+        start_idx = raw.find("{")
+        end_idx = raw.rfind("}")
+        if start_idx < 0 or end_idx <= start_idx:
+            return None
+        obj = json.loads(raw[start_idx:end_idx + 1])
+    except Exception:
+        return None
+    return _validate_fused_result(obj, allowed_doc_ids)
+
+
+# v11-C: cluster-level synthesis. Sits between per-doc clustering and the
+# writer. For each (stance, cluster) bucket of >=2 docs, asks the LLM to read
+# the cluster's docs as a group and produce a single shared-mechanism claim plus
+# the ids of the docs that support it. The writer renders this as a multi-doc
+# citation block instead of presenting each doc as a separate witness.
+
+def _cluster_synth_signature(topic: str, stance: str, cluster_label: str,
+                             doc_ids, model: str = _MODEL,
+                             prompt_version: str = _CLUSTER_SYNTH_PROMPT_VERSION) -> str:
+    h = hashlib.sha256()
+    h.update((topic or "").encode("utf-8"))
+    h.update(b"\x10" + (stance or "").encode("utf-8"))
+    h.update(b"\x11" + (cluster_label or "").encode("utf-8"))
+    for did in sorted(doc_ids or []):
+        h.update(b"\x00")
+        h.update(str(did).encode("utf-8"))
+    h.update(b"\x01" + (model or "").encode("utf-8"))
+    h.update(b"\x02" + (prompt_version or "").encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cluster_synth_cache_path(sig: str) -> str:
+    return str(runs_path("cache", "cluster_synth", f"{sig}.json"))
+
+
+def _load_cluster_synth_cache(sig: str):
+    try:
+        with open(_cluster_synth_cache_path(sig), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_cluster_synth_cache(sig: str, obj):
+    ensure_dir(str(runs_path("cache", "cluster_synth")))
+    with open(_cluster_synth_cache_path(sig), "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def _build_cluster_synth_prompt(topic: str, stance: str, cluster_label: str,
+                                cluster_docs: list) -> str:
+    """Build the synthesis prompt. cluster_docs is a list of per-doc summaries
+    with keys: doc_id, mechanism (fused), mechanisms[], quotes[].
+    """
+    parts = [
+        "You are an economic historian writing a literature review.",
+        f"Topic: {topic}",
+        f"All sources below take the same stance toward the topic ({stance}).",
+        f"Cluster label: {cluster_label}",
+        "",
+        "Sources in this cluster:",
+    ]
+    for d in cluster_docs:
+        did = d.get("doc_id", "")
+        mech = (d.get("mechanism") or "").strip()
+        mechs = [m for m in (d.get("mechanisms") or []) if (m or "").strip()][:3]
+        quotes = []
+        for q in (d.get("quotes") or [])[:2]:
+            text = (q.get("text") or q.get("quote") or "").strip()
+            if not text:
+                continue
+            clipped = (text[:200] + "...") if len(text) > 200 else text
+            quotes.append(f"- p.{q.get('page','')}: {clipped}")
+        parts.append(f"\n[{did}]")
+        if mech:
+            parts.append(f"  Lead mechanism: {mech}")
+        if mechs:
+            parts.append("  Other mechanisms: " + " | ".join(mechs))
+        if quotes:
+            parts.append("  Quotes:")
+            parts.extend("  " + q for q in quotes)
+    parts += [
+        "",
+        "Read the cluster as a single stream of literature. In ONE JSON object:",
+        "1. shared_mechanism: ONE sentence (<=200 chars) naming the causal "
+        "mechanism these sources hold in common in relation to the topic. State "
+        "it as a substantive claim about the world, not 'the sources argue...'.",
+        "2. supporting_doc_ids: array of doc_id strings (subset of the listed "
+        "ids) for sources that hold the shared mechanism strongly.",
+        "3. qualifying_doc_ids: array of doc_id strings for sources that hold "
+        "the shared mechanism only with a scope condition or qualification. "
+        "May be empty.",
+        "4. contested_dimension: ONE sentence (<=180 chars) naming the axis on "
+        "which the sources WITHIN this cluster disagree, or empty if they "
+        "fully agree.",
+        "",
+        "Return ONLY a single JSON object with exactly these four keys.",
+    ]
+    return "\n".join(parts)
+
+
+def _validate_cluster_synth(obj, valid_doc_ids: set):
+    if not isinstance(obj, dict):
+        return None
+    shared = str(obj.get("shared_mechanism", "") or "").strip()[:280]
+    contested = str(obj.get("contested_dimension", "") or "").strip()[:240]
+    if not shared:
+        return None
+
+    def _filter_ids(raw):
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for x in raw:
+            s = str(x).strip()
+            if s in valid_doc_ids and s not in out:
+                out.append(s)
+        return out
+
+    supporting = _filter_ids(obj.get("supporting_doc_ids", []))
+    qualifying = _filter_ids(obj.get("qualifying_doc_ids", []))
+    # Sources double-counted as both supporting and qualifying default to
+    # supporting (stronger signal wins).
+    qualifying = [d for d in qualifying if d not in supporting]
+    return {
+        "shared_mechanism": shared,
+        "supporting_doc_ids": supporting,
+        "qualifying_doc_ids": qualifying,
+        "contested_dimension": contested,
+    }
+
+
+def _synthesise_one_cluster(topic: str, stance: str, cluster_label: str,
+                            cluster_docs: list, metrics=None):
+    """One LLM call for a single (stance, cluster) bucket. Returns the
+    validated synthesis dict or None on any failure (writer falls back to the
+    pre-v11-C per-doc evidence path)."""
+    doc_ids = [d.get("doc_id", "") for d in cluster_docs if d.get("doc_id")]
+    valid_doc_ids = set(doc_ids)
+    if not valid_doc_ids:
+        return None
+
+    sig = _cluster_synth_signature(topic, stance, cluster_label, doc_ids)
+    cached = _load_cluster_synth_cache(sig)
+    if cached is not None:
+        if metrics:
+            metrics.cache_event("cluster_synth", "hits")
+        return cached
+    if metrics:
+        metrics.cache_event("cluster_synth", "misses")
+
+    prompt = _build_cluster_synth_prompt(topic, stance, cluster_label, cluster_docs)
+    try:
+        import ollama
+        start = time.perf_counter()
+        res = ollama.chat(
+            model=_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=_OPTIONS_CLUSTER_SYNTH,
+            keep_alive=_KEEP_ALIVE,
+            format="json",
+            stream=False,
+        )
+        raw = (res.get("message", {}).get("content") or "").strip()
+        if metrics:
+            metrics.record_llm("cluster_synth", _MODEL, options=_OPTIONS_CLUSTER_SYNTH,
+                               duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt),
+                               response_chars=len(raw))
+    except Exception as e:
+        if metrics:
+            metrics.record_llm("cluster_synth", _MODEL, options=_OPTIONS_CLUSTER_SYNTH,
+                               success=False, error=e)
+        return None
+
+    try:
+        start_idx = raw.find("{")
+        end_idx = raw.rfind("}")
+        if start_idx < 0 or end_idx <= start_idx:
+            return None
+        obj = json.loads(raw[start_idx:end_idx + 1])
+    except Exception:
+        return None
+    result = _validate_cluster_synth(obj, valid_doc_ids)
+    if result is None:
+        return None
+    _save_cluster_synth_cache(sig, result)
+    if metrics:
+        metrics.cache_event("cluster_synth", "writes")
+    return result
+
+
+def _synthesise_clusters(doc_summaries: list, topic: str, metrics=None) -> dict:
+    """Run cluster-level synthesis for every (stance, cluster) bucket of >=2
+    docs. Returns {(stance, cluster_label): synthesis_dict}. Toggle via
+    RRR_CLUSTER_SYNTHESIS (default ON). Singletons and clusters labelled
+    "Other" are skipped — the multi-citation prose move only makes sense when
+    multiple docs share a real cluster.
+    """
+    if os.environ.get("RRR_CLUSTER_SYNTHESIS", "1") != "1":
+        return {}
+
+    buckets = {}
+    for d in doc_summaries or []:
+        stance = (d.get("stance") or "tangential").strip().lower()
+        cluster = (d.get("cluster") or "Other").strip()
+        buckets.setdefault((stance, cluster), []).append(d)
+
+    syntheses = {}
+    for (stance, cluster_label), cluster_docs in buckets.items():
+        if cluster_label == "Other":
+            continue
+        if len(cluster_docs) < 2:
+            continue
+        if stance not in {"supports", "critiques", "complicates"}:
+            continue
+        result = _synthesise_one_cluster(topic, stance, cluster_label,
+                                         cluster_docs, metrics=metrics)
+        if result is not None:
+            syntheses[(stance, cluster_label)] = result
+
+    if metrics:
+        metrics.set("cluster_syntheses_count", len(syntheses))
+    return syntheses
+
 
 def _try_parse_cluster_json(raw: str, n_mechs: int, all_mechs: list):
     """Attempt to parse clustering JSON. Returns mech_to_cluster dict or None."""
@@ -692,24 +1136,51 @@ def _write_json_run(name: str, obj):
 
 
 def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int, metrics=None) -> list:
+    """v8 (R8): rank merged candidates by Reciprocal Rank Fusion across probes
+    instead of max(bm25_score). Pages that rank moderately on every probe now
+    outrank pages that spike on one probe. On multi-aspect topics (where
+    different probes target distinct sub-claims that rarely co-occur on a
+    single page), this preserves breadth-of-probe-agreement as a ranking
+    signal. bm25_score is retained as a tiebreaker for downstream consumers.
+    Constant k=60 is the textbook RRF default.
+    """
     merged = {}
     per_probe_topk = max(1, topk)
+    rrf_k = float(os.environ.get("RRR_RRF_K", "60"))
     for probe in probes:
         candidates = retrieve_fn(probe, topk=per_probe_topk, doc_id=doc_id)
         if metrics:
             metrics.inc("retrieval_probe_calls")
             metrics.inc("retrieved_pages_raw", len(candidates))
-        for c in candidates:
+        for rank, c in enumerate(candidates):
             key = (c.get("doc_id"), c.get("page"))
             score = float(c.get("bm25_score", 0.0) or 0.0)
+            rrf_contrib = 1.0 / (rrf_k + rank)
             existing = merged.get(key)
-            if not existing or score > float(existing.get("bm25_score", 0.0) or 0.0):
+            if not existing:
                 item = dict(c)
-                item["matched_probes"] = [probe]
+                item["matched_probes"] = [probe] if score > 0.0 else []
+                item["rrf_score"] = rrf_contrib if score > 0.0 else 0.0
+                item["bm25_score"] = score
                 merged[key] = item
             else:
-                existing.setdefault("matched_probes", []).append(probe)
-    ranked = sorted(merged.values(), key=lambda x: float(x.get("bm25_score", 0.0) or 0.0), reverse=True)
+                if score > 0.0 and probe not in existing.get("matched_probes", []):
+                    existing.setdefault("matched_probes", []).append(probe)
+                if score > 0.0:
+                    existing["rrf_score"] = float(existing.get("rrf_score", 0.0)) + rrf_contrib
+                # keep bm25_score as the max for tiebreaking and downstream
+                # diagnostic consumers that still look at it directly.
+                if score > float(existing.get("bm25_score", 0.0) or 0.0):
+                    existing["bm25_score"] = score
+    # small bonus for breadth of probe agreement, capped so it can never
+    # dominate a strong single-probe match
+    for item in merged.values():
+        item["rrf_score"] = float(item.get("rrf_score", 0.0)) + 0.02 * len(set(item.get("matched_probes", [])))
+    ranked = sorted(
+        merged.values(),
+        key=lambda x: (float(x.get("rrf_score", 0.0)), float(x.get("bm25_score", 0.0) or 0.0)),
+        reverse=True,
+    )
     return ranked[:max(1, topk)]
 
 
@@ -727,6 +1198,26 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     topic = args.topic
     metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
     metrics.set("restart_attempt", restart_attempt)
+
+    # v8 (R12): fire-and-forget prewarm so the Ollama cold-load (~7s on first
+    # call after model swap) overlaps with metadata loading + planning instead
+    # of being charged to the planning stage. Background thread; no blocking.
+    def _prewarm_ollama():
+        try:
+            import ollama
+            ollama.chat(
+                model=_MODEL,
+                messages=[{"role": "user", "content": "."}],
+                options={"num_predict": 1, "num_ctx": 4096, "temperature": 0.0},
+                keep_alive=_KEEP_ALIVE,
+                stream=False,
+            )
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_prewarm_ollama, name="rrr-ollama-prewarm", daemon=True).start()
+    except Exception:
+        pass
 
     with metrics.stage("load_metadata"):
         df = pd.read_csv(meta_path)
@@ -760,9 +1251,19 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         plan_obj = plan_query(topic, metrics=metrics)
     score_query = " ".join(plan_obj.get("keywords_must", []) + plan_obj.get("keywords_any", []))
     score_query = score_query.strip() or topic
-    probes = _plan_probes(plan_obj, topic, score_query)
+    planner_mode = plan_obj.get("planner_meta", {}).get("mode", "unknown")
+    # v8 (R9): when the LLM planner produced real phrase probes, do NOT inject
+    # the bag-of-words concatenation as an additional probe. In baseline runs
+    # the synthetic probe dominated max(token_set_ratio) scoring because it had
+    # the most surface tokens, making the LLM-derived phrase probes do almost
+    # no work. The synthetic remains as a fallback only when the planner fell
+    # back to the heuristic mode.
+    if planner_mode == "llm":
+        probes = _plan_probes(plan_obj, topic, "")
+    else:
+        probes = _plan_probes(plan_obj, topic, score_query)
     plan_obj["active_probes"] = probes
-    metrics.set("planner_mode", plan_obj.get("planner_meta", {}).get("mode", "unknown"))
+    metrics.set("planner_mode", planner_mode)
     metrics.set("planner_probe_count", len(probes))
     print(f"[Layered-T2] score_query={score_query}")
     print(f"[Layered-T2] probes={len(probes)}")
@@ -932,6 +1433,52 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             clipped = (text[:220] + "...") if len(text) > 220 else text
             ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
 
+        # v9 (R3): try the fused stance+mechanism call first. If it returns a
+        # valid object, we get stance + rationale + mechanism + contested +
+        # mechanisms[] in ONE LLM call instead of two. Falls back to the
+        # legacy two-call path on any failure (parse error, invalid stance,
+        # ollama exception). Controlled by RRR_FUSED_STANCE_MECH=1 (default).
+        fused_enabled = os.environ.get("RRR_FUSED_STANCE_MECH", "1") != "0"
+        fused_result = None
+        if fused_enabled:
+            fused_sig = _fused_signature(topic, valid_quotes)
+            cached_fused = _load_fused_cache(did, fused_sig)
+            if cached_fused and cached_fused.get("stance"):
+                metrics.cache_event("fused", "hits")
+                fused_result = _validate_fused_result(cached_fused, set(all_doc_ids))
+            if fused_result is None:
+                metrics.cache_event("fused", "misses")
+                fused_result = _fused_stance_and_mechanism(
+                    did, topic, valid_quotes,
+                    allowed_doc_ids=set(all_doc_ids), metrics=metrics,
+                )
+                if fused_result:
+                    _save_fused_cache(did, fused_sig, {
+                        **fused_result,
+                        "model": _MODEL,
+                        "prompt_version": _FUSED_PROMPT_VERSION,
+                    })
+                    metrics.cache_event("fused", "writes")
+                else:
+                    metrics.cache_event("fused", "skips")
+        if fused_result is not None:
+            evidence_stance = fused_result["stance"]
+            mechanisms = fused_result["mechanisms"]
+            metrics.inc("mechanisms_extracted", len(mechanisms))
+            metrics.inc("fused_path_used")
+            metrics.inc("docs_kept")
+            enriched = dict(doc)
+            enriched["stance"] = evidence_stance
+            enriched["mechanisms"] = mechanisms
+            # v9 (R3): expose richer per-doc context to the writer so stance
+            # prompts have substantive anchors (not just the stance label).
+            enriched["rationale"] = fused_result.get("rationale", "")
+            enriched["mechanism"] = fused_result.get("mechanism", "")
+            enriched["contested"] = fused_result.get("contested", "")
+            return enriched
+
+        # Legacy two-call fallback path.
+        metrics.inc("fused_path_fallback")
         evidence_stance = classify_evidence_stance(did, topic, valid_quotes, metrics=metrics)
 
         topic_words = set(w.lower() for w in re.findall(r'\b\w{4,}\b', topic))
@@ -957,6 +1504,9 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         if cached and cached.get("mechanisms"):
             metrics.cache_event("mechanism", "hits")
             mechanisms = cached.get("mechanisms", [])
+            # v8 (R2): also sanitise cached mechanisms so a poisoned cache from
+            # a v7 run cannot leak fabricated doc_ids into a v8 narrative.
+            mechanisms = _canonicalise_mech_list(mechanisms, set(all_doc_ids))
         else:
             metrics.cache_event("mechanism", "misses")
             try:
@@ -981,6 +1531,16 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 mechanisms = []
                 metrics.record_llm("mechanism", _MODEL, options=_OPTIONS_MECHANISM,
                                    success=False, error=e)
+            # v8 (R2): sanitise embedded parentheticals against the corpus so a
+            # mis-typed year (e.g. baseline's North_1689 for North_1989) cannot
+            # leak into review_narrative.md as a fabricated citation.
+            mechanisms_before = len(mechanisms)
+            mechanisms = _canonicalise_mech_list(mechanisms, set(all_doc_ids))
+            if metrics and mechanisms_before:
+                # if any mechanism collapsed to empty after sanitisation, count it
+                drops = mechanisms_before - len([m for m in mechanisms if m])
+                if drops:
+                    metrics.inc("mechanism_sanitiser_drops", drops)
             if mechanisms:
                 _save_mechanism_cache(
                     did,
@@ -1067,7 +1627,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     print("[Layered-T2] clustering mechanisms...")
     with metrics.stage("clustering"):
         mech_to_cluster = _cluster_mechanisms(doc_summaries, topic, metrics=metrics)
-    
+
     for doc in doc_summaries:
         primary = None
         for m in doc.get("mechanisms", []):
@@ -1076,6 +1636,21 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 primary = m
                 break
         doc["cluster"] = mech_to_cluster.get(primary, "Other") if primary else "Other"
+
+    # v11-C: cluster-level synthesis. One LLM call per (stance, cluster) bucket
+    # of >=2 docs producing a shared mechanism + supporting/qualifying split.
+    # The writer renders this as a multi-doc citation block instead of
+    # presenting each doc as a separate witness.
+    cluster_syntheses_raw = {}
+    with metrics.stage("cluster_synthesis"):
+        cluster_syntheses_raw = _synthesise_clusters(doc_summaries, topic, metrics=metrics)
+    # Serialise tuple keys to "stance::cluster_label" for JSON storage.
+    cluster_syntheses = {
+        f"{stance}::{cluster_label}": synth
+        for (stance, cluster_label), synth in cluster_syntheses_raw.items()
+    }
+    if cluster_syntheses_raw:
+        print(f"[Layered-T2] cluster syntheses: {len(cluster_syntheses_raw)} produced")
 
     evidence_id_count = _assign_evidence_ids(doc_summaries)
     metrics.set("evidence_ids_assigned", evidence_id_count)
@@ -1185,6 +1760,9 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             "docs_selected_for_llm": len(selected_docs),
         },
         "docs": doc_summaries,
+        # v11-C: cluster-level synthesis keyed by "stance::cluster_label".
+        # Empty when RRR_CLUSTER_SYNTHESIS=0 or every cluster is a singleton.
+        "cluster_syntheses": cluster_syntheses,
         "restarts_required": restart_attempt
     }
     with metrics.stage("write_ledger"):

@@ -5,15 +5,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from rrr.utils import ensure_dir
 from rrr.paths import runs_path
-from rrr.render import CITE_RE, parse_citations, render_citation
+from rrr.render import (
+    CITE_RE,
+    DISPLAY_CITE_RE,
+    DISPLAY_PAREN_CITE_RE,
+    parse_citations,
+    render_citation,
+    render_citation_canonical,
+    render_narrative_citation,
+    render_parenthetical_citation,
+    rewrite_canonical_to_display,
+    rewrite_misplaced_narrative_citations,
+    _build_display_lookup,
+    _doc_id_to_author_label,
+)
 
 _MODEL = os.environ.get("RRR_MODEL", "mistral")
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
     "temperature": float(os.environ.get("RRR_WRITER_T", "0.50")),  # v7: increased from 0.30
-    "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "32768")),
-    "num_predict": int(os.environ.get("RRR_WRITER_PRED", "2000")),
+    # v8: writer ctx default 12288 (was 32768). Largest observed writer prompt
+    # is ~2900 tokens; 32k KV-cache allocation slows generation 15-25% with no
+    # quality gain. Override RRR_WRITER_CTX if a topic needs a much larger
+    # allowed-citation list.
+    "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "12288")),
+    # v8: writer pred default 1500 (was 2000). Largest observed output is
+    # ~620 tokens; 1500 leaves 2.4x slack.
+    "num_predict": int(os.environ.get("RRR_WRITER_PRED", "1500")),
     "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
 }
 
@@ -31,26 +50,111 @@ _GENERIC_STYLE_RE = re.compile(
     r"complex interplay|valuable insights|policy-making|future research|further research|"
     r"further investigation|nuanced perspective|the stakes are high|this analysis will|"
     r"delving deeper|underscores? the need|further exploration|ongoing research|"
-    r"shed light|complex and influenced by various factors"
+    r"shed light|complex and influenced by various factors|"
+    # v8: NGO/consulting register that leaks through current directives
+    r"holds significance|potential implications|strategies aimed at|"
+    r"sustainable development|alleviating poverty|this investigation|"
+    r"this analysis|this study|this examination|plays a pivotal role|"
+    r"contributing significantly to|fundamental factor|crucial factor|"
+    r"essential factor|interplay between|in this regard|in this context|"
+    r"by acknowledging these variables|presents a complex picture|"
+    r"thereby contributing"
     r")\b",
+    re.IGNORECASE,
+)
+
+# v8 (R5) / v9.1: catch nested citation wraps that escape every other cleanup
+# because CITE_RE matches only the single-paren form. Two forms observed:
+#   1. ((Doc: p.N))              — simple double-wrap (v8)
+#   2. ((Doc: p.X): p.Y)         — doubled page-suffix; happens when the LLM
+#      writes ([E0001]: p.X) and _render_evidence_id_citations turns [E0001]
+#      into (Doc: p.X), producing the nested form. v9 introduced two of these
+#      because the fused-call writer prompt provides richer evidence context
+#      that the model wraps in parens. (v9.1 fix.)
+_DOUBLE_PAREN_CITE_RE = re.compile(
+    r"\(\(([A-Za-z0-9_&.\-]+:\s*p\.\d+)\)\)"
+)
+_NESTED_PAGE_SUFFIX_RE = re.compile(
+    r"\(\(([A-Za-z0-9_&.\-]+):\s*p\.\d+\):\s*p\.\d+\)"
+)
+
+# v10: detect-then-LLM-rewrite style enforcement. We deliberately do NOT
+# substitute forbidden words mechanically because the right replacement is
+# sense-dependent (e.g. "sharp distinction" vs "sharply declined"). Sentences
+# containing any of these patterns are routed to a single batched LLM rewrite
+# call per writer section.
+_FORBIDDEN_LEXEME_RE = re.compile(r"\b(?:legible|sharp(?:ly)?)\b", re.IGNORECASE)
+_ADVERSATIVE_RE = re.compile(
+    r"\b("
+    r"not\s+\S+(?:\s+\S+){0,5}\s+but(?:\s+rather)?\s+"
+    r"|rather than\b"
+    r"|in (?:sharp\s+)?contrast(?:\s+to)?\b"
+    r"|instead of\b"
+    r"|unlike\b"
+    r")",
+    re.IGNORECASE,
+)
+# v10 (rule 6): trailing significance clauses — these ARE safely strippable
+# because the head of the sentence carries the substantive claim.
+_TRAILING_SIGNIFICANCE_RE = re.compile(
+    r"[,.;]?\s+"
+    r"(?:[Aa]nd that matters"
+    r"|[Ww]hich matters because[^.!?]*"
+    r"|[Tt]his is important because[^.!?]*"
+    r"|[Tt]his matters because[^.!?]*)"
+    r"[.!?]?",
+)
+# v10 (rule 8): colon-heavy academic setup ("A long stem clause: A new clause").
+_COLON_SETUP_RE = re.compile(r"[A-Z][^.!?:\n]{20,}:\s+[A-Z]")
+# v10 (rule 1): em dash + en dash. Both go through the LLM rewriter because the
+# right replacement varies (comma, period, parens, semicolon).
+_TYPOGRAPHIC_DASH_RE = re.compile("[–—]")
+# v10 options for the short style-rewrite LLM call.
+_OPTIONS_STYLE_REWRITE = {
+    "temperature": 0.1,
+    "num_ctx": int(os.environ.get("RRR_STYLE_CTX", "4096")),
+    "num_predict": int(os.environ.get("RRR_STYLE_PRED", "1500")),
+}
+
+# v8 (R5): detect "Author argues / posits / emphasizes ..." openings that the
+# system prompt forbids but the model keeps producing. Used to flag, then
+# optionally rewrite, sections that violate.
+_AUTHOR_VERB_RE = re.compile(
+    r"\b((?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)\s*[A-Z][A-Za-z&.\-]+)(?:\s+et\s+al\.?)?(?:\s*\(?[A-Za-z_]*\d{4}[A-Za-z_]*\)?)?)\s+"
+    r"(argues|emphasizes|emphasises|demonstrates|highlights|posits|suggests|"
+    r"claims|notes|observes|maintains|asserts|contends|shows|writes|states|"
+    r"finds|points out|underscores|argues that|notes that)\b",
     re.IGNORECASE,
 )
 _MIN_SECTION_CITED_DOCS = int(os.environ.get("RRR_WRITER_MIN_SECTION_CITED_DOCS", "2"))
 _ENFORCE_COVERAGE = os.environ.get("RRR_WRITER_ENFORCE_COVERAGE", "1") != "0"
 
-# v7: Streamlined system instruction - citation rules only, prose guidance moved to prompts
+# v10: cite as 'Author (Year, p.N)'. Underscore-keyed canonical form retired.
 _SYSTEM_CITATION_INSTRUCTION = (
-    "CITATION FORMAT: (AuthorName_Year: p.N)\n"
-    "- Single author: (Smith_1990: p.12)\n"
-    "- Multiple authors: (North&Weingast_1989: p.28)\n"
-    "- Three+ authors: (AcemogluEtAl_2002: p.4)\n\n"
-    "RULES:\n"
-    "1. Only cite documents and pages from the evidence provided\n"
-    "2. Copy document IDs exactly as shown\n"
-    "3. One page per citation\n"
-    "4. Never write page-only citations such as (p.3)\n"
-    "5. Never write author-year citations such as Author (1990) or (Author, 1990)\n"
-    "6. If unsure, omit the citation entirely\n"
+    "CITATION FORMATS: two forms, picked by sentence role.\n"
+    "  NARRATIVE — author is the grammatical subject of the sentence:\n"
+    "    Author (Year, p.N)\n"
+    "    e.g. 'North and Weingast (1989, p.2) argue that institutions...'\n"
+    "  PARENTHETICAL — whole reference in parens, when the author is NOT\n"
+    "    the subject (citing as an aside, or citing multiple sources for a\n"
+    "    shared claim):\n"
+    "    (Author Year, p.N)\n"
+    "    e.g. '...credible commitment underpins growth (North and Weingast 1989, p.2).'\n"
+    "    Multi-source: '...established across the literature (North 1989, p.9; "
+    "Acemoglu et al. 2001, p.27).'\n\n"
+    "Use the narrative form when the author is the speaker in the sentence; "
+    "use the parenthetical form otherwise.\n\n"
+    "ALWAYS WRONG (never emit these):\n"
+    "  (North, 1989)             # missing page\n"
+    "  North (1989) p.9          # page outside the parens\n"
+    "  (p.5)                     # page-only, no author/year\n\n"
+    "Rules:\n"
+    "1. Copy each author label EXACTLY as it appears in the ALLOWED CITATIONS list below.\n"
+    "2. Use only the page numbers shown next to that author in the list.\n"
+    "3. Every citation must include a page number; never write a citation without a page.\n"
+    "4. One page per citation; never write 'pp.5-7' or 'pp.5, 7'.\n"
+    "5. Never write page-only citations such as (p.5).\n"
+    "6. If a claim is not supported by the allowed evidence, state it without a citation; do not invent one.\n"
 )
 
 
@@ -83,9 +187,26 @@ def _format_quote(q) -> str:
 
 def _format_doc_entry(d) -> str:
     # Format doc entry with stance label for writer context.
+    # v9 (R3): when the fused stance+mechanism call produced rationale /
+    # mechanism / contested fields, surface them so the writer prompt has
+    # substantive per-doc anchors instead of just the stance label. Falls back
+    # silently when those fields are absent (legacy two-call path).
+    # v10: include the human-readable author-year label so the writer copies
+    # 'Acemoglu et al. (2002, p.5)' directly instead of inventing surface form.
     did = str(d.get("doc_id", "")).strip()
     stance = d.get("stance", "tangential")
-    lines = [f"[{did}] [STANCE: {stance.upper()}]"]
+    author_label = _doc_id_to_author_label(did)
+    header = f"[{did}] cite as {author_label!s}  [STANCE: {stance.upper()}]"
+    lines = [header]
+    lead_mechanism = str(d.get("mechanism", "") or "").strip()
+    if lead_mechanism:
+        lines.append(f"  Lead mechanism: {_clip(lead_mechanism, n=180)}")
+    rationale = str(d.get("rationale", "") or "").strip()
+    if rationale:
+        lines.append(f"  Why this stance: {_clip(rationale, n=220)}")
+    contested = str(d.get("contested", "") or "").strip()
+    if contested:
+        lines.append(f"  What this contests: {_clip(contested, n=220)}")
     mechanisms = [str(m).strip() for m in d.get("mechanisms", []) if str(m).strip()]
     if mechanisms:
         lines.append("  Mechanisms:")
@@ -98,7 +219,10 @@ def _format_doc_entry(d) -> str:
 
 
 def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
-    # Create explicit list of allowed citations for this chunk.
+    # v10: emit display form 'Author (Year, p.N)' so the writer can copy-paste
+    # directly. Each line maps an evidence_id to its rendered display citation.
+    # When the ledger lacks evidence_ids we fall back to a per-doc summary:
+    # 'Acemoglu et al. (2002): pp.5, 27, 33'.
     lines = []
     evidence_lines = []
     for d in docs:
@@ -112,8 +236,11 @@ def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
             continue
         pages = sorted(list(allowed_pages_by_doc.get(did, set())))
         if pages:
+            author_label = _doc_id_to_author_label(did)
+            # strip trailing ')' from the label and re-emit with pages
+            base = author_label[:-1] if author_label.endswith(")") else author_label
             page_str = ", ".join(f"p.{p}" for p in pages[:6])
-            lines.append(f"  - {did}: {page_str}")
+            lines.append(f"  - {base}, {page_str})")
     if evidence_lines:
         return "\n".join(evidence_lines[:32])
     return "\n".join(lines)
@@ -163,6 +290,359 @@ def _strip_wrapping(text: str) -> str:
         t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
     return t
+
+
+def _collapse_double_parens(text: str) -> tuple:
+    # v8 (R5): collapse ((DocId: p.N)) -> (DocId: p.N). Returns (text, count).
+    # v9.1: also collapse ((DocId: p.X): p.Y) -> (DocId: p.X). The inner page
+    # wins because it was the model's own evidence-id-rendered citation, while
+    # the outer ": p.Y" is the model's redundant attempt at a page suffix.
+    count = 0
+
+    def repl_double(m):
+        nonlocal count
+        count += 1
+        return "(" + m.group(1) + ")"
+
+    def repl_nested_suffix(m):
+        nonlocal count
+        count += 1
+        # m.group(1) is just the DocId; we need to preserve the original inner
+        # page so reconstruct it by re-running the inner regex on the match.
+        inner = re.match(r"\(\(([A-Za-z0-9_&.\-]+:\s*p\.\d+)\):\s*p\.\d+\)", m.group(0))
+        if inner:
+            return "(" + inner.group(1) + ")"
+        return m.group(0)
+
+    text, _ = (_DOUBLE_PAREN_CITE_RE.subn(repl_double, text))
+    text, _ = (_NESTED_PAGE_SUFFIX_RE.subn(repl_nested_suffix, text))
+    return text, count
+
+
+def _count_author_led_openings(text: str) -> int:
+    # v8 (R5): count sentences that open with "Author argues / posits / ...".
+    # v10: kept as metric only; user explicitly ditched the prompt rule because
+    # mistral-small:24b and above produce them sparingly, in natural academic
+    # register, not as a parade pattern.
+    count = 0
+    for sentence in _split_sentences_for_cleanup(text):
+        s = sentence.strip()
+        if not s:
+            continue
+        head = re.sub(r"^[\(\[\"\'\s]+", "", s)[:120]
+        if _AUTHOR_VERB_RE.search(head):
+            count += 1
+    return count
+
+
+# ============================================================================
+# v10: STYLE ENFORCEMENT — detect-then-LLM-rewrite for ambiguous violations.
+# Strippable patterns (trailing significance) are handled mechanically first;
+# the remaining sentences with em-dashes, forbidden lexemes, adversative
+# framings, or colon setups are routed to a single batched LLM rewrite call
+# per writer postprocess pass.
+# ============================================================================
+
+def _strip_trailing_significance(text: str) -> tuple:
+    # v10 (rule 6): mechanically strip "and that matters" / "which matters
+    # because ..." trailing clauses. These have a stable shape and live at end
+    # of sentence; removing them does not change the substantive claim head.
+    matches = list(_TRAILING_SIGNIFICANCE_RE.finditer(text or ""))
+    if not matches:
+        return text or "", 0
+    cleaned = _TRAILING_SIGNIFICANCE_RE.sub("", text)
+    # Recompose terminal punctuation if the strip removed it.
+    cleaned = re.sub(r"([A-Za-z0-9_\)\]])(?=\n|$)", r"\1.", cleaned)
+    return cleaned, len(matches)
+
+
+def _classify_sentence_violations(sentence: str) -> list:
+    reasons = []
+    if _TYPOGRAPHIC_DASH_RE.search(sentence):
+        reasons.append("em_dash")
+    if _FORBIDDEN_LEXEME_RE.search(sentence):
+        reasons.append("forbidden_lexeme")
+    if _ADVERSATIVE_RE.search(sentence):
+        reasons.append("adversative")
+    if _COLON_SETUP_RE.search(sentence):
+        reasons.append("colon_setup")
+    return reasons
+
+
+def _collect_style_violations(text: str):
+    """Return list of (sentence_index, sentence_text, [reasons]) for the
+    sentences in `text` that warrant LLM rewrite. Paragraph structure is
+    preserved by walking sentences in order; the rewriter splices results back
+    by index.
+    """
+    sentences = _split_sentences_for_cleanup(text)
+    violations = []
+    for idx, sent in enumerate(sentences):
+        s = sent.strip()
+        if not s:
+            continue
+        reasons = _classify_sentence_violations(s)
+        if reasons:
+            violations.append((idx, s, reasons))
+    return sentences, violations
+
+
+def _build_style_rewrite_prompt(violations) -> str:
+    """One short prompt covering all flagged sentences from this section."""
+    parts = [
+        "You are revising sentences from a literature review. Rewrite each "
+        "numbered sentence below so that it expresses the same meaning while "
+        "observing ALL of the following constraints:",
+        "",
+        "- Do not use em dashes or en dashes. Use commas, periods, semicolons, "
+        "or parentheses.",
+        "- Do not use the words 'legible', 'sharp', or 'sharply'.",
+        "- Do not use adversative framings as the default prose engine. Avoid "
+        "'not X but Y', 'rather than', 'unlike', 'in contrast', and "
+        "contrastive 'instead of'.",
+        "- Do not introduce a claim with a colon followed by an explanatory "
+        "clause. Use a full sentence.",
+        "- Preserve every 'Author (Year, p.N)' citation exactly as written.",
+        "- Preserve the substantive meaning. Do not add or remove evidence.",
+        "- Keep prose natural and varied. Do not produce staccato short "
+        "sentences in place of the originals.",
+        "",
+        "Sentences:",
+    ]
+    for n, (_, sent, _) in enumerate(violations, start=1):
+        parts.append(f"{n}. {sent}")
+    parts.append("")
+    parts.append(
+        "Return ONLY a JSON object with one key 'rewritten' whose value is a "
+        "JSON array of strings, the rewritten sentences in the same order. "
+        "Do not include any commentary."
+    )
+    return "\n".join(parts)
+
+
+def _rewrite_style_violations(sentences, violations, metrics=None):
+    """Run one batched LLM call to rewrite all flagged sentences.
+
+    Returns a new list of sentences (same length as input). On any failure the
+    original sentences are returned unchanged.
+    """
+    if not violations:
+        return sentences, 0, "no_violations"
+    prompt = _build_style_rewrite_prompt(violations)
+    try:
+        import ollama
+        import time
+        start = time.perf_counter()
+        res = ollama.chat(
+            model=_MODEL,
+            messages=[
+                {"role": "system",
+                 "content": "You revise academic prose. Be concise. Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            options=_OPTIONS_STYLE_REWRITE,
+            keep_alive=_KEEP_ALIVE,
+            format="json",
+            stream=False,
+        )
+        raw = (res.get("message", {}).get("content") or "").strip()
+        if metrics:
+            metrics.record_llm("style_rewrite", _MODEL, options=_OPTIONS_STYLE_REWRITE,
+                               duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt),
+                               response_chars=len(raw))
+    except Exception as e:
+        if metrics:
+            metrics.record_llm("style_rewrite", _MODEL, options=_OPTIONS_STYLE_REWRITE,
+                               success=False, error=e)
+        return sentences, 0, f"llm_call_failed:{type(e).__name__}"
+
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return sentences, 0, "json_braces_missing"
+        obj = json.loads(raw[start:end + 1])
+        rewritten = obj.get("rewritten", [])
+        if not isinstance(rewritten, list) or len(rewritten) != len(violations):
+            return sentences, 0, "wrong_count"
+    except Exception:
+        return sentences, 0, "json_parse_failed"
+
+    new_sentences = list(sentences)
+    rewrites_applied = 0
+    for (idx, original, _reasons), new_text in zip(violations, rewritten):
+        new_text = (new_text or "").strip()
+        if not new_text:
+            continue
+        # Refuse a rewrite that REINTRODUCES the same violation (model loop).
+        if _classify_sentence_violations(new_text):
+            continue
+        # Refuse a rewrite that drops or changes any citation token. We compare
+        # the set of '(Year, p.N)' tuples present before and after.
+        original_cites = set(re.findall(r"\((\d{4})[a-z]?,\s*p\.\s*(\d+)\)", original))
+        new_cites = set(re.findall(r"\((\d{4})[a-z]?,\s*p\.\s*(\d+)\)", new_text))
+        if original_cites != new_cites:
+            continue
+        new_sentences[idx] = new_text
+        rewrites_applied += 1
+
+    return new_sentences, rewrites_applied, "ok"
+
+
+def _splice_sentences_back(original_text: str, new_sentences) -> str:
+    """Reconstruct text from sentence array, preserving paragraph breaks.
+
+    The original splitter is sentence-level only; we use paragraph breaks from
+    the input to chunk sentences back into the same shape.
+    """
+    if not original_text:
+        return ""
+    paragraphs = original_text.split("\n\n")
+    out_paragraphs = []
+    cursor = 0
+    for para in paragraphs:
+        original_sents = _split_sentences_for_cleanup(para)
+        n = len(original_sents)
+        replacement = new_sentences[cursor:cursor + n]
+        cursor += n
+        if replacement:
+            out_paragraphs.append(" ".join(s.strip() for s in replacement if s.strip()))
+        else:
+            out_paragraphs.append(para)
+    return "\n\n".join(out_paragraphs).strip()
+
+
+def _apply_style_enforcement(text: str, metrics=None):
+    """v10 single entry point for prose-style cleanup.
+
+    Order matters:
+      1. Strip the trailing-significance clause shape mechanically. Safe.
+      2. Detect remaining violations (em-dash, lexeme, adversative, colon).
+      3. Batch-LLM-rewrite the flagged sentences and splice back.
+
+    Returns (text, stats_dict). Stats keys: 'trailing_stripped', 'violations',
+    'rewrites_applied', 'fallback_reason'.
+    """
+    if not text or os.environ.get("RRR_STYLE_ENFORCE", "1") == "0":
+        return text, {"trailing_stripped": 0, "violations": 0,
+                      "rewrites_applied": 0, "fallback_reason": "disabled"}
+
+    text, trailing_stripped = _strip_trailing_significance(text)
+
+    sentences, violations = _collect_style_violations(text)
+    if not violations:
+        return text, {"trailing_stripped": trailing_stripped, "violations": 0,
+                      "rewrites_applied": 0, "fallback_reason": "no_violations"}
+
+    new_sentences, applied, reason = _rewrite_style_violations(
+        sentences, violations, metrics=metrics,
+    )
+    if applied == 0:
+        return text, {"trailing_stripped": trailing_stripped,
+                      "violations": len(violations),
+                      "rewrites_applied": 0,
+                      "fallback_reason": reason}
+    rewritten_text = _splice_sentences_back(text, new_sentences)
+    return rewritten_text, {"trailing_stripped": trailing_stripped,
+                            "violations": len(violations),
+                            "rewrites_applied": applied,
+                            "fallback_reason": reason}
+
+
+# v9 (R6): word-level content tokens for "shares >=K content tokens with an
+# earlier sentence" check. Strips punctuation and short stopwords so the
+# overlap measure reflects substantive content rather than function-word
+# coincidence. Tuned to be permissive — we only drop on STRICT-SUBSET citation
+# overlap PLUS strong content overlap, so a high bar here is fine.
+_REDUNDANCY_STOPWORDS = frozenset({
+    "the", "and", "of", "in", "to", "a", "an", "is", "are", "was", "were",
+    "for", "on", "by", "with", "as", "at", "from", "that", "this", "these",
+    "those", "it", "its", "their", "they", "we", "be", "been", "has", "have",
+    "had", "or", "but", "not", "no", "nor", "if", "than", "then", "so", "such",
+    "into", "out", "over", "under", "between", "among", "while", "when",
+    "where", "which", "who", "whom", "whose", "what", "how", "why", "also",
+    "however", "moreover", "furthermore", "therefore", "thus", "hence",
+    "instance", "example", "p", "pp",
+})
+
+
+def _redundancy_tokens(sentence: str) -> set:
+    raw = re.findall(r"[A-Za-z][A-Za-z0-9_]+", sentence.lower())
+    return {t for t in raw if len(t) >= 4 and t not in _REDUNDANCY_STOPWORDS}
+
+
+def _sentence_citation_pairs(sentence: str):
+    pairs = set()
+    for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", sentence):
+        try:
+            pairs.add((m.group(1), int(m.group(2))))
+        except Exception:
+            continue
+    return pairs
+
+
+def _drop_cross_section_redundancy(text: str, min_token_overlap: int = 4):
+    """v9 (R6): walk the assembled review sentence by sentence; drop a sentence
+    when BOTH:
+      (a) every (doc, page) citation it contains has already been cited earlier
+          in the document (strict-subset rule); AND
+      (b) it shares >= min_token_overlap content tokens with at least one
+          earlier kept sentence (high content overlap).
+    Sentences with at least one novel citation are always kept; sentences
+    citing already-seen evidence are kept if they introduce a genuinely
+    distinct content angle. Returns (cleaned_text, removed_examples).
+    """
+    if not text:
+        return text, []
+    # Process paragraph by paragraph so we don't merge cross-paragraph text.
+    paragraphs = text.split("\n\n")
+    seen_pairs: set = set()
+    seen_tokens: list = []  # list of token-sets per kept sentence
+    removed_examples = []
+    new_paragraphs = []
+    for para in paragraphs:
+        lines = para.split("\n")
+        kept_lines = []
+        for line in lines:
+            sentences = _split_sentences_for_cleanup(line)
+            if not sentences:
+                kept_lines.append(line)
+                continue
+            kept_sentences = []
+            for sent in sentences:
+                sent_pairs = _sentence_citation_pairs(sent)
+                # No citation: keep (we never drop uncited prose here)
+                if not sent_pairs:
+                    kept_sentences.append(sent)
+                    continue
+                # Any novel citation: keep, register pairs
+                if not sent_pairs.issubset(seen_pairs):
+                    kept_sentences.append(sent)
+                    seen_pairs |= sent_pairs
+                    seen_tokens.append(_redundancy_tokens(sent))
+                    continue
+                # All citations already seen: check token overlap
+                this_tokens = _redundancy_tokens(sent)
+                max_overlap = max((len(this_tokens & prev) for prev in seen_tokens), default=0)
+                if max_overlap >= min_token_overlap:
+                    snippet = re.sub(r"\s+", " ", sent.strip())[:140]
+                    removed_examples.append({
+                        "snippet": snippet + ("…" if len(snippet) == 140 else ""),
+                        "overlap_tokens": int(max_overlap),
+                        "cited_pairs": sorted(list(sent_pairs)),
+                    })
+                    continue
+                # Same citation set but distinct content: keep
+                kept_sentences.append(sent)
+                seen_tokens.append(this_tokens)
+            if kept_sentences:
+                kept_lines.append(" ".join(kept_sentences))
+        if kept_lines:
+            new_paragraphs.append("\n".join(kept_lines))
+    cleaned = "\n\n".join(new_paragraphs)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned, removed_examples
 
 
 def _strip_placeholder_citations(text: str) -> str:
@@ -624,16 +1104,25 @@ def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
 # =============================================================================
 
 _PROSE_DIRECTIVE = (
-    "Write in the register of historical demography and economic history, with attention to population processes, "
-    "institutions, labor regimes, prices, measurement, state capacity, and source limits. "
-    "Do not begin sentences with author names, and do not write 'X argues', 'X demonstrates', 'X highlights', or 'X supports'. "
-    "State the substantive claim, then cite a validated page. "
-    "Avoid generic survey phrases such as 'the literature suggests', 'complex interplay', 'future research', and 'further investigation'. "
-    "Do not use em dashes. "
+    "Write in a scholarly register suited to historical methods. "
+    "Argue in direct positive claims; do not lean on contrastive framings such as "
+    "'not X but Y', 'rather than', 'unlike', or 'in contrast'. "
+    "Vary sentence length; do not produce runs of short staccato sentences. "
+    "Introduce claims as full sentences rather than via colon setups. "
     "You may cite an evidence ID such as [E0001]; it will be rendered into a validated page citation. "
-    "Otherwise all citations must use the (Author_Year: p.N) format. No other citation style."
+    "When multiple sources in the evidence support the same point, cite them together in one "
+    "parenthetical reference rather than presenting each as a separate witness — e.g. "
+    "'the institutional turn is established across the literature ([E0001]; [E0007]; [E0014]).' "
+    "Save the named, narrative form 'Author (Year, p.N) argues that...' for moments when one "
+    "source's specific argument is the subject of the sentence."
 )
 
+# v8 (R4): single canonical set of prompt builders. The previous file had two
+# definitions per builder — the first was dead code shadowed by the second.
+# Each stance builder now has a structurally DISTINCT instruction so the
+# resulting paragraphs read as substantively different arguments rather than
+# three parallel templates with one verb swapped.
+
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
     return f"""Literature review on: {topic}
 
@@ -647,118 +1136,58 @@ Evidence:
 
 {_PROSE_DIRECTIVE}
 
-Write 200-300 words. Establish the central question and its stakes. Introduce the main positions. End mid-thought—the argument continues.
+Open the review. State the substantive question and what is at stake intellectually (not in NGO terms). Name the live disagreement: what positions exist, where they conflict, without listing them as a survey. 200-300 words. End mid-thought; the argument continues.
 
 Begin:"""
 
 
-def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
-    return f"""Continue this literature review on: {topic}
+def _format_cluster_synthesis_block(synth, doc_to_evidence_ids) -> str:
+    """v11-C: render a cluster synthesis dict into a prompt-ready block.
 
-Previous ending:
-...{previous_tail}
+    Translates supporting/qualifying doc_ids into evidence IDs ([E####]) so the
+    writer can emit a multi-citation parenthetical when stating the shared
+    claim. Returns an empty string when there is no synthesis (singleton
+    cluster, "Other" bucket, RRR_CLUSTER_SYNTHESIS=0, or LLM failure)."""
+    if not synth or not isinstance(synth, dict):
+        return ""
 
-Theme: {cluster} — these sources SUPPORT the thesis.
+    def _eids(doc_ids):
+        out = []
+        for did in doc_ids or []:
+            ids = doc_to_evidence_ids.get(did) or []
+            if ids:
+                out.append(ids[0])
+        return out
 
-ALLOWED CITATIONS:
-{allowed_list}
+    supporting_eids = _eids(synth.get("supporting_doc_ids", []))
+    qualifying_eids = _eids(synth.get("qualifying_doc_ids", []))
+    shared = (synth.get("shared_mechanism") or "").strip()
+    contested = (synth.get("contested_dimension") or "").strip()
 
-Evidence:
-{evidence}
+    if not shared or len(supporting_eids) < 2:
+        return ""
 
-{_PROSE_DIRECTIVE}
-
-DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
-Develop the argument directly. 200-300 words. End mid-thought.
-
-Continue:"""
-
-
-def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
-    return f"""Continue this literature review on: {topic}
-
-Previous ending:
-...{previous_tail}
-
-Theme: {cluster} — these sources CHALLENGE the thesis.
-
-ALLOWED CITATIONS:
-{allowed_list}
-
-Evidence:
-{evidence}
-
-{_PROSE_DIRECTIVE}
-
-DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
-Present the counterargument directly. 200-300 words. End mid-thought.
-
-Continue:"""
-
-
-def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
-    return f"""Continue this literature review on: {topic}
-
-Previous ending:
-...{previous_tail}
-
-Theme: {cluster} — these sources ADD NUANCE to the thesis.
-
-ALLOWED CITATIONS:
-{allowed_list}
-
-Evidence:
-{evidence}
-
-{_PROSE_DIRECTIVE}
-
-DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
-Show how these qualifications reshape the argument. 200-300 words. End mid-thought.
-
-Continue:"""
+    cite_block = "; ".join(f"[{e}]" for e in supporting_eids[:5])
+    lines = [
+        "CLUSTER SYNTHESIS (use ONE parenthetical multi-citation when stating the shared claim):",
+        f"  Shared mechanism: {shared}",
+        f"  Supporting sources to cite together: ({cite_block})",
+    ]
+    if qualifying_eids:
+        qual_block = "; ".join(f"[{e}]" for e in qualifying_eids[:3])
+        lines.append(
+            f"  Sources that qualify or scope the claim (cite as a follow-up "
+            f"sentence, not in the main multi-citation): ({qual_block})"
+        )
+    if contested:
+        lines.append(f"  Internal disagreement to acknowledge: {contested}")
+    return "\n".join(lines)
 
 
-def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
-    return f"""Close this literature review on: {topic}
-
-Previous ending:
-...{previous_tail}
-
-ALLOWED CITATIONS:
-{allowed_list}
-
-Remaining evidence:
-{evidence}
-
-{_PROSE_DIRECTIVE}
-
-Write 150-200 words. Identify where scholars converge and diverge. State what remains unresolved. 
-Do NOT write "In conclusion" or "To summarize."
-
-Continue:"""
-
-
-# Batch-one prompt definitions. These names intentionally shadow the earlier
-# prompt builders so the writer uses mechanisms and stance-specific structures.
-def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
-    return f"""Literature review on: {topic}
-
-{stance_summary}
-
-ALLOWED CITATIONS:
-{allowed_list}
-
-Evidence:
-{evidence}
-
-{_PROSE_DIRECTIVE}
-
-Write 200-300 words. Establish the central question and its stakes. Introduce the main positions. End mid-thought, since the argument continues.
-
-Begin:"""
-
-
-def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
+def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str,
+                           previous_tail: str, synthesis_block: str = ""):
+    # v8 (R4) — distinct shape: single chain of inference, ~260-300 words.
+    synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
     return f"""Continue this literature review on: {topic}
 
 Previous ending:
@@ -769,18 +1198,20 @@ Theme: {cluster}. These sources SUPPORT the thesis through corroborating mechani
 ALLOWED CITATIONS:
 {allowed_list}
 
-Evidence:
+{synthesis_section}Evidence:
 {evidence}
 
 {_PROSE_DIRECTIVE}
 
-DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
-Lead with the shared mechanism, then connect the strongest quoted evidence to the historical claim. 200-300 words. End mid-thought.
+Build one chain of inference. Open by stating the shared mechanism the cluster holds in common and cite the supporting sources together in one parenthetical (per the CLUSTER SYNTHESIS above if present, otherwise the strongest 2-3 sources in Evidence). Then narrow to one source for a specific quoted phrase that establishes the mechanism; show how a second source confirms it under different conditions (period, region, measurement); then trace one downstream implication that follows. Do not list. Do not restate the thesis. 260-300 words. End mid-thought.
 
 Continue:"""
 
 
-def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
+def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str,
+                            previous_tail: str, synthesis_block: str = ""):
+    # v8 (R4) — distinct shape: force a choice. Shorter, sharper.
+    synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
     return f"""Continue this literature review on: {topic}
 
 Previous ending:
@@ -791,18 +1222,20 @@ Theme: {cluster}. These sources CHALLENGE the thesis by identifying weak assumpt
 ALLOWED CITATIONS:
 {allowed_list}
 
-Evidence:
+{synthesis_section}Evidence:
 {evidence}
 
 {_PROSE_DIRECTIVE}
 
-DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
-Name the vulnerable assumption, develop the counter-evidence, and keep citations tied to concrete pages. 200-300 words. End mid-thought.
+Identify the specific assumption the supporting case rests on, then quote the evidence that breaks it inside the same sentence, not after it. When the CLUSTER SYNTHESIS above identifies a shared critical move across multiple sources, name it once with a multi-citation parenthetical. Force the reader to weigh the assumption against the counter-evidence; do not list qualifications. Do not restate the thesis. 200-240 words. End mid-thought.
 
 Continue:"""
 
 
-def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str, previous_tail: str):
+def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str,
+                              previous_tail: str, synthesis_block: str = ""):
+    # v8 (R4) — distinct shape: pick the binding scope condition and develop it.
+    synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
     return f"""Continue this literature review on: {topic}
 
 Previous ending:
@@ -813,18 +1246,19 @@ Theme: {cluster}. These sources COMPLICATE the thesis by setting scope condition
 ALLOWED CITATIONS:
 {allowed_list}
 
-Evidence:
+{synthesis_section}Evidence:
 {evidence}
 
 {_PROSE_DIRECTIVE}
 
-DO NOT restate the thesis. DO NOT mention "future research" or "further investigation."
-Show how the scope condition changes the interpretation without treating the evidence as a simple rejection. 200-300 words. End mid-thought.
+Do not list qualifications. Pick the single scope condition that most narrows the supporting claim, and use one extended example to show what the thesis can and cannot explain under that condition. If the CLUSTER SYNTHESIS above names a scope condition shared across multiple sources, cite them together in one parenthetical when introducing it. Treat the qualification as reshaping the question, not as a rejection. Do not restate the thesis. 220-260 words. End mid-thought.
 
 Continue:"""
 
 
 def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
+    # v8 (R4/R6): closing must synthesise without restating prior section claims;
+    # do not paraphrase the same two mechanisms that opened.
     return f"""Close this literature review on: {topic}
 
 Previous ending:
@@ -833,20 +1267,51 @@ Previous ending:
 ALLOWED CITATIONS:
 {allowed_list}
 
-Section claims and supporting evidence:
+Section claims already made (do NOT restate the specific mechanisms below; synthesise across them):
 {evidence}
 
 {_PROSE_DIRECTIVE}
 
-Write 150-200 words. Identify where scholars converge and diverge. State what remains unresolved.
-Do NOT write "In conclusion" or "To summarize."
+Without restating the specific mechanisms or evidence already developed, name the underlying point of agreement, the precise remaining disagreement, and what would have to be measured to resolve it. 150-200 words. Do not write "In conclusion" or "To summarize".
 
 Continue:"""
+
+
+def _dump_writer_prompt(stage: str, system: str, user: str) -> None:
+    """v10: when RRR_DEBUG_WRITER_PROMPTS=1 (or an explicit dir), write the
+    exact system+user pair sent to the model into runs/prompts/. One file per
+    stage call; later calls of the same stage suffix with a counter.
+    """
+    target = os.environ.get("RRR_WRITER_PROMPT_DUMP_DIR")
+    if not target and os.environ.get("RRR_DEBUG_WRITER_PROMPTS", "0") == "1":
+        target = str(runs_path("prompts"))
+    if not target:
+        return
+    try:
+        os.makedirs(target, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", stage)
+        # disambiguate repeated stages (e.g. writer_complicates fires N times)
+        idx = 0
+        while True:
+            fn = os.path.join(target, f"{slug}_{idx:02d}.txt")
+            if not os.path.exists(fn):
+                break
+            idx += 1
+        payload = (
+            "===== SYSTEM =====\n" + (system or "") + "\n\n"
+            "===== USER =====\n" + (user or "") + "\n"
+        )
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(payload)
+    except Exception:
+        # debug dump must never break a writer call
+        pass
 
 
 def _ollama_chat(prompt: str, metrics=None, stage="writer"):
     import ollama
     import time
+    _dump_writer_prompt(stage, _SYSTEM_CITATION_INSTRUCTION, prompt)
     start = time.perf_counter()
     try:
         res = ollama.chat(
@@ -873,6 +1338,146 @@ def _ollama_chat(prompt: str, metrics=None, stage="writer"):
     return out
 
 
+def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
+    """v11-B: rewrite the first sentence of each interior section so the
+    review flows from section to section instead of each restating the topic
+    framing. One batched LLM call. Falls back to the original chunks on any
+    parse / verification failure. Toggle via RRR_WRITER_STITCH (default ON).
+
+    Verification: the rewritten opener must contain the SAME set of canonical
+    citations (Doc_Year: p.N) as the original; any addition or removal causes
+    that opener to be discarded. Only the opening sentence is replaced; the
+    rest of each section is untouched.
+    """
+    import time
+    if os.environ.get("RRR_WRITER_STITCH", "1") != "1":
+        return chunks
+    # Need at least opening + 2 interior sections + closing to make stitching
+    # meaningful. (Opening alone doesn't need stitching; closing already
+    # synthesises across sections.)
+    if not chunks or len(chunks) < 4:
+        return chunks
+
+    interior_indices = list(range(1, len(chunks) - 1))
+    extracts = []
+    for i in interior_indices:
+        sents = _split_sentences_for_cleanup(chunks[i])
+        if not sents:
+            continue
+        opener = sents[0].strip()
+        prev_sents = _split_sentences_for_cleanup(chunks[i - 1])
+        prev_tail = prev_sents[-1].strip() if prev_sents else ""
+        if not opener:
+            continue
+        extracts.append({"index": i, "opener": opener, "prev_tail": prev_tail})
+
+    if len(extracts) < 2:
+        return chunks
+
+    parts = [
+        f"Topic of the literature review: {topic}",
+        "",
+        "Below are the OPENING sentence of several adjacent sections in the "
+        "same review. Each currently restates the topic framing on its own, "
+        "which reads as several mini-essays stitched together. Rewrite each "
+        "OPENING so it flows from the previous section's last sentence — pick "
+        "up a thread, contrast a finding, follow a scope condition — rather "
+        "than re-introducing the topic.",
+        "",
+        "STRICT RULES:",
+        "- Keep every (Doc_Year: p.N) citation token UNCHANGED.",
+        "- Do NOT add or remove any citation.",
+        "- Do NOT exceed the original sentence length by more than ~20%.",
+        "- Return ONLY a single JSON object: "
+        '{"openings": [{"index": <int>, "rewritten": "<sentence>"}, ...]}',
+        "",
+        "Sections to stitch:",
+    ]
+    for e in extracts:
+        parts.append(f"\n--- section index={e['index']} ---")
+        if e["prev_tail"]:
+            parts.append(f"Previous section ended: {e['prev_tail']}")
+        parts.append(f"Current opening (rewrite this): {e['opener']}")
+    prompt = "\n".join(parts)
+
+    try:
+        import ollama
+        start = time.perf_counter()
+        res = ollama.chat(
+            model=_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": float(os.environ.get("RRR_WRITER_STITCH_T", "0.3")),
+                "num_ctx": int(os.environ.get("RRR_WRITER_STITCH_CTX", "8192")),
+                "num_predict": int(os.environ.get("RRR_WRITER_STITCH_PRED", "1500")),
+            },
+            keep_alive=_KEEP_ALIVE,
+            format="json",
+            stream=False,
+        )
+        raw = (res.get("message", {}).get("content") or "").strip()
+        if metrics:
+            metrics.record_llm("cross_section_stitch", _MODEL,
+                               duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt), response_chars=len(raw))
+    except Exception as e:
+        if metrics:
+            metrics.record_llm("cross_section_stitch", _MODEL,
+                               success=False, error=e)
+        return chunks
+
+    try:
+        start_idx = raw.find("{")
+        end_idx = raw.rfind("}")
+        if start_idx < 0 or end_idx <= start_idx:
+            return chunks
+        obj = json.loads(raw[start_idx:end_idx + 1])
+    except Exception:
+        return chunks
+    rewrites = obj.get("openings") if isinstance(obj, dict) else None
+    if not isinstance(rewrites, list):
+        return chunks
+
+    new_chunks = list(chunks)
+    applied = 0
+    skipped_citation = 0
+    skipped_empty = 0
+    interior_set = set(interior_indices)
+    cite_token_re = re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\)")
+    for r in rewrites:
+        if not isinstance(r, dict):
+            continue
+        try:
+            idx = int(r.get("index"))
+        except (TypeError, ValueError):
+            continue
+        rewritten = str(r.get("rewritten", "") or "").strip()
+        if not rewritten or idx not in interior_set:
+            skipped_empty += 1
+            continue
+        sents = _split_sentences_for_cleanup(new_chunks[idx])
+        if not sents:
+            continue
+        orig_opener = sents[0]
+        orig_cites = sorted(cite_token_re.findall(orig_opener))
+        new_cites = sorted(cite_token_re.findall(rewritten))
+        if orig_cites != new_cites:
+            skipped_citation += 1
+            continue
+        sents[0] = rewritten
+        new_chunks[idx] = " ".join(sents)
+        applied += 1
+
+    if metrics:
+        metrics.set("writer_stitch_applied", applied)
+        metrics.set("writer_stitch_skipped_citation_change", skipped_citation)
+        metrics.set("writer_stitch_skipped_empty", skipped_empty)
+    if applied:
+        print(f"[Writer] Cross-section stitch: rewrote {applied} section "
+              f"opener(s) (skipped {skipped_citation} for citation drift)")
+    return new_chunks
+
+
 def _build_author_year_lookup(allowed_docs):
     # Build reverse lookup: (author, year) -> doc_id for academic citation matching.
     author_year_to_docid = {}
@@ -889,33 +1494,53 @@ def _build_author_year_lookup(allowed_docs):
 
 
 def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
-    # Collect cited doc_ids from both correct and academic citation formats.
+    """Collect cited doc_ids from all surfaces the writer may have emitted.
+
+    v10: the user-facing surface is 'Author (Year, p.N)'. We still scan the
+    legacy canonical and bare doc_id forms in case any slipped through.
+    """
     cited_docs = set()
-    
+
+    # Canonical: (Doc_Year: p.N)
     for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", text):
         did = m.group(1)
         if did in allowed_docs:
             cited_docs.add(did)
-    
+
+    # Bare canonical: (Doc_Year)
     for m in re.finditer(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)", text):
         did = m.group(1)
         if did in allowed_docs:
             cited_docs.add(did)
-    
+
+    # v10 display surfaces: both 'Author (Year, p.N)' and '(Author Year, p.N)'
+    display_lookup = _build_display_lookup(allowed_docs)
+    for m in DISPLAY_CITE_RE.finditer(text):
+        key = (m.group(1).strip().lower(), m.group(2))
+        did = display_lookup.get(key)
+        if did:
+            cited_docs.add(did)
+    for m in DISPLAY_PAREN_CITE_RE.finditer(text):
+        key = (m.group(1).strip().lower(), m.group(2))
+        did = display_lookup.get(key)
+        if did:
+            cited_docs.add(did)
+
+    # Legacy author-year academic forms: (Author, Year) and Author (Year)
     for m in re.finditer(r"\(([A-Za-z&]+(?:\s+et\s+al\.?)?)[,\s]+(\d{4})\)", text):
         author = m.group(1).lower().strip().rstrip('.')
         year = m.group(2)
         did = author_year_to_docid.get((author, year))
         if did:
             cited_docs.add(did)
-    
+
     for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4})\)", text):
         author = m.group(1).lower().strip().rstrip('.')
         year = m.group(2)
         did = author_year_to_docid.get((author, year))
         if did:
             cited_docs.add(did)
-    
+
     return cited_docs
 
 
@@ -938,6 +1563,30 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     author_year_to_docid = _build_author_year_lookup(allowed_docs)
     evidence_id_map = _build_evidence_id_map(docs)
+
+    # v11-C: read cluster syntheses from the ledger and build the doc -> [evidence_ids]
+    # reverse lookup we need to render multi-citation parentheticals. Each
+    # synthesis is keyed as "stance::cluster_label" in the ledger; unpack into a
+    # tuple-keyed dict for lookup during chunk_plan construction.
+    cluster_syntheses_raw = data.get("cluster_syntheses", {}) or {}
+    cluster_syntheses = {}
+    for key, synth in cluster_syntheses_raw.items():
+        if "::" not in key or not isinstance(synth, dict):
+            continue
+        stance_part, _, cluster_part = key.partition("::")
+        cluster_syntheses[(stance_part, cluster_part)] = synth
+    doc_to_evidence_ids = defaultdict(list)
+    for eid, ev in evidence_id_map.items():
+        did = (ev.get("doc_id") or "").strip()
+        if did:
+            doc_to_evidence_ids[did].append(eid)
+    # Sort each doc's evidence IDs so the first one is deterministic (E0001 < E0002).
+    for did in list(doc_to_evidence_ids.keys()):
+        doc_to_evidence_ids[did] = sorted(doc_to_evidence_ids[did])
+    if cluster_syntheses:
+        print(f"[Writer] cluster syntheses loaded: {len(cluster_syntheses)}")
+        if metrics:
+            metrics.set("writer_cluster_syntheses_loaded", len(cluster_syntheses))
 
     # Bucket by stance first, then by cluster
     stance_buckets = defaultdict(lambda: defaultdict(list))
@@ -971,21 +1620,28 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         max_clusters = _max_clusters_for_stance(n_docs)
         return ranked[:max_clusters]
     
+    def _synth_block(stance, cluster_label):
+        synth = cluster_syntheses.get((stance, cluster_label))
+        return _format_cluster_synthesis_block(synth, doc_to_evidence_ids)
+
     for cluster, cluster_docs in rank_clusters("supports"):
-        chunk_plan.append(("supports", cluster, cluster_docs, _build_supports_prompt))
-    
+        chunk_plan.append(("supports", cluster, cluster_docs,
+                           _build_supports_prompt, _synth_block("supports", cluster)))
+
     for cluster, cluster_docs in rank_clusters("critiques"):
-        chunk_plan.append(("critiques", cluster, cluster_docs, _build_critiques_prompt))
-    
+        chunk_plan.append(("critiques", cluster, cluster_docs,
+                           _build_critiques_prompt, _synth_block("critiques", cluster)))
+
     for cluster, cluster_docs in rank_clusters("complicates"):
-        chunk_plan.append(("complicates", cluster, cluster_docs, _build_complicates_prompt))
+        chunk_plan.append(("complicates", cluster, cluster_docs,
+                           _build_complicates_prompt, _synth_block("complicates", cluster)))
     
     if not chunk_plan:
         raise SystemExit("No documents to write about.")
 
-    supports_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "supports")
-    critiques_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "critiques")
-    complicates_clusters = sum(1 for s, _, _, _ in chunk_plan if s == "complicates")
+    supports_clusters = sum(1 for s, *_ in chunk_plan if s == "supports")
+    critiques_clusters = sum(1 for s, *_ in chunk_plan if s == "critiques")
+    complicates_clusters = sum(1 for s, *_ in chunk_plan if s == "complicates")
     print(f"[Writer] Adaptive clusters: supports={supports_clusters}, critiques={critiques_clusters}, complicates={complicates_clusters}")
     print(f"[Writer] Generating {len(chunk_plan) + 2} sections (opening + {len(chunk_plan)} stance sections + closing)...")
     if metrics:
@@ -1006,16 +1662,57 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     total_style_removed = 0
     total_coverage_fallbacks = 0
     total_evidence_id_renders = 0
+    # v8 (R5): observability for new postproc surfaces
+    total_double_paren_collapsed = 0
+    total_author_led_openings = 0
     section_coverage = []
     
+    # v10: display->canonical lookup built once per run. The writer is asked
+    # for display surface 'Author (Year, p.N)' but the existing per-section
+    # validators (citation removal, coverage audit, redundancy detection) all
+    # speak canonical '(Doc_Year: p.N)'. We rewrite display->canonical at the
+    # START of postprocess_chunk so the canonical machinery keeps working
+    # unchanged; the FINAL assembly converts everything back to display.
+    chunk_display_lookup = _build_display_lookup(allowed_docs)
+
+    def _chunk_display_to_canonical(text):
+        def repl(m):
+            label = m.group(1).strip().lower()
+            year = m.group(2)
+            page = int(m.group(3))
+            did = chunk_display_lookup.get((label, year))
+            if did:
+                return render_citation_canonical(did, page)
+            return m.group(0)
+        # v10.2: rewrite BOTH 'Author (Year, p.N)' AND '(Author Year, p.N)' to
+        # the canonical surface. The paren-shape was the silent failure mode in
+        # the v10.1 smoke (model mixed the two; we caught only one).
+        text = DISPLAY_CITE_RE.sub(repl, text)
+        text = DISPLAY_PAREN_CITE_RE.sub(repl, text)
+        return text
+
     def postprocess_chunk(chunk, chunk_docs):
         nonlocal total_repairs, total_placeholders_stripped, all_dump_citations, total_ajr_fixes
         nonlocal total_removed_citations, total_style_removed, total_evidence_id_renders
-        
+        nonlocal total_double_paren_collapsed, total_author_led_openings
+
         chunk = _strip_wrapping(chunk)
         chunk, evidence_renders = _render_evidence_id_citations(chunk, evidence_id_map)
         total_evidence_id_renders += evidence_renders
-        
+
+        # v10: rewrite Author (Year, p.N) -> (Doc_Year: p.N) so every existing
+        # validator below sees the canonical surface it understands.
+        chunk = _chunk_display_to_canonical(chunk)
+
+        # v8 (R5): collapse ((Doc: p.N)) before any other citation pass — those
+        # forms otherwise survive every downstream regex because CITE_RE matches
+        # single-paren only.
+        chunk, double_collapsed = _collapse_double_parens(chunk)
+        total_double_paren_collapsed += double_collapsed
+
+        # v8 (R5): observe author-led-opening violations and count them.
+        total_author_led_openings += _count_author_led_openings(chunk)
+
         chunk_before = chunk
         chunk = _strip_placeholder_citations(chunk)
         placeholders_stripped = chunk_before.count('DocId_Year') + chunk_before.count('AuthorName_Year')
@@ -1055,6 +1752,27 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
         if audit["ok"] or not _writer_enforcement_enabled():
             return chunk, repairs, placeholders, ajr, style_removed, audit
+
+        # v8 (R11): try the deterministic fallback FIRST — it's free, uses the
+        # same allowed-pairs provenance as the LLM retry would, and resolves
+        # the small-shortfall case (which dominates) without a ~2s LLM call.
+        chunk_allowed_pairs, _, _ = _build_allowed_citations(chunk_docs)
+        chunk, fallback_count = _append_coverage_fallback(
+            chunk,
+            chunk_docs,
+            audit["required_cited_docs"],
+            allowed_pairs=chunk_allowed_pairs,
+        )
+        if fallback_count:
+            total_coverage_fallbacks += fallback_count
+            if metrics:
+                metrics.inc("writer_section_coverage_fallbacks", fallback_count)
+        audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+        if audit["ok"]:
+            return chunk, repairs, placeholders, ajr, style_removed, audit
+
+        # Deterministic fallback couldn't reach the required doc count. Escalate
+        # to LLM coverage retry as the last resort.
         if metrics:
             metrics.inc("writer_section_coverage_retries")
         retry_prompt = _coverage_retry_prompt(prompt, chunk, audit["required_cited_docs"])
@@ -1062,17 +1780,17 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         chunk, repairs2, placeholders2, ajr2, style_removed2 = postprocess_chunk(raw, chunk_docs)
         audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
         if not audit["ok"]:
-            chunk_allowed_pairs, _, _ = _build_allowed_citations(chunk_docs)
-            chunk, fallback_count = _append_coverage_fallback(
+            # Final deterministic top-up in case the LLM retry made partial progress.
+            chunk, fallback_count2 = _append_coverage_fallback(
                 chunk,
                 chunk_docs,
                 audit["required_cited_docs"],
                 allowed_pairs=chunk_allowed_pairs,
             )
-            if fallback_count:
-                total_coverage_fallbacks += fallback_count
+            if fallback_count2:
+                total_coverage_fallbacks += fallback_count2
                 if metrics:
-                    metrics.inc("writer_section_coverage_fallbacks", fallback_count)
+                    metrics.inc("writer_section_coverage_fallbacks", fallback_count2)
                 audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
         if not audit["ok"]:
             raise ValueError(
@@ -1125,11 +1843,12 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # Generate stance sections
     stance_jobs = []
     parallel_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-    for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
+    for i, (stance, cluster, cluster_docs, prompt_builder, synthesis_block) in enumerate(chunk_plan):
         cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
         allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
         evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
-        prompt = prompt_builder(topic, cluster, evidence, allowed_list, parallel_tail)
+        prompt = prompt_builder(topic, cluster, evidence, allowed_list, parallel_tail,
+                                synthesis_block)
         stance_jobs.append({
             "index": i,
             "stance": stance,
@@ -1212,12 +1931,13 @@ def compose_from_ledger(ledger_path=None, metrics=None):
                 if metrics:
                     metrics.inc("writer_sections_failed")
     else:
-        for i, (stance, cluster, cluster_docs, prompt_builder) in enumerate(chunk_plan):
+        for i, (stance, cluster, cluster_docs, prompt_builder, synthesis_block) in enumerate(chunk_plan):
             cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
             allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
             evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
             previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-            prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail)
+            prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail,
+                                    synthesis_block)
             job = {
                 "index": i,
                 "stance": stance,
@@ -1290,22 +2010,63 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         if metrics:
             metrics.inc("writer_sections_failed")
 
+    # v11-B: one batched LLM call that rewrites the opening sentence of each
+    # interior section so the review flows section-to-section instead of each
+    # restating the topic framing. Operates on the chunks list (each chunk is
+    # one section). Verifies citation tokens are preserved per opener; any
+    # opener whose citation set drifts is silently reverted to the original.
+    if metrics:
+        with metrics.stage("writer_stitch"):
+            chunks = _apply_cross_section_stitch(chunks, topic, metrics=metrics)
+    else:
+        chunks = _apply_cross_section_stitch(chunks, topic, metrics=None)
+
     # Final assembly
     full_text = "\n\n".join(chunks)
     full_text, final_evidence_renders = _render_evidence_id_citations(full_text, evidence_id_map)
     total_evidence_id_renders += final_evidence_renders
-    
+
+    # v10: bring everything to the CANONICAL surface for validation. The model
+    # is asked for display form 'Author (Year, p.N)'; we map it back to the
+    # canonical '(Doc_Year: p.N)' so the existing validator (which knows about
+    # allowed_pairs in canonical form) can do its work unchanged.
+    display_lookup = _build_display_lookup(allowed_docs)
+    display_to_canonical_count = 0
+
+    def _display_to_canonical(text):
+        nonlocal display_to_canonical_count
+
+        def repl(m):
+            nonlocal display_to_canonical_count
+            label = m.group(1).strip().lower()
+            year = m.group(2)
+            page = int(m.group(3))
+            did = display_lookup.get((label, year))
+            if did:
+                display_to_canonical_count += 1
+                return render_citation_canonical(did, page)
+            return m.group(0)
+
+        # v10.2: handle both display shapes
+        text = DISPLAY_CITE_RE.sub(repl, text)
+        text = DISPLAY_PAREN_CITE_RE.sub(repl, text)
+        return text
+
+    full_text = _display_to_canonical(full_text)
+    if display_to_canonical_count and metrics:
+        metrics.inc("writer_display_to_canonical", display_to_canonical_count)
+
     global_year_to_docid = _build_year_to_docid(docs)
     full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
     total_repairs += final_repairs
-    
+
     full_text, final_ajr = _fix_ajr_abbreviation(full_text)
     total_ajr_fixes += final_ajr
-    
+
     full_text = _strip_placeholder_citations(full_text)
     full_text, final_dump_cites = _extract_citation_dumps(full_text)
     all_dump_citations.extend(final_dump_cites)
-    
+
     full_text, case_fixes = _normalize_citation_case(full_text, allowed_docs)
     if case_fixes > 0:
         print(f"[Writer] Case normalized: {case_fixes} citations")
@@ -1328,12 +2089,66 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     full_text, final_style_removed = _remove_style_violations(full_text)
     total_style_removed += len(final_style_removed)
-    
+
+    # v9 (R6): final-assembly cross-section redundancy drop. Conservative —
+    # only fires when a sentence's citations are a strict subset of those
+    # already cited AND it has substantial content overlap with an earlier
+    # sentence. Configurable via env (set 0 to disable, or raise the overlap
+    # threshold to be even more conservative).
+    if os.environ.get("RRR_WRITER_DROP_REDUNDANCY", "1") != "0":
+        overlap_threshold = int(os.environ.get("RRR_WRITER_REDUNDANCY_OVERLAP", "4"))
+        full_text, redundancy_drops = _drop_cross_section_redundancy(
+            full_text, min_token_overlap=overlap_threshold,
+        )
+        if redundancy_drops:
+            print(f"[Writer] Dropped {len(redundancy_drops)} redundant sentence(s) at final assembly:")
+            for r in redundancy_drops[:5]:
+                print(f"         - overlap={r['overlap_tokens']} cited={r['cited_pairs']}: {r['snippet']}")
+            if metrics:
+                metrics.inc("writer_redundancy_drops", len(redundancy_drops))
+                metrics.set("writer_redundancy_examples", redundancy_drops[:10])
+    else:
+        redundancy_drops = []
+
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
     full_text = _strip_continuation_markers(full_text)
-    
+
     full_text = re.sub(r'\n{3,}', '\n\n', full_text)
+
+    # v10: every surviving canonical-form citation '(Doc_Year: p.N)' is
+    # rewritten to the user-facing display form 'Author (Year, p.N)'.
+    # Validation is already complete at this point, so the rewrite is purely
+    # cosmetic; the corpus boundary check ran against the canonical pair.
+    full_text, canonical_to_display_count = rewrite_canonical_to_display(full_text)
+    if canonical_to_display_count and metrics:
+        metrics.inc("writer_canonical_to_display", canonical_to_display_count)
+
+    # v11-A: rewrite narrative citations 'Author (Year, p.N)' sitting at the
+    # end of a sentence whose subject is not the author to the parenthetical
+    # form '(Author Year, p.N)'. Closes the v10 known edge case where the
+    # writer produced 'X conducive to growth North and Weingast (1989, p.4).'
+    full_text, narrative_rewrites = rewrite_misplaced_narrative_citations(full_text)
+    if narrative_rewrites and metrics:
+        metrics.inc("writer_narrative_to_paren", narrative_rewrites)
+    if narrative_rewrites:
+        print(f"[Writer] Narrative->paren rewrites: {narrative_rewrites}")
+
+    # v10: detect-then-LLM-rewrite style enforcement (one batched call). Runs
+    # AFTER validation so the rewriter sees the final citation surface and is
+    # forbidden from changing any (Year, p.N) tokens. Refuses to apply rewrites
+    # that would reintroduce a violation or alter a citation.
+    full_text, style_stats = _apply_style_enforcement(full_text, metrics=metrics)
+    if metrics:
+        metrics.set("writer_style_enforcement", style_stats)
+    if style_stats.get("violations"):
+        print(f"[Writer] Style: {style_stats['violations']} flagged, "
+              f"{style_stats['rewrites_applied']} rewritten "
+              f"(trailing_significance stripped: {style_stats['trailing_stripped']}, "
+              f"fallback_reason: {style_stats['fallback_reason']})")
+    elif style_stats.get("trailing_stripped"):
+        print(f"[Writer] Style: stripped {style_stats['trailing_stripped']} "
+              "trailing-significance phrase(s); no other violations.")
 
     cited_docs = _collect_cited_docs(full_text, allowed_docs, author_year_to_docid)
     for did in all_dump_citations:
@@ -1356,7 +2171,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} "
         f"repairs={total_repairs} AJR={total_ajr_fixes} case={case_fixes} "
         f"removed={total_removed_citations} style_removed={total_style_removed} "
-        f"coverage_fallbacks={total_coverage_fallbacks} evidence_id_renders={total_evidence_id_renders}"
+        f"coverage_fallbacks={total_coverage_fallbacks} evidence_id_renders={total_evidence_id_renders} "
+        f"double_paren_collapsed={total_double_paren_collapsed} author_led_openings={total_author_led_openings} "
+        f"redundancy_drops={len(redundancy_drops)}"
     )
     if metrics:
         metrics.set("writer_stats", {
@@ -1370,6 +2187,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "style_sentences_removed": total_style_removed,
             "coverage_fallbacks": total_coverage_fallbacks,
             "evidence_id_renders": total_evidence_id_renders,
+            "double_paren_collapsed": total_double_paren_collapsed,
+            "author_led_openings": total_author_led_openings,
+            "redundancy_drops": len(redundancy_drops),
             "citation_dump_docs": len(all_dump_citations),
             "section_claims": section_claims,
             "section_coverage": section_coverage,
@@ -1378,6 +2198,8 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         metrics.inc("writer_removed_citations", total_removed_citations)
         metrics.inc("writer_style_sentences_removed", total_style_removed)
         metrics.inc("writer_evidence_id_renders", total_evidence_id_renders)
+        metrics.inc("writer_double_paren_collapsed", total_double_paren_collapsed)
+        metrics.inc("writer_author_led_openings", total_author_led_openings)
     
     return str(out_path)
 
