@@ -9,6 +9,7 @@ from rrr.render import (
     CITE_RE,
     DISPLAY_CITE_RE,
     DISPLAY_PAREN_CITE_RE,
+    collapse_nested_narrative_multicite,
     parse_citations,
     render_citation,
     render_citation_canonical,
@@ -1442,8 +1443,39 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     applied = 0
     skipped_citation = 0
     skipped_empty = 0
+    skipped_topic_paraphrase = 0
     interior_set = set(interior_indices)
     cite_token_re = re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\)")
+
+    # v11.1: topic-paraphrase guard. Compute the topic's content-token set once,
+    # then reject any stitch rewrite that pulls back to a near-restatement of
+    # the topic line. Closes the v11 failure on section 4 where the LLM
+    # produced "The question of whether institutions are indeed the fundamental
+    # cause of long-run economic growth remains a pivotal area of inquiry..."
+    _STOPWORDS = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "of", "to", "in", "for", "on", "with", "as", "by", "at", "from",
+        "this", "that", "these", "those", "and", "or", "but", "if", "then",
+        "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+        "how", "their", "there", "here", "it", "its", "such", "any", "all",
+        "no", "not", "do", "does", "did", "have", "has", "had", "can", "could",
+        "may", "might", "will", "would", "shall", "should", "must",
+        "more", "most", "less", "least", "very", "much", "many", "some",
+        "about", "into", "through", "during", "before", "after", "above",
+        "below", "between", "among", "across", "over", "under",
+        "we", "you", "they", "i", "me", "us", "them", "he", "she", "him", "her",
+        "our", "your", "my",
+    }
+
+    def _content_tokens(s: str) -> set:
+        toks = re.findall(r"[A-Za-z][A-Za-z\-]+", (s or "").lower())
+        return {t for t in toks if t not in _STOPWORDS and len(t) >= 3}
+
+    topic_tokens = _content_tokens(topic)
+    # Threshold: if the rewrite shares >= 2/3 of the topic's content tokens, it's
+    # a paraphrase. Floor at 4 so a 5-word topic doesn't trip on coincidence.
+    paraphrase_threshold = max(4, int(0.66 * len(topic_tokens)))
+
     for r in rewrites:
         if not isinstance(r, dict):
             continue
@@ -1464,6 +1496,12 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         if orig_cites != new_cites:
             skipped_citation += 1
             continue
+        # v11.1: reject if the rewrite paraphrases the topic line.
+        rewrite_tokens = _content_tokens(rewritten)
+        overlap = len(rewrite_tokens & topic_tokens)
+        if topic_tokens and overlap >= paraphrase_threshold:
+            skipped_topic_paraphrase += 1
+            continue
         sents[0] = rewritten
         new_chunks[idx] = " ".join(sents)
         applied += 1
@@ -1472,9 +1510,11 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         metrics.set("writer_stitch_applied", applied)
         metrics.set("writer_stitch_skipped_citation_change", skipped_citation)
         metrics.set("writer_stitch_skipped_empty", skipped_empty)
-    if applied:
+        metrics.set("writer_stitch_skipped_topic_paraphrase", skipped_topic_paraphrase)
+    if applied or skipped_topic_paraphrase:
         print(f"[Writer] Cross-section stitch: rewrote {applied} section "
-              f"opener(s) (skipped {skipped_citation} for citation drift)")
+              f"opener(s) (skipped {skipped_citation} citation drift, "
+              f"{skipped_topic_paraphrase} topic paraphrase)")
     return new_chunks
 
 
@@ -2133,6 +2173,16 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         metrics.inc("writer_narrative_to_paren", narrative_rewrites)
     if narrative_rewrites:
         print(f"[Writer] Narrative->paren rewrites: {narrative_rewrites}")
+
+    # v11.1: collapse nested narrative cites inside an outer paren wrapper —
+    # '(Author (Year, p.N); Author (Year, p.N))' becomes
+    # '(Author Year, p.N; Author Year, p.N)'. The v11 smoke produced 5 of
+    # these and they read as visually broken; semantically already correct.
+    full_text, nested_collapses = collapse_nested_narrative_multicite(full_text)
+    if nested_collapses and metrics:
+        metrics.inc("writer_nested_paren_collapsed", nested_collapses)
+    if nested_collapses:
+        print(f"[Writer] Nested-narrative paren collapses: {nested_collapses}")
 
     # v10: detect-then-LLM-rewrite style enforcement (one batched call). Runs
     # AFTER validation so the rewriter sees the final citation surface and is

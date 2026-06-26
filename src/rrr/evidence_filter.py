@@ -97,10 +97,11 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
     if not sentences:
         return []
 
-    # v10.3 #3: drop sentences with PDF-extraction artefacts when the knob is
-    # on. Default 0 = off (backwards-compatible). 1 = drop sentences with any
-    # corruption signal; 2 = drop only when multiple signals fire.
-    quote_quality_min = int(os.environ.get("RRR_WRITER_QUOTE_QUALITY_MIN", "0"))
+    # v10.3 #3 / v11.1: drop sentences with PDF-extraction artefacts. Default
+    # 1 in v11.1 (was 0 in v10.3 for backwards compatibility, verified safe in
+    # the v11 smoke). 0 = off; 1 = drop sentences with any corruption signal;
+    # 2 = drop only when multiple signals fire.
+    quote_quality_min = int(os.environ.get("RRR_WRITER_QUOTE_QUALITY_MIN", "1"))
     if quote_quality_min > 0:
         sentences = [s for s in sentences if _quote_corruption_signals(s) < quote_quality_min]
         if not sentences:

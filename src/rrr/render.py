@@ -233,6 +233,48 @@ def rewrite_misplaced_narrative_citations(text: str) -> tuple:
     return "".join(out_parts), rewrites
 
 
+# v11.1: collapse the nested-narrative-inside-paren multi-cite form that
+# mistral-small:24b produces almost every time it puts two narrative cites
+# inside an outer paren wrapper. Input: "(Author (Year, p.N); Author
+# (Year, p.N))" -> "(Author Year, p.N; Author Year, p.N)". Conservative —
+# only fires on the (outer-paren ... narrative ... ; ... narrative ...
+# outer-paren) shape; single narratives wrapped in an extra paren are also
+# collapsed because the same pattern catches them.
+_NESTED_NARRATIVE_OUTER_RE = re.compile(
+    r"\(\s*"
+    r"(?:" + _DISPLAY_LABEL + r")\s+\(\d{4}[a-z]?(?:,\s*|\s+)p\.\s*\d+\)"
+    r"(?:\s*;\s*(?:" + _DISPLAY_LABEL + r")\s+\(\d{4}[a-z]?(?:,\s*|\s+)p\.\s*\d+\))*"
+    r"\s*\)"
+)
+_INNER_NARRATIVE_CITE_RE = re.compile(
+    r"(" + _DISPLAY_LABEL + r")\s+\((\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(\d+)\)"
+)
+
+
+def collapse_nested_narrative_multicite(text: str) -> tuple:
+    """v11.1: rewrite '(Author (Year, p.N); Author (Year, p.N))' to
+    '(Author Year, p.N; Author Year, p.N)'. Returns (text, count)."""
+    if not text:
+        return text, 0
+    rewrites = 0
+
+    def repl_outer(m):
+        nonlocal rewrites
+        inner = m.group(0)[1:-1]  # strip outer parens
+        # Rewrite each inner narrative to the bare 'Author Year, p.N' form.
+        new_inner, n_inner = _INNER_NARRATIVE_CITE_RE.subn(
+            lambda im: f"{im.group(1).strip()} {im.group(2)}, p.{im.group(3)}",
+            inner,
+        )
+        if n_inner == 0:
+            return m.group(0)
+        rewrites += 1
+        return f"({new_inner.strip()})"
+
+    new_text = _NESTED_NARRATIVE_OUTER_RE.sub(repl_outer, text)
+    return new_text, rewrites
+
+
 def render_markdown(obj, refs_by_id):
     lines = []
     lines.append(f"**Claim/Topic**: {obj.get('claim') or obj.get('topic','')}")
