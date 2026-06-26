@@ -21,7 +21,11 @@ from rrr.render import (
     _doc_id_to_author_label,
 )
 
-_MODEL = os.environ.get("RRR_MODEL", "mistral")
+# v11.2 lever 2: per-stage model selection. The writer needs prose quality;
+# the reasoner needs JSON-schema obedience. Splitting lets the writer stay on
+# a prose-tier model while the reasoner runs on a smaller, cheaper model.
+# Falls back to RRR_MODEL if unset (preserves v11.1 behaviour).
+_MODEL = os.environ.get("RRR_WRITER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
 _KEEP_ALIVE = "30m"
 
 _DEFAULT_CHAT_OPTIONS = {
@@ -1185,16 +1189,41 @@ def _format_cluster_synthesis_block(synth, doc_to_evidence_ids) -> str:
     return "\n".join(lines)
 
 
+def _format_claims_so_far(section_claims) -> str:
+    """v11.2 lever 3: render the running record of prior sections into a prompt
+    block so the next writer call knows what claims have already been made.
+    Returns empty string when there are no prior sections (the opening, the
+    first stance section, or the parallel writer path where every section
+    starts simultaneously)."""
+    if not section_claims:
+        return ""
+    lines = [
+        "CLAIMS ALREADY MADE IN PRIOR SECTIONS (do NOT repeat these openers or "
+        "the same mechanism phrasing; build on them or contrast them):"
+    ]
+    for i, c in enumerate(section_claims, 1):
+        mechs = "; ".join((c.get("mechanisms") or [])[:2]) or "(no mechanism recorded)"
+        docs = ", ".join(str(d) for d in (c.get("docs") or [])[:4])
+        stance = (c.get("stance") or "").upper()
+        cluster = c.get("cluster") or ""
+        lines.append(f"  Section {i} [{stance}/{cluster}]: {mechs} (citing {docs})")
+    return "\n".join(lines)
+
+
 def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list: str,
-                           previous_tail: str, synthesis_block: str = ""):
+                           previous_tail: str, synthesis_block: str = "",
+                           claims_so_far: str = ""):
     # v8 (R4) — distinct shape: single chain of inference, ~260-300 words.
+    # v11.2 lever 3: claims_so_far renders the running record of prior sections
+    # when the writer runs sequentially (RRR_WRITER_PARALLEL=0).
     synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
+    prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
     return f"""Continue this literature review on: {topic}
 
 Previous ending:
 ...{previous_tail}
 
-Theme: {cluster}. These sources SUPPORT the thesis through corroborating mechanisms, measurements, or historical conditions.
+{prior_section}Theme: {cluster}. These sources SUPPORT the thesis through corroborating mechanisms, measurements, or historical conditions.
 
 ALLOWED CITATIONS:
 {allowed_list}
@@ -1210,15 +1239,17 @@ Continue:"""
 
 
 def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_list: str,
-                            previous_tail: str, synthesis_block: str = ""):
+                            previous_tail: str, synthesis_block: str = "",
+                            claims_so_far: str = ""):
     # v8 (R4) — distinct shape: force a choice. Shorter, sharper.
     synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
+    prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
     return f"""Continue this literature review on: {topic}
 
 Previous ending:
 ...{previous_tail}
 
-Theme: {cluster}. These sources CHALLENGE the thesis by identifying weak assumptions, alternative causes, or contrary evidence.
+{prior_section}Theme: {cluster}. These sources CHALLENGE the thesis by identifying weak assumptions, alternative causes, or contrary evidence.
 
 ALLOWED CITATIONS:
 {allowed_list}
@@ -1234,15 +1265,17 @@ Continue:"""
 
 
 def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_list: str,
-                              previous_tail: str, synthesis_block: str = ""):
+                              previous_tail: str, synthesis_block: str = "",
+                              claims_so_far: str = ""):
     # v8 (R4) — distinct shape: pick the binding scope condition and develop it.
     synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
+    prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
     return f"""Continue this literature review on: {topic}
 
 Previous ending:
 ...{previous_tail}
 
-Theme: {cluster}. These sources COMPLICATE the thesis by setting scope conditions, contingencies, or measurement limits.
+{prior_section}Theme: {cluster}. These sources COMPLICATE the thesis by setting scope conditions, contingencies, or measurement limits.
 
 ALLOWED CITATIONS:
 {allowed_list}
@@ -1971,13 +2004,19 @@ def compose_from_ledger(ledger_path=None, metrics=None):
                 if metrics:
                     metrics.inc("writer_sections_failed")
     else:
+        # v11.2 lever 3: when sequential, build the accumulated claims summary
+        # right before each section's prompt so it sees what's already been
+        # argued. Empty for the first stance section (only the opening exists),
+        # then grows as each section completes.
+        print(f"[Writer] Sequential stance chunks: claims-so-far context enabled")
         for i, (stance, cluster, cluster_docs, prompt_builder, synthesis_block) in enumerate(chunk_plan):
             cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
             allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
             evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
             previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
+            claims_so_far = _format_claims_so_far(section_claims)
             prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail,
-                                    synthesis_block)
+                                    synthesis_block, claims_so_far)
             job = {
                 "index": i,
                 "stance": stance,

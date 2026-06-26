@@ -3,7 +3,9 @@ from functools import lru_cache
 import time
 from rrr.paths import page_text_path, require_page_text_dir
 
-_MODEL = os.environ.get("RRR_MODEL", "mistral")
+# v11.2 lever 2: stance is logically part of reasoning, so prefer
+# RRR_REASONER_MODEL if set; fall back to RRR_MODEL otherwise.
+_MODEL = os.environ.get("RRR_STANCE_MODEL", os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral")))
 _STANCE_TOKENS = {"supports", "critiques", "complicates", "tangential"}
 
 

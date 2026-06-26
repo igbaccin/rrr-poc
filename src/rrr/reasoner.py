@@ -8,7 +8,11 @@ from rrr.paths import runs_path, logs_path
 from rrr.text import tokenize
 from rapidfuzz import fuzz
 
-_MODEL      = os.environ.get("RRR_MODEL", "mistral")
+# v11.2 lever 2: per-stage model selection. The reasoner stage covers fused
+# stance+mechanism, clustering, and cluster_synth — all structured-JSON calls
+# whose quality bottleneck is schema obedience, not prose. Falls back to
+# RRR_MODEL if unset (preserves v11.1 behaviour).
+_MODEL      = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
 # v8 (R12): harmonise per-stage num_ctx down from 8192 to 4096 for the small
 # reasoner/cluster prompts. Under OLLAMA_MAX_LOADED_MODELS=1 each ctx change
 # forces a KV-cache reinit. Cluster prompt observed ~2400 chars (well inside
