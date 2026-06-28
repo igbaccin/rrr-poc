@@ -1,24 +1,17 @@
 import os, json, re, time
 
 
-_PLANNER_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_PLANNER_T", "0.1")),
-    "num_ctx": int(os.environ.get("RRR_PLANNER_CTX", "2048")),
-    "num_predict": int(os.environ.get("RRR_PLANNER_PRED", "700")),
-}
-
+# v13: RRR_PLANNER_T/CTX/PRED, RRR_PLANNER_TERMS_T/CTX/PRED, RRR_PLANNER_PROBE_CAP
+# retired. These were per-stage CTX/PRED/T tuning knobs the v8-v12 work
+# converged on; no caller in scripts/, README, or pod configs overrode them.
+_PLANNER_OPTIONS = {"temperature": 0.1, "num_ctx": 2048, "num_predict": 700}
 # v9 (R7): second-stage planner asks for domain technical vocabulary the topic
 # statement does not contain. Smaller budget than stage 1 because we want a
 # tight list of phrases.
-_TERMS_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_PLANNER_TERMS_T", "0.1")),
-    "num_ctx": int(os.environ.get("RRR_PLANNER_TERMS_CTX", "2048")),
-    "num_predict": int(os.environ.get("RRR_PLANNER_TERMS_PRED", "300")),
-}
-
+_TERMS_OPTIONS = {"temperature": 0.1, "num_ctx": 2048, "num_predict": 300}
 # v9 (R7): max probes after merging stage 1 + stage 2. Stage 1 caps at 8; stage
 # 2 can add up to (PROBE_CAP - len(stage1)) novel technical phrases.
-_PROBE_CAP = int(os.environ.get("RRR_PLANNER_PROBE_CAP", "12"))
+_PROBE_CAP = 12
 
 
 def _clean_list(values, limit, item_limit=80):
@@ -136,11 +129,9 @@ def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None):
 # raw topic into every writer prompt, which produces meta-commentary and
 # defend/attack framing when the user writes a strong thesis. Reformulating
 # upstream eliminates that pressure.
-_TOPIC_REFORM_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_TOPIC_REFORM_T", "0.0")),
-    "num_ctx": int(os.environ.get("RRR_TOPIC_REFORM_CTX", "2048")),
-    "num_predict": int(os.environ.get("RRR_TOPIC_REFORM_PRED", "400")),
-}
+# v13: RRR_TOPIC_REFORM_T/CTX/PRED retired (lever pruning); per-stage tuning
+# never overridden in the wild.
+_TOPIC_REFORM_OPTIONS = {"temperature": 0.0, "num_ctx": 2048, "num_predict": 400}
 
 
 def _reformulate_topic(topic: str, model: str, metrics=None):
@@ -273,31 +264,31 @@ def plan(topic: str, metrics=None):
 
         # v9 (R7): second-stage technical-vocabulary call. Purely additive —
         # failure leaves stage-1 probes intact.
-        if os.environ.get("RRR_PLANNER_TWO_STAGE", "1") != "0":
-            terms = _extract_terms_of_art(topic, obj, model, metrics=metrics)
-            if terms:
-                merged = _merge_probes_with_terms(obj["probes"], terms, cap=_PROBE_CAP)
-                added = len(merged) - len(obj["probes"])
-                obj["probes"] = merged
-                obj["terms_of_art"] = terms
-                obj["planner_meta"]["mode"] = "llm_two_stage"
-                obj["planner_meta"]["terms_of_art_count"] = len(terms)
-                obj["planner_meta"]["probes_added_by_terms"] = added
-                print(f"[Planner] stage2 terms_of_art={len(terms)} probes_added={added} total_probes={len(obj['probes'])}")
+        # v13: RRR_PLANNER_TWO_STAGE retired (always on).
+        terms = _extract_terms_of_art(topic, obj, model, metrics=metrics)
+        if terms:
+            merged = _merge_probes_with_terms(obj["probes"], terms, cap=_PROBE_CAP)
+            added = len(merged) - len(obj["probes"])
+            obj["probes"] = merged
+            obj["terms_of_art"] = terms
+            obj["planner_meta"]["mode"] = "llm_two_stage"
+            obj["planner_meta"]["terms_of_art_count"] = len(terms)
+            obj["planner_meta"]["probes_added_by_terms"] = added
+            print(f"[Planner] stage2 terms_of_art={len(terms)} probes_added={added} total_probes={len(obj['probes'])}")
 
         # v12: topic reformulation. Falls back to raw topic on failure so the
         # rest of the pipeline never breaks on a None topic_question.
+        # v13: RRR_TOPIC_REFORMULATION retired (always on).
         obj["topic_display"] = topic
         obj["topic_question"] = topic
-        if os.environ.get("RRR_TOPIC_REFORMULATION", "1") != "0":
-            reform = _reformulate_topic(topic, model, metrics=metrics)
-            if reform:
-                obj["topic_question"] = reform["topic_question"]
-                obj["topic_dimensions"] = reform["topic_dimensions"]
-                obj["planner_meta"]["topic_reformulated"] = True
-                print(f"[Planner] topic_question='{reform['topic_question']}'")
-                if reform["topic_dimensions"]:
-                    print(f"[Planner] topic_dimensions={reform['topic_dimensions']}")
+        reform = _reformulate_topic(topic, model, metrics=metrics)
+        if reform:
+            obj["topic_question"] = reform["topic_question"]
+            obj["topic_dimensions"] = reform["topic_dimensions"]
+            obj["planner_meta"]["topic_reformulated"] = True
+            print(f"[Planner] topic_question='{reform['topic_question']}'")
+            if reform["topic_dimensions"]:
+                print(f"[Planner] topic_dimensions={reform['topic_dimensions']}")
 
         print(f"[Planner] mode={obj['planner_meta']['mode']} n_must={len(obj['keywords_must'])} n_any={len(obj['keywords_any'])} n_probes={len(obj['probes'])}")
         if metrics:

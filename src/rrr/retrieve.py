@@ -1,7 +1,7 @@
 import os, pickle, numpy as np
 from functools import lru_cache
 from rrr.paths import indices_path, page_text_path, require_file, require_indices_dir, require_page_text_dir
-from rrr.text import tokenize, tokenize_query
+from rrr.text import tokenize_query
 
 @lru_cache(maxsize=1)
 def _load_bm25_and_ids():
@@ -19,8 +19,6 @@ def _split_pid(pid):
     return pid, 1
 
 # ---------- Phase B2: cache BM25 scoring per topic ----------
-from functools import lru_cache
-
 @lru_cache(maxsize=8)
 def _scores_for_query_cached(query: str):
     """Compute BM25 scores once per topic, then reuse.

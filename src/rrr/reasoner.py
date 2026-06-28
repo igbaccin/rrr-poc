@@ -13,55 +13,39 @@ from rapidfuzz import fuzz
 # whose quality bottleneck is schema obedience, not prose. Falls back to
 # RRR_MODEL if unset (preserves v11.1 behaviour).
 _MODEL      = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
-# v8 (R12): harmonise per-stage num_ctx down from 8192 to 4096 for the small
-# reasoner/cluster prompts. Under OLLAMA_MAX_LOADED_MODELS=1 each ctx change
-# forces a KV-cache reinit. Cluster prompt observed ~2400 chars (well inside
-# 4096). Mechanism already at 4096. Net effect: removes 3-5s of reinit time at
-# each stage transition (~6-10s/run). Override per-stage envs to revert.
-_OPTIONS_REASON = {
-    "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_REASONER_CTX", "4096")),
-    "num_predict": int(os.environ.get("RRR_REASONER_PRED", "2000")),
-}
-_OPTIONS_MECHANISM = {
-    "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_MECH_CTX", "4096")),
-    "num_predict": int(os.environ.get("RRR_MECH_PRED", "300")),
-}
-_OPTIONS_CLUSTER = {
-    "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_CLUSTER_CTX", "4096")),
-    "num_predict": int(os.environ.get("RRR_CLUSTER_PRED", "2500")),
-}
+# v8 (R12) values frozen into source in v13: harmonised per-stage num_ctx
+# down from 8192 to 4096 for the small reasoner/cluster prompts. Under
+# OLLAMA_MAX_LOADED_MODELS=1 each ctx change forces a KV-cache reinit.
+# Cluster prompt observed ~2400 chars (well inside 4096). Mechanism already
+# at 4096. Net effect: removes 3-5s of reinit time at each stage transition
+# (~6-10s/run). Previously these were RRR_REASONER_CTX / RRR_REASONER_PRED /
+# RRR_MECH_CTX / RRR_MECH_PRED / RRR_CLUSTER_CTX / RRR_CLUSTER_PRED env
+# overrides — retired in the v13 lever-pruning pass because they were never
+# set by any caller (battery, smoke, or pod scripts).
+_OPTIONS_REASON = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 2000}
+_OPTIONS_MECHANISM = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 300}
+_OPTIONS_CLUSTER = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 2500}
 _KEEP_ALIVE = "30m"
 # v8 (R2): bump prompt version so v7 caches don't collide with v8 mechanism format.
-_MECHANISM_PROMPT_VERSION = os.environ.get("RRR_MECH_PROMPT_VERSION", "2026-06-25-v8")
+# Frozen in v13 (was RRR_MECH_PROMPT_VERSION); bump in source when the prompt changes.
+_MECHANISM_PROMPT_VERSION = "2026-06-25-v8"
 # v9 (R3): version key for fused stance+mechanism cache entries (separate from
 # mechanism cache so a v8 mechanism cache hit cannot serve a v9 caller missing
-# stance/rationale/contested).
-_FUSED_PROMPT_VERSION = os.environ.get("RRR_FUSED_PROMPT_VERSION", "2026-06-25-v9-fused")
+# stance/rationale/contested). Frozen in v13 (was RRR_FUSED_PROMPT_VERSION).
+_FUSED_PROMPT_VERSION = "2026-06-25-v9-fused"
 # v9 (R3): structured-output options for the fused call. num_predict bumped
 # vs mechanism because the JSON contains stance + rationale + mechanism +
-# contested + mechanisms[] (richer payload).
-_OPTIONS_FUSED = {
-    "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_FUSED_CTX", "4096")),
-    "num_predict": int(os.environ.get("RRR_FUSED_PRED", "500")),
-}
+# contested + mechanisms[] (richer payload). Frozen in v13.
+_OPTIONS_FUSED = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 500}
 _FUSED_STANCE_TOKENS = {"supports", "critiques", "complicates", "tangential"}
 
 # v11-C: cluster-level synthesis call. One LLM pass per (stance, cluster) bucket
 # of >=2 docs producing {shared_mechanism, supporting_doc_ids, qualifying_doc_ids,
 # contested_dimension}. Lets the writer say "established across the literature
 # (X; Y; Z)" instead of one-citation-per-claim.
-_CLUSTER_SYNTH_PROMPT_VERSION = os.environ.get(
-    "RRR_CLUSTER_SYNTH_PROMPT_VERSION", "2026-06-26-v11c"
-)
-_OPTIONS_CLUSTER_SYNTH = {
-    "temperature": 0.0,
-    "num_ctx": int(os.environ.get("RRR_CLUSTER_SYNTH_CTX", "8192")),
-    "num_predict": int(os.environ.get("RRR_CLUSTER_SYNTH_PRED", "600")),
-}
+# v13: prompt-version and CTX/PRED tuning frozen in source.
+_CLUSTER_SYNTH_PROMPT_VERSION = "2026-06-26-v11c"
+_OPTIONS_CLUSTER_SYNTH = {"temperature": 0.0, "num_ctx": 8192, "num_predict": 600}
 
 
 # v8 (R2): sanitiser for mechanism strings. The mechanism LLM call returns free
@@ -604,9 +588,9 @@ def _synthesise_clusters(doc_summaries: list, topic: str, metrics=None) -> dict:
     "Other" are skipped — the multi-citation prose move only makes sense when
     multiple docs share a real cluster.
     """
-    if os.environ.get("RRR_CLUSTER_SYNTHESIS", "1") != "1":
-        return {}
-
+    # v13: RRR_CLUSTER_SYNTHESIS retired (always on). The v11-C synthesis is
+    # cheap (~8 LLM calls, all cached after first run) and the writer relies
+    # on its output for multi-citation cluster openings.
     buckets = {}
     for d in doc_summaries or []:
         stance = (d.get("stance") or "tangential").strip().lower()
@@ -825,49 +809,9 @@ def _cluster_mechanisms(doc_summaries: list, topic: str, metrics=None) -> dict:
     print(f"[Clustering] {n_mechs} mechanisms -> {n_clusters} clusters ({n_assigned} assigned, {n_mechs - n_assigned} to Other)")
     return mech_to_cluster
 
-def _build_author_year_lookup(allowed_docs):
-    """Build reverse lookup: (author, year) -> doc_id for academic citation matching."""
-    author_year_to_docid = {}
-    for did in allowed_docs:
-        clean = did.replace("EtAl", "").replace("&", "")
-        parts = clean.split("_")
-        if len(parts) >= 2:
-            author = parts[0].lower()
-            year = parts[-1].rstrip('abcdefgh')
-            author_year_to_docid[(author, year)] = did
-            if "EtAl" in did:
-                author_year_to_docid[(author + " et al", year)] = did
-    return author_year_to_docid
-
-def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
-    """Collect cited doc_ids from both correct and academic citation formats."""
-    cited_docs = set()
-    
-    for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", text):
-        did = m.group(1)
-        if did in allowed_docs:
-            cited_docs.add(did)
-    
-    for m in re.finditer(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)", text):
-        did = m.group(1)
-        if did in allowed_docs:
-            cited_docs.add(did)
-    
-    for m in re.finditer(r"\(([A-Za-z&]+(?:\s+et\s+al\.?)?)[,\s]+(\d{4})\)", text):
-        author = m.group(1).lower().strip().rstrip('.')
-        year = m.group(2)
-        did = author_year_to_docid.get((author, year))
-        if did:
-            cited_docs.add(did)
-    
-    for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4})\)", text):
-        author = m.group(1).lower().strip().rstrip('.')
-        year = m.group(2)
-        did = author_year_to_docid.get((author, year))
-        if did:
-            cited_docs.add(did)
-    
-    return cited_docs
+# v13: _build_author_year_lookup and _collect_cited_docs promoted to
+# render.py; both modules import them from there now.
+from rrr.render import _build_author_year_lookup, _collect_cited_docs  # noqa: E402
 
 def _clean_latex(s: str) -> str:
     """Clean LaTeX artifacts from BibTeX strings."""
@@ -1150,7 +1094,9 @@ def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int,
     """
     merged = {}
     per_probe_topk = max(1, topk)
-    rrf_k = float(os.environ.get("RRR_RRF_K", "60"))
+    # v13: RRR_RRF_K retired; k=60 is the textbook RRF default and v8 R8 audit
+    # decision baked into the source.
+    rrf_k = 60.0
     for probe in probes:
         candidates = retrieve_fn(probe, topk=per_probe_topk, doc_id=doc_id)
         if metrics:
@@ -1242,10 +1188,12 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     GLOBAL_MIN_DOCS = int(os.environ.get("RRR_GLOBAL_MIN_DOCS", "5"))
     MD_QUOTE_CAP = int(os.environ.get("RRR_MD_QUOTE_CAP", "8"))
     DOC_BUDGET = int(os.environ.get("RRR_DOC_BUDGET", "24"))
-    DOC_ADMIT_CACHE = os.environ.get("RRR_DOC_ADMIT_CACHE", "1") != "0"
+    # v13: RRR_DOC_ADMIT_CACHE retired (always on). The cache is cheap to
+    # write, the v8 default was 1, and no battery script overrode it.
+    DOC_ADMIT_CACHE = True
     DOC_ADMIT_REPLAY = os.environ.get("RRR_DOC_ADMIT_REPLAY", "0") == "1"
     EV_CAP = int(os.environ.get("RRR_EV_PER_DOC_CAP", "8"))
-    metrics.set("doc_admit_cache_enabled", int(DOC_ADMIT_CACHE))
+    metrics.set("doc_admit_cache_enabled", 1)
     metrics.set("doc_admit_replay", int(DOC_ADMIT_REPLAY))
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1441,30 +1389,31 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         # valid object, we get stance + rationale + mechanism + contested +
         # mechanisms[] in ONE LLM call instead of two. Falls back to the
         # legacy two-call path on any failure (parse error, invalid stance,
-        # ollama exception). Controlled by RRR_FUSED_STANCE_MECH=1 (default).
-        fused_enabled = os.environ.get("RRR_FUSED_STANCE_MECH", "1") != "0"
+        # ollama exception).
+        # v13: RRR_FUSED_STANCE_MECH retired (always on). The v9 smoke ran
+        # 24/24 fused calls with zero parse failures; the two-call path is
+        # kept only as the runtime exception fallback.
         fused_result = None
-        if fused_enabled:
-            fused_sig = _fused_signature(topic, valid_quotes)
-            cached_fused = _load_fused_cache(did, fused_sig)
-            if cached_fused and cached_fused.get("stance"):
-                metrics.cache_event("fused", "hits")
-                fused_result = _validate_fused_result(cached_fused, set(all_doc_ids))
-            if fused_result is None:
-                metrics.cache_event("fused", "misses")
-                fused_result = _fused_stance_and_mechanism(
-                    did, topic, valid_quotes,
-                    allowed_doc_ids=set(all_doc_ids), metrics=metrics,
-                )
-                if fused_result:
-                    _save_fused_cache(did, fused_sig, {
-                        **fused_result,
-                        "model": _MODEL,
-                        "prompt_version": _FUSED_PROMPT_VERSION,
-                    })
-                    metrics.cache_event("fused", "writes")
-                else:
-                    metrics.cache_event("fused", "skips")
+        fused_sig = _fused_signature(topic, valid_quotes)
+        cached_fused = _load_fused_cache(did, fused_sig)
+        if cached_fused and cached_fused.get("stance"):
+            metrics.cache_event("fused", "hits")
+            fused_result = _validate_fused_result(cached_fused, set(all_doc_ids))
+        if fused_result is None:
+            metrics.cache_event("fused", "misses")
+            fused_result = _fused_stance_and_mechanism(
+                did, topic, valid_quotes,
+                allowed_doc_ids=set(all_doc_ids), metrics=metrics,
+            )
+            if fused_result:
+                _save_fused_cache(did, fused_sig, {
+                    **fused_result,
+                    "model": _MODEL,
+                    "prompt_version": _FUSED_PROMPT_VERSION,
+                })
+                metrics.cache_event("fused", "writes")
+            else:
+                metrics.cache_event("fused", "skips")
         if fused_result is not None:
             evidence_stance = fused_result["stance"]
             mechanisms = fused_result["mechanisms"]
@@ -1796,14 +1745,15 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         with open(runs_path("T2_review.md"), "w", encoding="utf-8") as f:
             f.write("\n".join(md_lines))
 
-    if os.environ.get("RRR_WRITE_REVIEW", "0") != "1":
-        print("\n[Review narrative]\n")
-        print(narrative_md)
+    # v13: RRR_WRITE_REVIEW retired. The writer is the headline architecture
+    # output; the narrative-only short summary is preserved but only printed
+    # when narrative_only is requested. Composition now runs unconditionally
+    # so the composed review always lands on disk.
     print("\n[Layered-T2] wrote: runs/review_narrative.md and runs/review_ledger.json")
     if not getattr(args, "narrative_only", False):
         print("[Layered-T2] appendix: runs/T2_review.md")
 
-    if os.environ.get("RRR_WRITE_REVIEW", "0") == "1":
+    if True:  # v13: writer composition is unconditional (was RRR_WRITE_REVIEW gate)
         from rrr.writer import compose_from_ledger
         print("[Layered-T2] composing long-form literature review...")
         try:

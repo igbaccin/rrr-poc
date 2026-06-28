@@ -10,8 +10,15 @@ CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 #   2. PAREN : "(Author Year, p.N)"          -- common academic shorthand
 # Both must parse to the same canonical (doc_id, page). The final-assembly
 # step rewrites shape 2 back to shape 1 so the user-facing output is uniform.
+# v13.1.1: the particle alternation is case-insensitive so "Van Zanden" /
+# "De La X" capitalised forms — which the model occasionally produces at
+# sentence-start — match into the particle path and capture the full label.
+# Without this, capital-V "Van" fell through to the single-token branch and
+# the downstream display_lookup resolved against "van" only, producing a
+# false E1 in the FIX-F detector. The lookup itself is already lowercased,
+# so the case-insensitive widening here is non-destructive.
 _DISPLAY_UNIT = (
-    r"(?:(?:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
+    r"(?:(?i:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
 )
 _DISPLAY_LABEL = (
     r"(?:" + _DISPLAY_UNIT +
@@ -80,27 +87,64 @@ def render_citation(doc_id, page) -> str:
     return base[:-1] + f", p.{int(page)})"
 
 
-# v11-A: narrative form is the default surface. render_narrative_citation is an
-# alias kept for clarity at call sites where the choice between narrative and
-# parenthetical matters.
-def render_narrative_citation(doc_id, page) -> str:
-    """v11-A: 'Author (Year, p.N)' — author is the grammatical subject."""
-    return render_citation(doc_id, page)
-
-
-def render_parenthetical_citation(doc_id, page) -> str:
-    """v11-A: '(Author Year, p.N)' — whole reference in parens; used when the
-    author is not the grammatical subject of the sentence carrying the cite."""
-    base = _doc_id_to_author_label(str(doc_id).strip())
-    m = re.match(r"^(.*?)\s*\((\d{4})\)$", base)
-    if not m:
-        return f"({base} p.{int(page)})"
-    return f"({m.group(1)} {m.group(2)}, p.{int(page)})"
-
-
 def render_citation_canonical(doc_id, page) -> str:
     """Legacy '(Doc_Year: p.N)' surface — kept for tests and migrators."""
     return f"({str(doc_id).strip()}: p.{int(page)})"
+
+
+def _build_author_year_lookup(allowed_docs):
+    """Build reverse lookup: (author, year) -> doc_id for academic citation
+    matching. Shared by writer.py (final citation collection) and reasoner.py
+    (fallback when runs/review_cited_docs.json is missing). v13: promoted to
+    render.py to retire the byte-identical copies that previously lived in
+    both modules.
+    """
+    author_year_to_docid = {}
+    for did in allowed_docs:
+        clean = did.replace("EtAl", "").replace("&", "")
+        parts = clean.split("_")
+        if len(parts) >= 2:
+            author = parts[0].lower()
+            year = parts[-1].rstrip('abcdefgh')
+            author_year_to_docid[(author, year)] = did
+            if "EtAl" in did:
+                author_year_to_docid[(author + " et al", year)] = did
+    return author_year_to_docid
+
+
+def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
+    """Collect cited doc_ids from canonical, bare-canonical, and legacy
+    author-year forms. v13: promoted from writer.py + reasoner.py. The writer
+    also extends the display-form scan (DISPLAY_CITE_RE / DISPLAY_PAREN_CITE_RE);
+    that branch lives in writer.py and adds to the set this function returns.
+    """
+    cited_docs = set()
+
+    for m in CITE_RE.finditer(text or ""):
+        did = m.group(1)
+        if did in allowed_docs:
+            cited_docs.add(did)
+
+    for m in re.finditer(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)", text or ""):
+        did = m.group(1)
+        if did in allowed_docs:
+            cited_docs.add(did)
+
+    for m in re.finditer(r"\(([A-Za-z&]+(?:\s+et\s+al\.?)?)[,\s]+(\d{4})\)", text or ""):
+        author = m.group(1).lower().strip().rstrip('.')
+        year = m.group(2)
+        did = author_year_to_docid.get((author, year))
+        if did:
+            cited_docs.add(did)
+
+    for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4})\)", text or ""):
+        author = m.group(1).lower().strip().rstrip('.')
+        year = m.group(2)
+        did = author_year_to_docid.get((author, year))
+        if did:
+            cited_docs.add(did)
+
+    return cited_docs
 
 
 def _build_display_lookup(allowed_doc_ids):
@@ -275,19 +319,3 @@ def collapse_nested_narrative_multicite(text: str) -> tuple:
     return new_text, rewrites
 
 
-def render_markdown(obj, refs_by_id):
-    lines = []
-    lines.append(f"**Claim/Topic**: {obj.get('claim') or obj.get('topic','')}")
-    lines.append("")
-    lines.append("**Evidence (snippets)**:")
-    for e in obj.get("evidence", []):
-        tag = "Quote" if e.get("type")=="quote" else "Paraphrase"
-        doc_id = e.get("doc_id")
-        ref = refs_by_id.get(doc_id, doc_id)
-        text = (e.get("text", "") or "")
-        snippet = text[:180].replace("\n", " ")
-        page = e.get("page")
-        lines.append(f"- {tag}: {snippet} {render_citation(doc_id, page)}")
-        if ref and ref != doc_id:
-            lines.append(f"  Source: {ref}")
-    return "\n".join(lines)

@@ -13,11 +13,11 @@ from rrr.render import (
     parse_citations,
     render_citation,
     render_citation_canonical,
-    render_narrative_citation,
-    render_parenthetical_citation,
     rewrite_canonical_to_display,
     rewrite_misplaced_narrative_citations,
+    _build_author_year_lookup,
     _build_display_lookup,
+    _collect_cited_docs as _shared_collect_cited_docs,
     _doc_id_to_author_label,
 )
 
@@ -28,28 +28,28 @@ from rrr.render import (
 _MODEL = os.environ.get("RRR_WRITER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
 _KEEP_ALIVE = "30m"
 
+# v13: RRR_WRITER_T/CTX/PRED/TOPP/TAIL_CHARS retired (lever pruning). Per-stage
+# tuning was never overridden in the wild; v7-v8 values are frozen below.
+# v7 raised temperature from 0.30 to 0.50; v8 R12 dropped num_ctx from 32768
+# to 12288 (largest observed writer prompt is ~2900 tokens); v8 dropped
+# num_predict to 1500 (largest observed output ~620 tokens, 2.4x slack).
 _DEFAULT_CHAT_OPTIONS = {
-    "temperature": float(os.environ.get("RRR_WRITER_T", "0.50")),  # v7: increased from 0.30
-    # v8: writer ctx default 12288 (was 32768). Largest observed writer prompt
-    # is ~2900 tokens; 32k KV-cache allocation slows generation 15-25% with no
-    # quality gain. Override RRR_WRITER_CTX if a topic needs a much larger
-    # allowed-citation list.
-    "num_ctx": int(os.environ.get("RRR_WRITER_CTX", "12288")),
-    # v8: writer pred default 1500 (was 2000). Largest observed output is
-    # ~620 tokens; 1500 leaves 2.4x slack.
-    "num_predict": int(os.environ.get("RRR_WRITER_PRED", "1500")),
-    "top_p": float(os.environ.get("RRR_WRITER_TOPP", "0.9")),
+    "temperature": 0.50,
+    "num_ctx": 12288,
+    "num_predict": 1500,
+    "top_p": 0.9,
 }
 
-_TAIL_CHARS = int(os.environ.get("RRR_WRITER_TAIL_CHARS", "250"))
+_TAIL_CHARS = 250
 
-_PAGE_ONLY_RE = re.compile(r"\((?:pp?\.)\s*\d+(?:\s*(?:,|-|and)\s*(?:pp?\.)?\s*\d+)*\)", re.IGNORECASE)
-_AUTHOR_NAME_RE = r"(?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)[A-Z][A-Za-z&.\-]+)"
-_DOC_WITHOUT_PAGE_RE = re.compile(r"\((?=[^)]*[A-Za-z0-9_&.\-]+_\d{4})(?![^)]*:\s*p\.)[^)]*\)")
-_AUTHOR_YEAR_PAREN_RE = re.compile(rf"\(({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?),\s*(\d{{4}})\)")
-_AUTHOR_YEAR_TEXT_RE = re.compile(rf"\b({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?)\s+\((\d{{4}})\)")
-_AUTHOR_YEAR_POSSESSIVE_RE = re.compile(rf"\b({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?)'s\s+\((\d{{4}})\)")
-_MULTIPAGE_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.\d+\s*,\s*p\.\d+[^)]*\)")
+# v13: _PAGE_ONLY_RE / _AUTHOR_NAME_RE / _DOC_WITHOUT_PAGE_RE / _AUTHOR_YEAR_*
+# / _MULTIPAGE_CITE_RE removed. These regexes fed only the loose-pattern arm
+# of _remove_invalid_citations, which is now retired per architecture item
+# A-030 (evidence-id rendering + display_lookup gating supersede the
+# loose-pattern scrub). The v12 smoke had writer_removed_citations=12 — those
+# came from the loose arm catching display-form variants outside the
+# canonical-pair gating, but with the v13 display/canonical pipeline the model
+# only emits forms reachable via the lookup, so the loose arm is dead.
 _GENERIC_STYLE_RE = re.compile(
     r"\b("
     r"complex interplay|valuable insights|policy-making|future research|further research|"
@@ -63,7 +63,30 @@ _GENERIC_STYLE_RE = re.compile(
     r"contributing significantly to|fundamental factor|crucial factor|"
     r"essential factor|interplay between|in this regard|in this context|"
     r"by acknowledging these variables|presents a complex picture|"
-    r"thereby contributing"
+    r"thereby contributing|"
+    # v13: near-paraphrases confirmed by the post-v12 prose audit. Six surfaces
+    # survived v12: "complex interactions between" (paraphrase of interplay),
+    # "played/playing a significant role" and "plays a significant role" (the
+    # pivotal-role family with 'significant' substituted), "significantly
+    # influenced" (intensifier + impact-verb pattern), "a more nuanced
+    # understanding" (review wishlist), "It is crucial to examine" (paired
+    # filler intent), and "are pivotal in" (predicate-adjective form of plays a
+    # pivotal role).
+    r"complex interactions between|"
+    r"play(?:s|ed)?\s+a\s+significant\s+role|"
+    r"significantly\s+influenc(?:e|ed|es)|"
+    r"a\s+more\s+nuanced\s+understanding|"
+    r"it\s+is\s+crucial\s+to\s+examine|"
+    r"are\s+pivotal\s+in|"
+    # v13.1 FIX-C: widen the pivotal family. The v13 smoke had openers like
+    # "stands as a pivotal question" (topic 1) and "is pivotal for understanding"
+    # (topic 4) that "are pivotal in" did not catch. Two alternation arms:
+    # (1) "pivotal <noun>" surfaces (question/role/issue/factor/moment/area/
+    # importance/insight), (2) modal + optional article + "pivotal" predicate
+    # forms ("is/are/stands as/remains/becomes a pivotal..."). Routed to the
+    # existing batched LLM style-rewriter, same as the other entries.
+    r"pivotal\s+(?:question|role|issue|factor|moment|area|importance|insight)|"
+    r"(?:is|are|stands\s+as|remains|becomes)\s+(?:a\s+|the\s+)?pivotal"
     r")\b",
     re.IGNORECASE,
 )
@@ -90,14 +113,21 @@ _NESTED_PAGE_SUFFIX_RE = re.compile(
 # call per writer section.
 _FORBIDDEN_LEXEME_RE = re.compile(r"\b(?:legible|sharp(?:ly)?)\b", re.IGNORECASE)
 _ADVERSATIVE_RE = re.compile(
-    r"\b("
-    r"not\s+\S+(?:\s+\S+){0,5}\s+but(?:\s+rather)?\s+"
+    r"(?:\b("
+    # v13: widen 'not X but Y' to span 0-15 tokens between not and but. The v12
+    # smoke had 'not merely the identification of factors that drive economic
+    # progress, but also' which is 11 tokens — the v10 6-token cap missed it.
+    r"not\s+(?:\S+\s+){0,15}but(?:\s+(?:rather|also))?\s+"
     r"|rather than\b"
     r"|in (?:sharp\s+)?contrast(?:\s+to)?\b"
     r"|instead of\b"
     r"|unlike\b"
-    r")",
-    re.IGNORECASE,
+    # v13: sentence-initial Conversely/Yet/However acting as adversative pivots.
+    # The (?<=^|[.!?]\s)|(?<=\n) lookbehind anchors to a sentence boundary so we
+    # don't match mid-sentence 'however' (which is rare anyway). Comma after the
+    # pivot is the model's tell — these always sit at sentence start with comma.
+    r")\b)|(?:(?<=[.!?]\s)(?:Conversely|Yet|However),)|(?:^(?:Conversely|Yet|However),)",
+    re.IGNORECASE | re.MULTILINE,
 )
 # v10 (rule 6): trailing significance clauses — these ARE safely strippable
 # because the head of the sentence carries the substantive claim.
@@ -115,11 +145,8 @@ _COLON_SETUP_RE = re.compile(r"[A-Z][^.!?:\n]{20,}:\s+[A-Z]")
 # right replacement varies (comma, period, parens, semicolon).
 _TYPOGRAPHIC_DASH_RE = re.compile("[–—]")
 # v10 options for the short style-rewrite LLM call.
-_OPTIONS_STYLE_REWRITE = {
-    "temperature": 0.1,
-    "num_ctx": int(os.environ.get("RRR_STYLE_CTX", "4096")),
-    "num_predict": int(os.environ.get("RRR_STYLE_PRED", "1500")),
-}
+# v13: RRR_STYLE_CTX/PRED retired; tuning frozen.
+_OPTIONS_STYLE_REWRITE = {"temperature": 0.1, "num_ctx": 4096, "num_predict": 1500}
 
 # v8 (R5): detect "Author argues / posits / emphasizes ..." openings that the
 # system prompt forbids but the model keeps producing. Used to flag, then
@@ -132,7 +159,10 @@ _AUTHOR_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 _MIN_SECTION_CITED_DOCS = int(os.environ.get("RRR_WRITER_MIN_SECTION_CITED_DOCS", "2"))
-_ENFORCE_COVERAGE = os.environ.get("RRR_WRITER_ENFORCE_COVERAGE", "1") != "0"
+# v13: RRR_WRITER_ENFORCE_COVERAGE retired (always on). Section-level coverage
+# enforcement is part of the corpus-grounding contract; disabling it is no
+# longer a supported configuration.
+_ENFORCE_COVERAGE = True
 
 # v10: cite as 'Author (Year, p.N)'. Underscore-keyed canonical form retired.
 _SYSTEM_CITATION_INSTRUCTION = (
@@ -366,6 +396,270 @@ def _strip_trailing_significance(text: str) -> tuple:
     return cleaned, len(matches)
 
 
+def _mechanical_dash_replace(text: str) -> tuple:
+    # v13: mechanical fallback for em-dashes when the LLM style rewriter rejects
+    # the rewrite because preserving every (Year, p.N) citation token would
+    # require an unsupported edit. The post-v12 prose audit found one such
+    # sentence in the opening of the v12 smoke ("institutions—defined as the
+    # rules and norms governing social interactions—determine long-term
+    # economic outcomes"): the model placed em-dashes around a parenthetical
+    # gloss, and the rewriter couldn't replace them without rephrasing the
+    # surrounding clauses, which would risk dropping citations. The mechanical
+    # substitution is safe because em/en dashes flanking a parenthetical gloss
+    # always reduce to commas, and dashes used as terminal pause always reduce
+    # to commas or semicolons. We pick comma uniformly — it preserves the gloss
+    # structure and never changes citation tokens.
+    if not text:
+        return text or "", 0
+    count = len(_TYPOGRAPHIC_DASH_RE.findall(text))
+    if count == 0:
+        return text, 0
+    cleaned = _TYPOGRAPHIC_DASH_RE.sub(",", text)
+    # The dash often sat between two words with no surrounding space ("word—word")
+    # or with single spaces ("word — word"). Either way, ", " is the target.
+    # Collapse "  ," and ",  " and ", ," that the naive substitution can create.
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    # Don't double up on existing punctuation: ", ," -> ",", ". ," -> ".",
+    cleaned = re.sub(r"([.,;:!?])\s*,", r"\1", cleaned)
+    cleaned = re.sub(r",\s*([.,;:!?])", r"\1", cleaned)
+    return cleaned, count
+
+
+# v13: detect the "mid-sentence narrative citation without preceding
+# punctuation" pattern that v12 produced twice in the same run (paras 1 and 3).
+# The shape is a noun phrase followed by an author label directly attached, no
+# comma or period between: "extractive economic controls Akyeampong and Fofack
+# (2014, p.20)" or "divergent paths of development Sokoloff and Engerman (2000,
+# p.8)". We match a lowercase content word, followed by 1+ spaces, followed by
+# a capital-cased author label and a "(YYYY, p.N)" parenthetical. We exclude
+# attribution verb subjects (where "X argues that" is the legitimate narrative
+# shape) by requiring the prior word to be a *content* noun/adjective ending in
+# a typical noun/adjective suffix (or being in a small content-word blacklist),
+# not a verb stem. Conservative: we only fire when (a) the preceding char is a
+# space (not punctuation) AND (b) the prior word's last letter is not a
+# whitespace/punctuation/comma. The fix is to insert ", " before the author
+# label, turning the citation into a proper narrative continuation.
+_MID_SENTENCE_NARRATIVE_CITE_RE = re.compile(
+    r"(?<=[a-z0-9])\s+"  # preceded by a lowercase content character + whitespace
+    r"((?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)\s+[A-Z][A-Za-z&.\-]+)"
+    r"(?:\s+and\s+(?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)\s+[A-Z][A-Za-z&.\-]+))?"
+    r"(?:\s+et\s+al\.?)?)"
+    r"\s+\((\d{4})\s*,\s*p\.(\d+)\)"
+)
+
+
+def _fix_mid_sentence_narrative_cites(text: str) -> tuple:
+    """v13: insert a comma before narrative citations that sit mid-sentence
+    without preceding punctuation. Returns (text, count). Conservative — only
+    fires when the prior character is a lowercase letter or digit; never edits
+    a citation that already sits after a sentence boundary or comma.
+    """
+    if not text:
+        return text or "", 0
+    count = 0
+
+    def repl(m):
+        nonlocal count
+        count += 1
+        author = m.group(1)
+        year = m.group(2)
+        page = m.group(3)
+        return f", {author} ({year}, p.{page})"
+
+    cleaned = _MID_SENTENCE_NARRATIVE_CITE_RE.sub(repl, text)
+    return cleaned, count
+
+
+# v13.1 FIX-A: stray-comma cleanup inside author labels. The v13 smoke produced
+# "Sokoloff and, Engerman (2000, p.5)", "North and, Weingast (1989, p.2)",
+# "van, Zanden (1999, p.18)" in every topic — a stray comma between a
+# connective ("and"/"with"/"or") or a lowercase particle ("van"/"von"/"de"/
+# "del"/"der") and the next capitalised surname. Two regexes, conservative:
+# the comma must be immediately followed by whitespace + uppercase letter.
+_AUTHOR_LABEL_CONNECTIVE_COMMA_RE = re.compile(
+    r"\b(and|with|or),(\s+)([A-Z][A-Za-z\-]+)"
+)
+_AUTHOR_LABEL_PARTICLE_COMMA_RE = re.compile(
+    r"\b(van|von|de|del|der),(\s+)([A-Z][A-Za-z\-]+)"
+)
+# v13.1.1 (FIX-A widening): the v13.1 3x3 smoke caught "Frankema and, van
+# Waijenburg" in topic 3 runs 03 + 06 — the comma sits between a CONNECTIVE
+# (and/with/or) and a LOWERCASE PARTICLE (van/von/de/del/der) that itself
+# precedes a capitalised surname. The v13.1 CONNECTIVE regex required an
+# uppercase letter directly after the comma and missed this case. Capture
+# the particle + the surname in one group so the strip preserves both.
+_AUTHOR_LABEL_CONNECTIVE_PARTICLE_COMMA_RE = re.compile(
+    r"\b(and|with|or),(\s+)((?:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+)"
+)
+
+
+def _strip_malformed_author_label_commas(text: str) -> tuple:
+    """v13.1 FIX-A: strip a comma sitting between an author connective
+    ("and"/"with"/"or") or a lowercase particle ("van"/"von"/"de"/"del"/"der")
+    and the next capitalised surname. Conservative — only fires when the
+    comma is immediately followed by whitespace + uppercase letter, so
+    legitimate Oxford-comma constructions in surrounding prose are untouched.
+    Returns (cleaned_text, count).
+    """
+    if not text:
+        return text or "", 0
+    count = 0
+
+    def repl(m):
+        nonlocal count
+        count += 1
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+
+    # v13.1.1: run the connective+particle variant FIRST so it consumes its
+    # longer match (and, van Waijenburg) before the plain connective regex
+    # would try to match (and, van) and produce a wrong split.
+    cleaned, n0 = _AUTHOR_LABEL_CONNECTIVE_PARTICLE_COMMA_RE.subn(repl, text)
+    cleaned, n1 = _AUTHOR_LABEL_CONNECTIVE_COMMA_RE.subn(repl, cleaned)
+    cleaned, n2 = _AUTHOR_LABEL_PARTICLE_COMMA_RE.subn(repl, cleaned)
+    return cleaned, count
+
+
+# v13.1 FIX-B: literal "(Author, Year)" placeholder strip. Topic 4 of the v13
+# smoke had the literal string "(Author, Year)" — the model copied the writer
+# prompt's NARRATIVE/PARENTHETICAL exemplar surface verbatim. Cover the three
+# shapes observed in practice: "(Author, Year)", "(Author Year)", and
+# "(Author, Year, p.N)". Run before _drop_zero_citation_paragraphs so a
+# paragraph whose ONLY cite was a placeholder is correctly identified as
+# zero-cite and dropped.
+_AUTHOR_YEAR_PLACEHOLDER_RE = re.compile(
+    r"\s?\(Author(?:,)?\s+Year(?:,\s*p\.\s*\d+|,\s*p\.N)?\)"
+)
+
+
+def _strip_author_year_placeholder(text: str) -> tuple:
+    """v13.1 FIX-B: strip the literal "(Author, Year)" / "(Author Year)" /
+    "(Author, Year, p.N)" placeholder surfaces that the model occasionally
+    copies from the system prompt's generic exemplar. Also strips a leading
+    space so the surrounding sentence does not gain a double space.
+    Returns (cleaned_text, count).
+    """
+    if not text:
+        return text or "", 0
+    cleaned, count = _AUTHOR_YEAR_PLACEHOLDER_RE.subn("", text)
+    return cleaned, count
+
+
+# v13.1 FIX-D: collapse same-(author, year) pseudo-plural multi-cites inside
+# one parenthetical. The v13 smoke produced "(Bryant (2006, p.11), Bryant
+# (2006, p.3))" and "(Sokoloff and Engerman (2000, p.12); Sokoloff and
+# Engerman (2000, p.3))" — multiple cites of the same paper at different
+# pages dressed up as multi-source support. After
+# collapse_nested_narrative_multicite has flattened the inner narratives the
+# form looks like "(Author Year, p.A; Author Year, p.B)" or with comma
+# separators. Group by (author_label, year); if any (author, year) appears
+# more than once, collapse to "(Author Year, pp.A, B)" (sorted, deduped). If
+# the parenthetical reduces to ONE distinct (author, year) overall, also
+# rewrite to "(Author Year, p.A)" or pp form.
+_FLAT_PAREN_CITE_UNIT_RE = re.compile(
+    r"(" + r"(?:(?:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
+    r"(?:\s+(?:and\s+(?:(?:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|"
+    r"[A-Z][A-Za-z\-]+)|et\s+al\.))?"
+    r")\s+(\d{4})[a-z]?,\s*p\.\s*(\d+)"
+)
+
+
+def _collapse_same_author_year_paren_cites(text: str) -> tuple:
+    """v13.1 FIX-D: collapse pseudo-plural multi-cites where the same
+    (author, year) pair appears more than once inside one top-level
+    parenthetical. Returns (cleaned_text, count). Conservative: skips any
+    parenthetical whose contents still have nested '(' to avoid grabbing
+    wrong structure (this runs AFTER collapse_nested_narrative_multicite so
+    the well-formed shape is already flat).
+    """
+    if not text:
+        return text or "", 0
+    collapses = 0
+
+    def process_paren(m):
+        nonlocal collapses
+        inner = m.group(1)
+        # Skip anything that still has a nested paren — leave for other passes.
+        if "(" in inner or ")" in inner:
+            return m.group(0)
+        # Strip and parse cite units. Accept ';' or ',' as the separator
+        # between cites; the model produces both.
+        units = list(_FLAT_PAREN_CITE_UNIT_RE.finditer(inner))
+        if len(units) < 2:
+            return m.group(0)
+        # Sanity: the units, joined back with their separators, must cover
+        # essentially the whole inner string (allow whitespace and the
+        # ';' or ',' separators). If there is substantive non-cite text
+        # between units, skip — don't risk losing prose.
+        residue = _FLAT_PAREN_CITE_UNIT_RE.sub("", inner)
+        residue_stripped = re.sub(r"[\s,;]", "", residue)
+        if residue_stripped:
+            return m.group(0)
+        # Group by (author, year) key (case-insensitive on the label).
+        groups = []
+        index = {}
+        for u in units:
+            author = u.group(1).strip()
+            year = u.group(2)
+            page = int(u.group(3))
+            key = (author.lower(), year)
+            if key not in index:
+                index[key] = len(groups)
+                groups.append({"author": author, "year": year, "pages": []})
+            if page not in groups[index[key]]["pages"]:
+                groups[index[key]]["pages"].append(page)
+        # If every (author, year) appears exactly once and pages are all
+        # singletons, nothing to do.
+        if all(len(g["pages"]) == 1 for g in groups) and len(groups) == len(units):
+            return m.group(0)
+        collapses += 1
+
+        def render_group(g):
+            pages = sorted(g["pages"])
+            if len(pages) == 1:
+                return f"{g['author']} {g['year']}, p.{pages[0]}"
+            return f"{g['author']} {g['year']}, pp.{', '.join(str(p) for p in pages)}"
+
+        return "(" + "; ".join(render_group(g) for g in groups) + ")"
+
+    # Match top-level parentheticals. We use a non-greedy match against the
+    # inner content; the nested-paren guard inside process_paren rejects any
+    # candidate that still contains '('.
+    cleaned = re.sub(r"\(([^()]+)\)", process_paren, text)
+    return cleaned, collapses
+
+
+def _drop_zero_citation_paragraphs(text: str) -> tuple:
+    """v13: hard enforcement of rule 9 (each paragraph must integrate at least
+    one cited document; the prompt asks for >=2 but the safety net catches the
+    worst case of zero). The v12 smoke had three zero-citation paragraphs
+    (paras 4, 9, 12 — the closing) that the prose-grounding contract forbids.
+    Drop them.
+
+    Returns (cleaned_text, [removed_paragraph_snippets]). Conservative: we
+    only count CANONICAL `(Doc_Year: p.N)` cites or DISPLAY-form `Author
+    (Year, p.N)` / `(Author Year, p.N)` cites. If neither shape is present
+    the paragraph cites zero documents and gets dropped.
+    """
+    if not text:
+        return text or "", []
+    paragraphs = text.split("\n\n")
+    kept = []
+    removed = []
+    for para in paragraphs:
+        if not para.strip():
+            continue
+        has_canonical = bool(CITE_RE.search(para))
+        has_display_narrative = bool(DISPLAY_CITE_RE.search(para))
+        has_display_paren = bool(DISPLAY_PAREN_CITE_RE.search(para))
+        if has_canonical or has_display_narrative or has_display_paren:
+            kept.append(para)
+        else:
+            snippet = re.sub(r"\s+", " ", para.strip())[:200]
+            removed.append(snippet + ("…" if len(para.strip()) > 200 else ""))
+    cleaned = "\n\n".join(kept)
+    return cleaned, removed
+
+
 def _classify_sentence_violations(sentence: str) -> list:
     reasons = []
     if _TYPOGRAPHIC_DASH_RE.search(sentence):
@@ -530,34 +824,56 @@ def _apply_style_enforcement(text: str, metrics=None):
       1. Strip the trailing-significance clause shape mechanically. Safe.
       2. Detect remaining violations (em-dash, lexeme, adversative, colon).
       3. Batch-LLM-rewrite the flagged sentences and splice back.
+      4. v13: any em-dashes that survived (because the rewriter rejected the
+         rewrite to preserve citation tokens) get mechanically replaced with
+         commas. This is the post-v12 fix for the opening-sentence em-dash that
+         the LLM rewriter couldn't touch because the sentence had four cites
+         and the rewriter's citation-preservation guard fired.
 
     Returns (text, stats_dict). Stats keys: 'trailing_stripped', 'violations',
-    'rewrites_applied', 'fallback_reason'.
+    'rewrites_applied', 'fallback_reason', 'mechanical_dashes_replaced'.
     """
-    if not text or os.environ.get("RRR_STYLE_ENFORCE", "1") == "0":
+    # v13: RRR_STYLE_ENFORCE retired (always on); a no-style-enforcement
+    # writer is no longer a supported configuration.
+    if not text:
         return text, {"trailing_stripped": 0, "violations": 0,
-                      "rewrites_applied": 0, "fallback_reason": "disabled"}
+                      "rewrites_applied": 0, "fallback_reason": "empty",
+                      "mechanical_dashes_replaced": 0}
 
     text, trailing_stripped = _strip_trailing_significance(text)
 
     sentences, violations = _collect_style_violations(text)
     if not violations:
+        # Even with no other violations, a stray em-dash can sit in text that
+        # didn't make the violation list (e.g. dashes in the input were already
+        # there before the run). Run the mechanical pass anyway as a safety net.
+        text, mechanical_replaced = _mechanical_dash_replace(text)
         return text, {"trailing_stripped": trailing_stripped, "violations": 0,
-                      "rewrites_applied": 0, "fallback_reason": "no_violations"}
+                      "rewrites_applied": 0, "fallback_reason": "no_violations",
+                      "mechanical_dashes_replaced": mechanical_replaced}
 
     new_sentences, applied, reason = _rewrite_style_violations(
         sentences, violations, metrics=metrics,
     )
     if applied == 0:
+        # LLM rewrite produced nothing usable. Still clean em-dashes
+        # mechanically so a citation-preservation rejection doesn't leave the
+        # dashes in the output.
+        text, mechanical_replaced = _mechanical_dash_replace(text)
         return text, {"trailing_stripped": trailing_stripped,
                       "violations": len(violations),
                       "rewrites_applied": 0,
-                      "fallback_reason": reason}
+                      "fallback_reason": reason,
+                      "mechanical_dashes_replaced": mechanical_replaced}
     rewritten_text = _splice_sentences_back(text, new_sentences)
+    # v13: post-LLM-rewrite mechanical sweep. Sentences whose rewrites were
+    # individually rejected (citation drift) still hold their em-dashes.
+    rewritten_text, mechanical_replaced = _mechanical_dash_replace(rewritten_text)
     return rewritten_text, {"trailing_stripped": trailing_stripped,
                             "violations": len(violations),
                             "rewrites_applied": applied,
-                            "fallback_reason": reason}
+                            "fallback_reason": reason,
+                            "mechanical_dashes_replaced": mechanical_replaced}
 
 
 # v9 (R6): word-level content tokens for "shares >=K content tokens with an
@@ -655,20 +971,6 @@ def _drop_cross_section_redundancy(text: str, min_token_overlap: int = 4):
     return cleaned, removed_examples
 
 
-def _strip_placeholder_citations(text: str) -> str:
-    # Remove placeholder citations that leaked from system prompt.
-    text = re.sub(r'\s*\(DocId_Year:\s*p\.[X\d]+\)', '', text)
-    text = re.sub(r'\s*\(AuthorName_Year:\s*p\.[X\d]+\)', '', text)
-    text = re.sub(r'\s*\(AuthorEtAl_Year:\s*p\.[X\d]+\)', '', text)
-    text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_Year:\s*p\.[X\d]+\)', '', text)
-    text = re.sub(r'\s*\(DocId_\d{4}:\s*p\.[X\d]+\)', '', text)
-    text = re.sub(r'\s*\(AuthorName_YYYY:\s*p\.N\)', '', text)
-    text = re.sub(r'\s*\(FirstAuthor&SecondAuthor_YYYY:\s*p\.N\)', '', text)
-    text = re.sub(r'\s*\(FirstAuthorEtAl_YYYY:\s*p\.N\)', '', text)
-    text = re.sub(r'\s*\(Smith_1990:\s*p\.12\)', '', text)  # v7: catch example from system prompt
-    return text
-
-
 def _split_sentences_for_cleanup(line: str):
     sentinel = "__RRR_DOT__"
 
@@ -681,68 +983,25 @@ def _split_sentences_for_cleanup(line: str):
     return [p.replace(sentinel, ".") for p in parts if p.strip()]
 
 
-def _fix_ajr_abbreviation(text: str) -> tuple:
-    # Fix AJR abbreviation to AcemogluEtAl. Returns (fixed_text, fix_count).
-    fix_count = 0
-    
-    def replacer(m):
-        nonlocal fix_count
-        year = m.group(1)
-        page = m.group(2)
-        fix_count += 1
-        return f"(AcemogluEtAl_{year}: p.{page})"
-    
-    text = re.sub(r'\(AJR_(\d{4}):\s*p\.(\d+)\)', replacer, text)
-    
-    def replacer_no_page(m):
-        nonlocal fix_count
-        year = m.group(1)
-        fix_count += 1
-        return f"(AcemogluEtAl_{year})"
-    
-    text = re.sub(r'\(AJR_(\d{4})\)', replacer_no_page, text)
-    
-    return text, fix_count
-
-
-def _normalize_citation_case(text: str, allowed_docs: set) -> tuple:
-    # Normalize citation case to match corpus. Returns (fixed_text, fix_count).
-    lower_to_canonical = {did.lower(): did for did in allowed_docs}
-    
-    fix_count = 0
-    
-    def replacer(m):
-        nonlocal fix_count
-        full_match = m.group(0)
-        doc_id = m.group(1)
-        page = m.group(2)
-        
-        doc_lower = doc_id.lower()
-        if doc_lower in lower_to_canonical:
-            canonical = lower_to_canonical[doc_lower]
-            if canonical != doc_id:
-                fix_count += 1
-                return f"({canonical}: p.{page})"
-        return full_match
-    
-    text = re.sub(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', replacer, text)
-    
-    return text, fix_count
-
-
 def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) -> tuple:
-    # Remove sentences containing citations outside the validated evidence set.
+    # v13: retired the loose-pattern arm per architecture item A-030.
+    # Evidence-id rendering (A-013) + display_lookup gating supersede the
+    # author-year-text / page-only / multipage / doc-without-page scrubs. Only
+    # the strict CITE_RE arm survives; it removes sentences citing canonical
+    # (Doc_Year: p.N) tokens that don't appear in the validated allowed_pairs
+    # set. The canonical surface is only present here as an intermediate
+    # produced by _chunk_display_to_canonical / render_citation_canonical, so
+    # this gates display→canonical rewrites that resolved to an out-of-corpus
+    # author label or an invalid (doc, page) pair.
     allowed_lower = {did.lower() for did in allowed_docs}
     lower_to_canonical = {did.lower(): did for did in allowed_docs}
     allowed_pairs = set(allowed_pairs or [])
-    
+
     removed = []
-    
+
     def find_invalid_citations_in_text(txt):
         invalid = []
-        strict_spans = []
         for m in CITE_RE.finditer(txt):
-            strict_spans.append((m.start(), m.end()))
             doc_id = m.group(1)
             page = int(m.group(2))
             if doc_id.lower() not in allowed_lower:
@@ -751,41 +1010,20 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
             canonical = lower_to_canonical.get(doc_id.lower(), doc_id)
             if allowed_pairs and (canonical, page) not in allowed_pairs:
                 invalid.append((m.start(), m.end(), canonical, page, "invalid_page"))
-
-        def outside_strict(match):
-            return not any(s <= match.start() < e for s, e in strict_spans)
-
-        loose_patterns = [
-            (_MULTIPAGE_CITE_RE, "multi_page_citation"),
-            (_PAGE_ONLY_RE, "page_only_citation"),
-            (_DOC_WITHOUT_PAGE_RE, "doc_without_page"),
-            (_AUTHOR_YEAR_PAREN_RE, "author_year_citation"),
-            (_AUTHOR_YEAR_TEXT_RE, "author_year_citation"),
-            (_AUTHOR_YEAR_POSSESSIVE_RE, "author_year_citation"),
-        ]
-        for pattern, reason in loose_patterns:
-            for m in pattern.finditer(txt):
-                if outside_strict(m):
-                    invalid.append((m.start(), m.end(), m.group(0), 0, reason))
         return invalid
-    
+
     invalid_citations = find_invalid_citations_in_text(text)
-    
     if not invalid_citations:
         return text, []
-    
+
     lines = text.split('\n')
     cleaned_lines = []
-    
     for line in lines:
         line_invalid = find_invalid_citations_in_text(line)
-        
         if not line_invalid:
             cleaned_lines.append(line)
             continue
-        
         sentences = _split_sentences_for_cleanup(line)
-        
         kept_sentences = []
         for sent in sentences:
             sent_invalid = find_invalid_citations_in_text(sent)
@@ -799,15 +1037,12 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
                     })
             else:
                 kept_sentences.append(sent)
-        
         if kept_sentences:
             cleaned_lines.append(' '.join(kept_sentences))
-    
+
     cleaned_text = '\n'.join(cleaned_lines)
-    
     cleaned_text = re.sub(r'  +', ' ', cleaned_text)
     cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
-    
     return cleaned_text, removed
 
 
@@ -847,6 +1082,14 @@ _META_COMMENTARY_RE = re.compile(
     r"|in (?:this|the (?:foregoing|preceding)) (?:review|paper|essay|article|section|discussion)"
     r"|we (?:will|shall) (?:examine|explore|investigate|consider|argue|show|discuss|analyse|analyze)"
     r"|this (?:section|paragraph) (?:examines|explores|investigates|considers|argues|shows|discusses)"
+    # v13: "the thesis" used as self-reference to the review's own argument
+    # ("important qualification to the thesis", "applies the thesis to",
+    # "illustrates how the thesis can be applied"). Two patterns:
+    # - "the thesis" preceded by a self-referential preposition or noun
+    # - "this is an important [noun] to the thesis" — the v12 audit's rule 6
+    #   trailing-significance miss is really meta-commentary about the review.
+    r"|(?:applies|illustrates how|qualification(?:s)? to|adds nuance to|in support of|against) the thesis"
+    r"|this is (?:an? )?important (?:qualification|implication|consequence|insight|point) (?:to|for|of) the thesis"
     r")\b",
     re.IGNORECASE,
 )
@@ -924,57 +1167,6 @@ def _strip_conclusion(text: str) -> str:
     for pattern in patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
     return text.strip()
-
-
-def _extract_citation_dumps(text: str):
-    # Extract citation dump lines and return (cleaned_text, dump_citations).
-    lines = text.split('\n')
-    cleaned = []
-    dump_citations = []
-    
-    for line in lines:
-        stripped = line.strip()
-
-        if stripped.startswith('[') and stripped.endswith(']'):
-            inner = stripped[1:-1]
-            cite_matches = re.findall(r'([A-Za-z0-9_&.\-]+):\s*p\.\d+', inner)
-            page_refs = re.findall(r'\bp\.\d+\b', inner)
-            if cite_matches and (len(cite_matches) >= 2 or len(page_refs) >= 3):
-                dump_citations.extend(cite_matches)
-                continue
-        
-        if stripped.startswith('(') and stripped.endswith(')') and ',' in stripped:
-            inner = stripped[1:-1]
-            cite_matches = re.findall(r'[A-Za-z0-9_&.\-]+_\d{4}[a-z]?:\s*p\.\d+', inner)
-            if len(cite_matches) >= 2:
-                for m in cite_matches:
-                    did = m.split(':')[0]
-                    dump_citations.append(did)
-                continue
-        
-        if stripped.startswith('(') and stripped.endswith(')'):
-            inner = stripped[1:-1]
-            page_refs = re.findall(r'p\.\d+', inner)
-            if len(page_refs) >= 3:
-                doc_match = re.match(r'([A-Za-z0-9_&]+)', inner)
-                if doc_match:
-                    dump_citations.append(doc_match.group(1))
-                continue
-        
-        paren_count = len(re.findall(r'\([A-Za-z]', stripped))
-        if paren_count >= 3 and len(stripped) < 600:
-            without_citations = re.sub(r'\([^)]+\)', '', stripped)
-            prose_ratio = len(without_citations.strip()) / max(len(stripped), 1)
-            if prose_ratio < 0.3:
-                for m in re.finditer(r'\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)', stripped):
-                    dump_citations.append(m.group(1))
-                for m in re.finditer(r'\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)', stripped):
-                    dump_citations.append(m.group(1))
-                continue
-        
-        cleaned.append(line)
-    
-    return '\n'.join(cleaned), dump_citations
 
 
 def _strip_references_section(text: str) -> str:
@@ -1119,37 +1311,6 @@ def _build_allowed_citations(docs):
                 allowed_pairs.add((qdid, pg))
                 allowed_pages_by_doc[qdid].add(pg)
     return allowed_pairs, allowed_docs, allowed_pages_by_doc
-
-
-def _build_year_to_docid(docs):
-    # Build year -> doc_id mapping. Only includes unambiguous mappings.
-    year_to_docs = defaultdict(list)
-    for d in docs:
-        did = str(d.get("doc_id", "")).strip()
-        if not did:
-            continue
-        m = re.search(r'_(\d{4})[a-z]?$', did)
-        if m:
-            year = m.group(1)
-            year_to_docs[year].append(did)
-    return {year: docs[0] for year, docs in year_to_docs.items() if len(docs) == 1}
-
-
-def _repair_year_only_citations(text: str, year_to_docid: dict) -> tuple:
-    # Repair (YEAR: p.X) -> (DocId_Year: p.X) using context.
-    repair_count = 0
-    
-    def replacer(m):
-        nonlocal repair_count
-        year = m.group(1)
-        page = m.group(2)
-        if year in year_to_docid:
-            repair_count += 1
-            return f"({year_to_docid[year]}: p.{page})"
-        return m.group(0)
-    
-    repaired = re.sub(r'\((\d{4}):\s*p\.(\d+)\)', replacer, text)
-    return repaired, repair_count
 
 
 # =============================================================================
@@ -1350,6 +1511,14 @@ Continue:"""
 def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
     # v8 (R4/R6): closing must synthesise without restating prior section claims;
     # do not paraphrase the same two mechanisms that opened.
+    # v13: the v12 smoke produced a methodology-stub closing ("This would
+    # involve measuring..."), zero citations, no synthesis. The prompt now
+    # forbids the future-research / methodology-stub register explicitly and
+    # demands the closing cite at least two distinct documents from the
+    # allowed list. The synthesis structure (agreement, disagreement,
+    # resolution) is preserved but reframed as ACTIVE statements grounded in
+    # the cited sources, not as hypothetical assessments of what would settle
+    # the question.
     return f"""Close this literature review on: {topic}
 
 Previous ending:
@@ -1363,7 +1532,18 @@ Section claims already made (do NOT restate the specific mechanisms below; synth
 
 {_PROSE_DIRECTIVE}
 
-Without restating the specific mechanisms or evidence already developed, name the underlying point of agreement, the precise remaining disagreement, and what would have to be measured to resolve it. 150-200 words. Do not write "In conclusion" or "To summarize".
+Write the closing as a synthesis grounded in the cited sources. Structure:
+1. Name the underlying point of agreement that the literature converges on, citing AT LEAST ONE source by author and page.
+2. Name the precise remaining disagreement that the cited sources leave open, citing AT LEAST ONE distinct source by author and page (so the closing cites at least 2 distinct documents in total).
+3. Identify the specific historical evidence or empirical comparison that would settle the disagreement, drawing on a measurement type or case that the cited sources have already used — not a future-research wishlist.
+
+STRICT RULES:
+- Do NOT write methodology-stub prose: avoid "this would involve measuring", "future research should", "further work would assess", "would provide a nuanced understanding", "remains an open question", "remains a subject of debate".
+- v13.1 FIX-E: also forbidden — "would be necessary", "would illuminate", "would clarify", "would resolve", "would shed light", "would inform", "would allow us to", "thorough comparison", "thorough examination". More generally: do NOT attach the modal "would" to a methodology verb such as comparison, examination, assessment, analysis, or investigation.
+- Use present-tense indicative statements about what the cited sources SHOW, not conditional-tense statements about what future work WOULD show.
+- Do NOT write "In conclusion" or "To summarize".
+- Every claim must be tied to a cited source from the allowed list and must name an author AND a page. Closing paragraphs without citations are forbidden.
+- 150-200 words.
 
 Continue:"""
 
@@ -1441,8 +1621,8 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     rest of each section is untouched.
     """
     import time
-    if os.environ.get("RRR_WRITER_STITCH", "1") != "1":
-        return chunks
+    # v13: RRR_WRITER_STITCH retired (always on). The v11-B stitch + v12
+    # tail-echo guard are core to the cross-section flow story.
     # Need at least opening + 2 interior sections + closing to make stitching
     # meaningful. (Opening alone doesn't need stitching; closing already
     # synthesises across sections.)
@@ -1494,14 +1674,11 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     try:
         import ollama
         start = time.perf_counter()
+        # v13: RRR_WRITER_STITCH_T/CTX/PRED retired; tuning frozen.
         res = ollama.chat(
             model=_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            options={
-                "temperature": float(os.environ.get("RRR_WRITER_STITCH_T", "0.3")),
-                "num_ctx": int(os.environ.get("RRR_WRITER_STITCH_CTX", "8192")),
-                "num_predict": int(os.environ.get("RRR_WRITER_STITCH_PRED", "1500")),
-            },
+            options={"temperature": 0.3, "num_ctx": 8192, "num_predict": 1500},
             keep_alive=_KEEP_ALIVE,
             format="json",
             stream=False,
@@ -1629,69 +1806,29 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     return new_chunks
 
 
-def _build_author_year_lookup(allowed_docs):
-    # Build reverse lookup: (author, year) -> doc_id for academic citation matching.
-    author_year_to_docid = {}
-    for did in allowed_docs:
-        clean = did.replace("EtAl", "").replace("&", "")
-        parts = clean.split("_")
-        if len(parts) >= 2:
-            author = parts[0].lower()
-            year = parts[-1].rstrip('abcdefgh')
-            author_year_to_docid[(author, year)] = did
-            if "EtAl" in did:
-                author_year_to_docid[(author + " et al", year)] = did
-    return author_year_to_docid
-
+# v13: _build_author_year_lookup promoted to render.py; we import it via the
+# top-of-file import block. The writer-side _collect_cited_docs extends the
+# shared one with display-form scans (DISPLAY_CITE_RE / DISPLAY_PAREN_CITE_RE)
+# that the reasoner-side caller doesn't need.
 
 def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
-    """Collect cited doc_ids from all surfaces the writer may have emitted.
-
-    v10: the user-facing surface is 'Author (Year, p.N)'. We still scan the
-    legacy canonical and bare doc_id forms in case any slipped through.
+    """Writer-side collector: shared canonical / bare-canonical / legacy
+    author-year scans (via render._collect_cited_docs) PLUS the v10 display
+    surfaces. The display branch lives here because reasoner's fallback path
+    doesn't emit display forms.
     """
-    cited_docs = set()
-
-    # Canonical: (Doc_Year: p.N)
-    for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", text):
-        did = m.group(1)
-        if did in allowed_docs:
-            cited_docs.add(did)
-
-    # Bare canonical: (Doc_Year)
-    for m in re.finditer(r"\(([A-Za-z0-9_&]+_\d{4}[a-z]?)\)", text):
-        did = m.group(1)
-        if did in allowed_docs:
-            cited_docs.add(did)
-
-    # v10 display surfaces: both 'Author (Year, p.N)' and '(Author Year, p.N)'
+    cited_docs = _shared_collect_cited_docs(text, allowed_docs, author_year_to_docid)
     display_lookup = _build_display_lookup(allowed_docs)
-    for m in DISPLAY_CITE_RE.finditer(text):
+    for m in DISPLAY_CITE_RE.finditer(text or ""):
         key = (m.group(1).strip().lower(), m.group(2))
         did = display_lookup.get(key)
         if did:
             cited_docs.add(did)
-    for m in DISPLAY_PAREN_CITE_RE.finditer(text):
+    for m in DISPLAY_PAREN_CITE_RE.finditer(text or ""):
         key = (m.group(1).strip().lower(), m.group(2))
         did = display_lookup.get(key)
         if did:
             cited_docs.add(did)
-
-    # Legacy author-year academic forms: (Author, Year) and Author (Year)
-    for m in re.finditer(r"\(([A-Za-z&]+(?:\s+et\s+al\.?)?)[,\s]+(\d{4})\)", text):
-        author = m.group(1).lower().strip().rstrip('.')
-        year = m.group(2)
-        did = author_year_to_docid.get((author, year))
-        if did:
-            cited_docs.add(did)
-
-    for m in re.finditer(r"([A-Za-z&]+(?:\s+et\s+al\.?)?)\s+\((\d{4})\)", text):
-        author = m.group(1).lower().strip().rstrip('.')
-        year = m.group(2)
-        did = author_year_to_docid.get((author, year))
-        if did:
-            cited_docs.add(did)
-
     return cited_docs
 
 
@@ -1813,10 +1950,6 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     chunks = []
     section_claims = []
-    all_dump_citations = []
-    total_repairs = 0
-    total_placeholders_stripped = 0
-    total_ajr_fixes = 0
     total_removed_citations = 0
     total_style_removed = 0
     total_coverage_fallbacks = 0
@@ -1851,7 +1984,6 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         return text
 
     def postprocess_chunk(chunk, chunk_docs):
-        nonlocal total_repairs, total_placeholders_stripped, all_dump_citations, total_ajr_fixes
         nonlocal total_removed_citations, total_style_removed, total_evidence_id_renders
         nonlocal total_double_paren_collapsed, total_author_led_openings
 
@@ -1872,21 +2004,11 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # v8 (R5): observe author-led-opening violations and count them.
         total_author_led_openings += _count_author_led_openings(chunk)
 
-        chunk_before = chunk
-        chunk = _strip_placeholder_citations(chunk)
-        placeholders_stripped = chunk_before.count('DocId_Year') + chunk_before.count('AuthorName_Year')
-        total_placeholders_stripped += placeholders_stripped
-        
-        chunk, ajr_fixes = _fix_ajr_abbreviation(chunk)
-        total_ajr_fixes += ajr_fixes
-        
-        year_to_docid = _build_year_to_docid(chunk_docs)
-        chunk, repair_count = _repair_year_only_citations(chunk, year_to_docid)
-        total_repairs += repair_count
-        
-        chunk, dump_cites = _extract_citation_dumps(chunk)
-        all_dump_citations.extend(dump_cites)
-        
+        # v13: removed the legacy pre-cleanup arms (_strip_placeholder_citations,
+        # _fix_ajr_abbreviation, _repair_year_only_citations, _extract_citation_dumps).
+        # All four had 0-hit metrics on the v12 smoke and the v13 prompt surface
+        # no longer produces any of the shapes they targeted.
+
         chunk = _strip_orphaned_citations(chunk)
         chunk = _strip_references_section(chunk)
         chunk = _strip_continuation_markers(chunk)
@@ -1902,8 +2024,8 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
         chunk, style_removed = _remove_style_violations(chunk)
         total_style_removed += len(style_removed)
-        
-        return chunk, repair_count, placeholders_stripped, ajr_fixes, len(style_removed)
+
+        return chunk, 0, 0, 0, len(style_removed)
 
     def finalize_covered_chunk(raw, prompt, chunk_docs, section_kind, stage):
         nonlocal total_coverage_fallbacks
@@ -2034,13 +2156,13 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         chunks.append(chunk)
 
     def log_stance_chunk(job, word_count, repairs, placeholders, ajr, style_removed, audit):
+        # v13: repairs / placeholders / ajr are vestigial (the helpers that
+        # produced them were retired); keep the signature for caller stability
+        # but only log the live signals (style sentences removed, citation
+        # count). The unused parameters are accepted to keep the call sites
+        # untouched.
+        del repairs, placeholders, ajr
         notes = []
-        if repairs > 0:
-            notes.append(f"repaired {repairs}")
-        if placeholders > 0:
-            notes.append(f"stripped {placeholders}")
-        if ajr > 0:
-            notes.append(f"AJR fixed {ajr}")
         if style_removed > 0:
             notes.append(f"style stripped {style_removed}")
         if audit.get("cited_doc_count", 0) > 0:
@@ -2221,21 +2343,11 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     if display_to_canonical_count and metrics:
         metrics.inc("writer_display_to_canonical", display_to_canonical_count)
 
-    global_year_to_docid = _build_year_to_docid(docs)
-    full_text, final_repairs = _repair_year_only_citations(full_text, global_year_to_docid)
-    total_repairs += final_repairs
+    # v13: removed the legacy final-assembly arms (_repair_year_only_citations,
+    # _fix_ajr_abbreviation, _strip_placeholder_citations, _extract_citation_dumps,
+    # _normalize_citation_case). All five had 0-hit metrics on the v12 smoke
+    # and target shapes the v13 prompt+display surface no longer produces.
 
-    full_text, final_ajr = _fix_ajr_abbreviation(full_text)
-    total_ajr_fixes += final_ajr
-
-    full_text = _strip_placeholder_citations(full_text)
-    full_text, final_dump_cites = _extract_citation_dumps(full_text)
-    all_dump_citations.extend(final_dump_cites)
-
-    full_text, case_fixes = _normalize_citation_case(full_text, allowed_docs)
-    if case_fixes > 0:
-        print(f"[Writer] Case normalized: {case_fixes} citations")
-    
     if os.environ.get("RRR_BYPASS_VALIDATION", "0") == "1":
         removed_citations = []
         print("[Writer] Citation removal skipped because RRR_BYPASS_VALIDATION=1")
@@ -2260,20 +2372,19 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # already cited AND it has substantial content overlap with an earlier
     # sentence. Configurable via env (set 0 to disable, or raise the overlap
     # threshold to be even more conservative).
-    if os.environ.get("RRR_WRITER_DROP_REDUNDANCY", "1") != "0":
-        overlap_threshold = int(os.environ.get("RRR_WRITER_REDUNDANCY_OVERLAP", "4"))
-        full_text, redundancy_drops = _drop_cross_section_redundancy(
-            full_text, min_token_overlap=overlap_threshold,
-        )
-        if redundancy_drops:
-            print(f"[Writer] Dropped {len(redundancy_drops)} redundant sentence(s) at final assembly:")
-            for r in redundancy_drops[:5]:
-                print(f"         - overlap={r['overlap_tokens']} cited={r['cited_pairs']}: {r['snippet']}")
-            if metrics:
-                metrics.inc("writer_redundancy_drops", len(redundancy_drops))
-                metrics.set("writer_redundancy_examples", redundancy_drops[:10])
-    else:
-        redundancy_drops = []
+    # v13: RRR_WRITER_DROP_REDUNDANCY and RRR_WRITER_REDUNDANCY_OVERLAP retired.
+    # The v9 R6 safety-net dedupe is conservative (fires 0-6 times per smoke)
+    # and disabling it has no production justification.
+    full_text, redundancy_drops = _drop_cross_section_redundancy(
+        full_text, min_token_overlap=4,
+    )
+    if redundancy_drops:
+        print(f"[Writer] Dropped {len(redundancy_drops)} redundant sentence(s) at final assembly:")
+        for r in redundancy_drops[:5]:
+            print(f"         - overlap={r['overlap_tokens']} cited={r['cited_pairs']}: {r['snippet']}")
+        if metrics:
+            metrics.inc("writer_redundancy_drops", len(redundancy_drops))
+            metrics.set("writer_redundancy_examples", redundancy_drops[:10])
 
     full_text = _strip_orphaned_citations(full_text)
     full_text = _strip_references_section(full_text)
@@ -2311,6 +2422,29 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     if narrative_rewrites:
         print(f"[Writer] Narrative->paren rewrites: {narrative_rewrites}")
 
+    # v13: fix mid-sentence narrative citations without preceding punctuation.
+    # The v12 smoke produced two of these (paras 1 and 3): "...extractive
+    # economic controls Akyeampong and Fofack (2014, p.20)" and "...divergent
+    # paths of development Sokoloff and Engerman (2000, p.8)". Insert a comma
+    # between the prior content word and the author label. Runs AFTER
+    # rewrite_misplaced_narrative_citations because that pass collapses
+    # narrative-form cites where the author IS the subject; only the genuine
+    # mid-sentence stragglers remain for this pass to fix.
+    full_text, mid_cite_fixes = _fix_mid_sentence_narrative_cites(full_text)
+    if mid_cite_fixes and metrics:
+        metrics.inc("writer_mid_sentence_cite_fixes", mid_cite_fixes)
+    if mid_cite_fixes:
+        print(f"[Writer] Mid-sentence narrative cite fixes: {mid_cite_fixes}")
+
+    # v13.1 FIX-A: strip stray commas inside author labels ("Sokoloff and,
+    # Engerman ...", "van, Zanden ..."). Runs BEFORE the nested-narrative
+    # collapse so the labels are clean when collapse builds its grouped form.
+    full_text, label_comma_fixes = _strip_malformed_author_label_commas(full_text)
+    if label_comma_fixes and metrics:
+        metrics.inc("writer_author_label_comma_fixes", label_comma_fixes)
+    if label_comma_fixes:
+        print(f"[Writer] Author-label comma fixes: {label_comma_fixes}")
+
     # v11.1: collapse nested narrative cites inside an outer paren wrapper —
     # '(Author (Year, p.N); Author (Year, p.N))' becomes
     # '(Author Year, p.N; Author Year, p.N)'. The v11 smoke produced 5 of
@@ -2320,6 +2454,17 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         metrics.inc("writer_nested_paren_collapsed", nested_collapses)
     if nested_collapses:
         print(f"[Writer] Nested-narrative paren collapses: {nested_collapses}")
+
+    # v13.1 FIX-D: collapse same-(author, year) pseudo-plural multi-cites
+    # inside one parenthetical (e.g. "(Bryant 2006, p.11; Bryant 2006, p.3)"
+    # -> "(Bryant 2006, pp.3, 11)"). Runs AFTER the nested-narrative collapse
+    # so the parenthetical is already flat. Conservative: skips any paren
+    # with residual nested structure.
+    full_text, same_author_collapses = _collapse_same_author_year_paren_cites(full_text)
+    if same_author_collapses and metrics:
+        metrics.inc("writer_same_author_collapses", same_author_collapses)
+    if same_author_collapses:
+        print(f"[Writer] Same-(author, year) paren collapses: {same_author_collapses}")
 
     # v10: detect-then-LLM-rewrite style enforcement (one batched call). Runs
     # AFTER validation so the rewriter sees the final citation surface and is
@@ -2337,10 +2482,37 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         print(f"[Writer] Style: stripped {style_stats['trailing_stripped']} "
               "trailing-significance phrase(s); no other violations.")
 
+    # v13.1 FIX-B: strip literal "(Author, Year)" / "(Author Year)" / "(Author,
+    # Year, p.N)" placeholders copied verbatim from the system prompt's
+    # exemplar. Runs BEFORE _drop_zero_citation_paragraphs so a paragraph
+    # whose only "cite" was a placeholder is correctly identified as zero-cite.
+    full_text, placeholder_stripped = _strip_author_year_placeholder(full_text)
+    if placeholder_stripped and metrics:
+        metrics.inc("writer_placeholder_citation_stripped", placeholder_stripped)
+    if placeholder_stripped:
+        print(f"[Writer] Author/Year placeholder cites stripped: {placeholder_stripped}")
+
+    # v13: hard rule-9 enforcement at final assembly. The v12 prose audit found
+    # three zero-citation paragraphs (paras 4, 9, 12 — the closing) that the
+    # prompt-level rule-9 directive failed to prevent. The prompt directive is
+    # the right place to ASK for multi-source paragraphs; this is the safety
+    # net that drops the worst case (zero citations) when the model still
+    # produces filler / bridging / methodology paragraphs. Conservative: only
+    # drops a paragraph when no citation surface of any kind is present.
+    full_text, zero_cite_dropped = _drop_zero_citation_paragraphs(full_text)
+    if zero_cite_dropped and metrics:
+        metrics.inc("writer_zero_cite_paragraphs_dropped", len(zero_cite_dropped))
+        metrics.set("writer_zero_cite_paragraphs", zero_cite_dropped[:5])
+    if zero_cite_dropped:
+        print(f"[Writer] Dropped {len(zero_cite_dropped)} zero-citation paragraph(s):")
+        for snippet in zero_cite_dropped[:3]:
+            print(f"         - {snippet}")
+
     cited_docs = _collect_cited_docs(full_text, allowed_docs, author_year_to_docid)
-    for did in all_dump_citations:
-        if did in allowed_docs:
-            cited_docs.add(did)
+    # v13: all_dump_citations was previously a side-channel from
+    # _extract_citation_dumps. With that helper retired (citation_dump_docs=0
+    # on every recent smoke), cited_docs is derived purely from the rendered
+    # full_text — no side channel needed.
     cited_docids = sorted(cited_docs)
 
     total_words = _count_words(full_text)
@@ -2356,7 +2528,6 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     print(f"[Writer] review_composed.md written ({total_words} words).")
     print(
         f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} "
-        f"repairs={total_repairs} AJR={total_ajr_fixes} case={case_fixes} "
         f"removed={total_removed_citations} style_removed={total_style_removed} "
         f"coverage_fallbacks={total_coverage_fallbacks} evidence_id_renders={total_evidence_id_renders} "
         f"double_paren_collapsed={total_double_paren_collapsed} author_led_openings={total_author_led_openings} "
@@ -2367,9 +2538,6 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "chunks_written": len(chunks),
             "distinct_docs_cited": len(cited_docids),
             "word_count": total_words,
-            "repairs": total_repairs,
-            "ajr_fixes": total_ajr_fixes,
-            "case_fixes": case_fixes,
             "removed_citations": total_removed_citations,
             "style_sentences_removed": total_style_removed,
             "coverage_fallbacks": total_coverage_fallbacks,
@@ -2377,17 +2545,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "double_paren_collapsed": total_double_paren_collapsed,
             "author_led_openings": total_author_led_openings,
             "redundancy_drops": len(redundancy_drops),
-            "citation_dump_docs": len(all_dump_citations),
             "section_claims": section_claims,
             "section_coverage": section_coverage,
         })
-        metrics.inc("writer_citation_repairs", total_repairs)
         metrics.inc("writer_removed_citations", total_removed_citations)
         metrics.inc("writer_style_sentences_removed", total_style_removed)
         metrics.inc("writer_evidence_id_renders", total_evidence_id_renders)
         metrics.inc("writer_double_paren_collapsed", total_double_paren_collapsed)
         metrics.inc("writer_author_led_openings", total_author_led_openings)
-    
+
     return str(out_path)
 
 

@@ -35,13 +35,3 @@ def write_run(task, claim, evidence, result, subdir=None):
 _WS = re.compile(r"\s+")
 def normalize_space(s: str) -> str:
     return _WS.sub(" ", s or "").strip()
-
-
-def jaccard(a_words, b_words) -> float:
-    try:
-        a = set(a_words); b = set(b_words)
-        if not a and not b: return 1.0
-        inter = len(a & b); union = len(a | b)
-        return inter / union if union else 0.0
-    except Exception:
-        return 0.0

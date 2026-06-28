@@ -1,4 +1,4 @@
-from rrr.utils import normalize_space, jaccard
+from rrr.utils import normalize_space
 import os
 from rrr.paths import page_text_path, require_page_text_dir
 
@@ -67,10 +67,6 @@ def validate_evidence_verbose(evidence, metadata_df, soft_threshold: float = 0.7
             results.append({"item": it, "verdict":"fail", "reason":"quote_not_found", "exact":False, "soft":False, "soft_score":score})
     return results
 
-# Backwards-compat wrapper (treat exact or soft_ok as ok)
-def validate_evidence(evidence, metadata_df, soft_threshold: float = 0.78):
-    out = []
-    for r in validate_evidence_verbose(evidence, metadata_df, soft_threshold=soft_threshold):
-        ok = r["verdict"] in ("exact","soft_ok","bypass")
-        out.append({"item": r["item"], "ok": ok, "reason": r["reason"]})
-    return out
+# v13: removed the back-compat `validate_evidence` wrapper. Its only caller
+# was the v6-era cli.t2 single-pass path, which the v13 cli rewrite retired.
+# layered_t2 uses validate_evidence_verbose directly.

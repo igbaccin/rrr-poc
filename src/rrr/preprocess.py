@@ -147,7 +147,6 @@ def _process_one(row_dict):
         }
         save_json(meta, str(data_path(f"{doc_id}.json")))
         
-        status_note = f" (excl. {ref_pages} ref pages)" if ref_pages > 0 else ""
         return {"doc_id": doc_id, "ok": True, "pages": len(content_pages), "hash": h[:12], "ref_excluded": ref_pages}
     except Exception as e:
         return {"doc_id": doc_id, "ok": False, "reason": str(e)}
