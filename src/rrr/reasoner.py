@@ -1290,13 +1290,19 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             if not txt:
                 page_sentence_counts[int(c.get("page", 0) or 0)] = 0
                 continue
+            # v13.2 FIX-SNIPPET-WIDEN: out_stats receives the per-page count
+            # of context sentences stitched on (prev+next) so we can tally the
+            # `evidence_context_sentences_added` run-level metric.
+            sent_stats = {}
             scored_sents = select_sentences(
                 txt,
                 topic,
                 max_sentences=MAX_SENTS_PER_PAGE,
                 min_chars=MIN_CHARS,
                 probes=probes,
+                out_stats=sent_stats,
             )
+            metrics.inc("evidence_context_sentences_added", int(sent_stats.get("context_sentences_added", 0)))
             page_sentence_counts[int(c.get("page", 0) or 0)] = len(scored_sents)
             for sent, score in scored_sents:
                 s_norm = normalize_space(sent)
@@ -1754,11 +1760,14 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         print("[Layered-T2] appendix: runs/T2_review.md")
 
     if True:  # v13: writer composition is unconditional (was RRR_WRITE_REVIEW gate)
-        from rrr.writer import compose_from_ledger
+        # v14: RRR_WRITER_MODE dispatches between the single-pass (default) and
+        # chunked writer paths. The chunked path is preserved as a measurement
+        # fallback so v13.1.1 5-topic smokes remain reproducible.
+        from rrr.writer import compose_review
         print("[Layered-T2] composing long-form literature review...")
         try:
             with metrics.stage("writing"):
-                composed_path = compose_from_ledger(str(runs_path("review_ledger.json")), metrics=metrics)
+                composed_path = compose_review(str(runs_path("review_ledger.json")), metrics=metrics)
             print(f"[Layered-T2] composed review written at: {composed_path}")
 
             with open(composed_path, "r", encoding="utf-8") as f:

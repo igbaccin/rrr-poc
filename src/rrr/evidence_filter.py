@@ -81,14 +81,34 @@ def _quote_corruption_signals(s: str) -> int:
     return signals
 
 
-def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_chars: int = 40, probes=None):
+def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_chars: int = 40, probes=None, out_stats=None):
     """
     Returns list of (sentence, score) tuples, sorted by score descending.
+
+    v13.2 FIX-SNIPPET-WIDEN: when RRR_EVIDENCE_CONTEXT_SENTENCES > 0 (default 1),
+    each selected sentence is widened to include N sentences before and N after
+    from the same page, joined with single spaces. This preserves attribution
+    chains (e.g. "Englebert concludes that..." preceding the selected sentence)
+    that were previously stripped when only the single best-matching sentence
+    was returned. The per-page cap (`max_sentences`) still applies to the
+    number of SELECTED sentences, not the widened payload. The widened text
+    remains a substring of the page so validate.py soft-match still passes.
+
+    If `out_stats` is a dict, it is mutated with `context_sentences_added` =
+    the total number of prev+next sentences that were stitched on across all
+    selections in this call. Backwards-compatible: callers that don't pass
+    `out_stats` see the same (text, score) tuple shape as before.
     """
-    spans = sentence_spans(page_text, min_chars=min_chars)
+    # All sentence boundaries on this page (uncapped by min_chars when used as
+    # neighbours, so a short "Yes." or attribution clause can still be picked
+    # up as context — only the SELECTABLE pool respects min_chars).
+    all_spans = sentence_spans(page_text, min_chars=1)
+    all_sentences = [s["text"].strip() for s in all_spans]
+    spans = [s for s in all_spans if len(s["text"].strip()) >= min_chars]
     sentences = [s["text"].strip() for s in spans]
     if not sentences:
         sentences = [normalize_text(s).strip() for s in _SENT_SPLIT.split(page_text) if len(s.strip()) >= min_chars]
+        all_sentences = sentences[:]
     if not sentences:
         return []
 
@@ -140,4 +160,40 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
         if len(chosen) >= max_sentences:
             break
 
-    return chosen
+    # v13.2 FIX-SNIPPET-WIDEN: widen each selected sentence with N neighbours
+    # on either side. Cap is on SELECTED sentences (already enforced above), so
+    # widening does not consume the budget. Default N=1 captures the
+    # Hopkins/Englebert attribution case ("Englebert concludes that... .
+    # Societies can be ethnically homogeneous...") without inflating snippets.
+    n_context = int(os.environ.get("RRR_EVIDENCE_CONTEXT_SENTENCES", "1"))
+    if n_context <= 0 or not all_sentences:
+        return chosen
+
+    # Index lookup: map selected sentence text -> its position in the page's
+    # full sentence list. Use first-match positional lookup; if a selected
+    # sentence appears twice on the page, the first occurrence is used (rare
+    # enough not to matter, and the widened context is still substring-valid).
+    pos_by_text = {}
+    for i, s in enumerate(all_sentences):
+        pos_by_text.setdefault(s, i)
+
+    widened = []
+    context_added = 0
+    for s, sc in chosen:
+        idx = pos_by_text.get(s)
+        if idx is None:
+            # Sentence was normalised differently from the page split — emit
+            # un-widened so we never drop a validated selection.
+            widened.append((s, sc))
+            continue
+        lo = max(0, idx - n_context)
+        hi = min(len(all_sentences), idx + n_context + 1)
+        window = all_sentences[lo:hi]
+        added = (idx - lo) + (hi - 1 - idx)
+        context_added += added
+        widened.append((" ".join(window).strip(), sc))
+
+    if isinstance(out_stats, dict):
+        out_stats["context_sentences_added"] = context_added
+
+    return widened
