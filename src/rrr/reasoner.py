@@ -32,7 +32,7 @@ _MECHANISM_PROMPT_VERSION = "2026-06-25-v8"
 # v9 (R3): version key for fused stance+mechanism cache entries (separate from
 # mechanism cache so a v8 mechanism cache hit cannot serve a v9 caller missing
 # stance/rationale/contested). Frozen in v13 (was RRR_FUSED_PROMPT_VERSION).
-_FUSED_PROMPT_VERSION = "2026-06-25-v9-fused"
+_FUSED_PROMPT_VERSION = "2026-06-29-v10-fused-claim"
 # v9 (R3): structured-output options for the fused call. num_predict bumped
 # vs mechanism because the JSON contains stance + rationale + mechanism +
 # contested + mechanisms[] (richer payload). Frozen in v13.
@@ -258,7 +258,8 @@ def _save_mechanism_cache(doc_id: str, sig: str, obj):
 # fused_prompt_version). Stored separately from mechanism cache so a v8
 # mechanism-only cache entry cannot serve a v9 caller that needs stance.
 def _fused_signature(topic: str, quotes, model: str = _MODEL,
-                     prompt_version: str = _FUSED_PROMPT_VERSION) -> str:
+                     prompt_version: str = _FUSED_PROMPT_VERSION,
+                     paper_claim: str = "") -> str:
     h = hashlib.sha256()
     h.update((topic or "").encode("utf-8"))
     for q in quotes or []:
@@ -268,6 +269,9 @@ def _fused_signature(topic: str, quotes, model: str = _MODEL,
         h.update((q.get("text", "") or "")[:400].encode("utf-8"))
     h.update(b"\x01" + (model or "").encode("utf-8"))
     h.update(b"\x02" + (prompt_version or "").encode("utf-8"))
+    # v14.4 Shape B: include the pre-extracted paper claim in the cache key
+    # so a re-extracted claim invalidates the stance cache for that doc.
+    h.update(b"\x03" + (paper_claim or "").encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -289,31 +293,84 @@ def _save_fused_cache(doc_id: str, sig: str, obj):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def _build_fused_prompt(topic: str, ev_texts):
+def _build_fused_prompt(topic: str, ev_texts, paper_claim: str = ""):
+    """v14.4: prompt now (a) injects a pre-extracted PAPER CLAIM block above
+    the quotes when available (Shape B), and (b) rewrites the stance
+    definitions to make the critiques-vs-complicates boundary operational
+    — critique = argues thesis is wrong AND proposes a rival cause;
+    complicate = accepts thesis but adds scope conditions WITHOUT proposing a
+    rival cause. The tangential definition is honest: 'paper does not
+    substantively engage with the topic's thesis'.
+    """
+    has_claim = bool(paper_claim)
+    claim_block = ""
+    if has_claim:
+        claim_block = (
+            "PAPER'S CENTRAL CLAIM (pre-extracted from the paper's abstract + "
+            "conclusion — describes what the paper ARGUES, in the author's own "
+            "framing):\n" + paper_claim + "\n\n"
+        )
+    # When the claim is present, give the model an explicit precedence rule:
+    # claim is primary, quotes are confirmation. This is the load-bearing
+    # instruction for the critique-with-rival-cause case where the quotes
+    # often surface concessive prose that LOOKS supportive but is actually
+    # the position the paper is attacking. When no claim was extracted
+    # (no_text or LLM error), this instruction would dangle, so we emit a
+    # different sentence that points at quotes only.
+    primary_signal_sentence = (
+        "Use the PAPER'S CENTRAL CLAIM (above) as the PRIMARY signal; use "
+        "the quotes to confirm or refine the stance. If the claim and the "
+        "quotes appear to point to different stances, TRUST THE CLAIM — the "
+        "quotes may be fragments of a position the paper summarises in order "
+        "to attack it, not its own argument."
+        if has_claim else
+        "Use the quotes as the primary signal. No pre-extracted claim was "
+        "available for this paper."
+    )
     return (
-        "Read the topic and the quoted evidence from this document. In ONE "
-        "JSON object decide all of the following:\n\n"
-        "1. stance: which of {supports, critiques, complicates, tangential} best "
-        "describes how this document's quoted evidence relates to the topic.\n"
+        "Read the topic, the paper's central claim (if provided), and the "
+        "quoted evidence from this document. In ONE JSON object decide all of "
+        "the following:\n\n"
+        "1. stance: which of {supports, critiques, complicates, tangential} "
+        "best describes how this document's argument relates to the topic.\n"
         "2. rationale: one short sentence (<=200 characters) explaining the stance.\n"
         "3. mechanism: a single sentence (<=120 characters) naming the central "
-        "causal mechanism this document offers in relation to the topic, or empty "
-        "string if none.\n"
+        "causal mechanism this document offers in relation to the topic, or "
+        "empty string if none.\n"
         "4. contested: a single sentence (<=160 characters) naming what this "
         "document treats as contested or in need of qualification, or empty if "
         "nothing.\n"
-        "5. mechanisms: a list of 1-3 specific mechanism strings (8-15 words each), "
-        "each answering HOW or THROUGH WHAT, using nouns concrete to this "
-        "document's evidence.\n\n"
-        "Stance definitions:\n"
-        "- supports: the quoted evidence corroborates the topic's claim through "
-        "measurement, mechanism, or historical case.\n"
-        "- critiques: the quoted evidence directly challenges or refutes the "
-        "topic's claim.\n"
-        "- complicates: the quoted evidence qualifies the topic's claim with "
-        "scope conditions, contingencies, or measurement limits.\n"
-        "- tangential: the quoted evidence is only marginally related.\n\n"
+        "5. mechanisms: a list of 1-3 specific mechanism strings (8-15 words "
+        "each), each answering HOW or THROUGH WHAT, using nouns concrete to "
+        "this document's evidence.\n\n"
+        "Stance definitions (read CAREFULLY — the critiques/complicates "
+        "boundary is the one that matters most):\n"
+        "- supports: the paper actively DEFENDS the topic's thesis through "
+        "measurement, mechanism, or historical case. The paper agrees with "
+        "the thesis as stated AND does NOT identify another cause as equally "
+        "or more fundamental than the one named in the thesis.\n"
+        "- critiques: the paper argues the topic's thesis is INCORRECT or "
+        "NOT THE FUNDAMENTAL EXPLANATION, AND proposes a RIVAL primary cause "
+        "(e.g. geography, factor endowments, culture, technology, ideology, "
+        "slavery, ecological conditions). A critique attacks the thesis and "
+        "offers something else as the real driver.\n"
+        "- complicates: the paper ACCEPTS the thesis broadly but adds SCOPE "
+        "CONDITIONS — qualifications, contingencies, mediating factors, "
+        "measurement limits, region/period limits. A complication refines "
+        "the thesis; it does NOT propose a rival fundamental cause. A paper "
+        "that locates a more UPSTREAM cause (an antecedent that produces or "
+        "shapes the thesis-cause) without rejecting the thesis-cause itself "
+        "is a complicate, not a critique.\n"
+        "- tangential: the paper does not substantively ENGAGE with the "
+        "topic's thesis — it is in an adjacent conversation, addresses a "
+        "different sub-question, or is from a different intellectual domain "
+        "entirely (e.g. natural science when the topic is economic history). "
+        "Excluded from the literature review.\n\n"
+        "Key distinction: if the paper REJECTS the thesis and offers a rival "
+        "cause -> critiques. If the paper ACCEPTS the thesis but narrows when "
+        "or how it holds -> complicates. " + primary_signal_sentence + "\n\n"
         "Topic:\n" + topic + "\n\n"
+        + claim_block +
         "Quotes:\n" + "\n\n---\n\n".join(ev_texts) + "\n\n"
         "Return ONLY a single JSON object with exactly these five keys."
     )
@@ -352,17 +409,23 @@ def _validate_fused_result(obj, allowed_doc_ids: set):
 
 
 def _fused_stance_and_mechanism(doc_id: str, topic: str, valid_quotes,
-                                allowed_doc_ids: set, metrics=None):
+                                allowed_doc_ids: set, metrics=None,
+                                paper_claim: str = ""):
     """v9 (R3): single LLM call returning stance + rationale + mechanism +
-    contested + mechanisms[]. Returns a normalised dict on success, or None on
-    any failure (caller falls back to the two-call stance+mechanism path).
+    contested + mechanisms[]. Returns a normalised dict on success, or None
+    on any failure (caller falls back to the two-call stance+mechanism path).
+
+    v14.4 Shape B: now also accepts `paper_claim` (pre-extracted central
+    claim from the paper's abstract + conclusion) and injects it into the
+    prompt so the classifier sees the paper's thesis directly, not just the
+    BM25-selected snippets which are often biased toward concessive prose.
     """
     ev_texts = []
     for q in valid_quotes:
         text = q.get("text", "") or ""
         clipped = (text[:220] + "...") if len(text) > 220 else text
         ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
-    prompt = _build_fused_prompt(topic, ev_texts)
+    prompt = _build_fused_prompt(topic, ev_texts, paper_claim=paper_claim)
 
     try:
         import ollama
@@ -1391,6 +1454,16 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             clipped = (text[:220] + "...") if len(text) > 220 else text
             ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
 
+        # v14.4 Shape B: extract the paper's central claim from abstract +
+        # conclusion BEFORE the stance call. This is cached per-paper (not per
+        # topic), so the cost amortises across all topics run against the same
+        # corpus. The cached claim is injected into the fused stance prompt so
+        # the classifier sees what the paper ARGUES, not just BM25-selected
+        # snippets that are often biased toward concessive/descriptive prose.
+        from rrr.stance import extract_paper_claim
+        claim_info = extract_paper_claim(did, metrics=metrics)
+        paper_claim = claim_info.get("claim", "")
+
         # v9 (R3): try the fused stance+mechanism call first. If it returns a
         # valid object, we get stance + rationale + mechanism + contested +
         # mechanisms[] in ONE LLM call instead of two. Falls back to the
@@ -1400,7 +1473,9 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         # 24/24 fused calls with zero parse failures; the two-call path is
         # kept only as the runtime exception fallback.
         fused_result = None
-        fused_sig = _fused_signature(topic, valid_quotes)
+        # v14.4: fused signature now includes the paper claim, so a new
+        # claim extraction invalidates the stance cache for that doc.
+        fused_sig = _fused_signature(topic, valid_quotes, paper_claim=paper_claim)
         cached_fused = _load_fused_cache(did, fused_sig)
         if cached_fused and cached_fused.get("stance"):
             metrics.cache_event("fused", "hits")
@@ -1410,12 +1485,14 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             fused_result = _fused_stance_and_mechanism(
                 did, topic, valid_quotes,
                 allowed_doc_ids=set(all_doc_ids), metrics=metrics,
+                paper_claim=paper_claim,
             )
             if fused_result:
                 _save_fused_cache(did, fused_sig, {
                     **fused_result,
                     "model": _MODEL,
                     "prompt_version": _FUSED_PROMPT_VERSION,
+                    "paper_claim": paper_claim,
                 })
                 metrics.cache_event("fused", "writes")
             else:
@@ -1640,6 +1717,69 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     stance_counts = Counter(d.get("stance", "tangential") for d in doc_summaries)
     metrics.set("stance_distribution", dict(stance_counts))
     print(f"[Layered-T2] stance distribution: {dict(stance_counts)}")
+
+    # v14.4: corpus-fit refusal. If the dominant stance is `tangential` for a
+    # large fraction of admitted docs, the corpus does not substantively
+    # engage with the topic — refuse to write a literature review rather than
+    # composing one over thin coverage. Threshold tunable via
+    # RRR_TANGENTIAL_REFUSAL_THRESHOLD (default 0.7). Disable with =1.0.
+    # Also emits a softer bucket-sanity warning when ANY of the substantive
+    # stances (supports/critiques/complicates) is empty despite >=10 admitted
+    # docs — this often signals stance-classifier failure rather than corpus
+    # composition (e.g. the v14.3 INST runs had 0 critiques because the
+    # classifier was systematically rounding critique-with-rival-cause down
+    # to complicates).
+    try:
+        tangential_threshold = float(os.environ.get("RRR_TANGENTIAL_REFUSAL_THRESHOLD", "0.7"))
+    except ValueError:
+        tangential_threshold = 0.7
+    # Guard against a zero or negative threshold accidentally refusing
+    # every run that has >=5 admitted docs (since 0.0 satisfies '>= 0.0'
+    # even when tangential_share is 0). Valid range is (0.0, 1.0]; clamp
+    # anything outside that to disable the check.
+    if tangential_threshold <= 0.0 or tangential_threshold > 1.0:
+        tangential_threshold = 1.01  # effectively disabled
+    total_admitted = sum(stance_counts.values()) or 1
+    tangential_share = stance_counts.get("tangential", 0) / total_admitted
+    metrics.set("tangential_share", round(tangential_share, 3))
+    empty_substantive_buckets = [
+        b for b in ("supports", "critiques", "complicates")
+        if stance_counts.get(b, 0) == 0
+    ]
+    if empty_substantive_buckets and total_admitted >= 10:
+        metrics.set("empty_substantive_buckets", empty_substantive_buckets)
+        print(f"[Layered-T2] WARN: empty stance buckets despite {total_admitted} "
+              f"admitted docs: {empty_substantive_buckets} — possible "
+              f"stance-classifier mis-routing; inspect cache/fused/ for misclassifications")
+    if tangential_share >= tangential_threshold and total_admitted >= 5:
+        print(f"[Layered-T2] refusal=corpus_off_topic "
+              f"(tangential {stance_counts.get('tangential',0)}/{total_admitted} "
+              f"= {tangential_share:.0%} >= threshold {tangential_threshold:.0%})")
+        write_run("T2_LAYERED_GLOBAL", topic,
+                  {"docs_seen": len(all_doc_ids), "docs_represented": kept,
+                   "tangential_share": round(tangential_share, 3)},
+                  {"refusal": True, "reason": "corpus_off_topic",
+                   "explanation": (
+                       f"{stance_counts.get('tangential',0)} of {total_admitted} "
+                       f"admitted documents do not substantively engage with this "
+                       f"topic's thesis. The corpus appears to be a poor fit for "
+                       f"the question. Consider a different corpus or a different "
+                       f"topic."
+                   )})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", "corpus_off_topic")
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL",
+            topic,
+            meta_path,
+            _MODEL,
+            plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
+                   "refusal": "corpus_off_topic",
+                   "stance_distribution": dict(stance_counts)},
+        )
+        metrics.save()
+        return
 
     if kept < GLOBAL_MIN_DOCS:
         print("[Layered-T2] refusal=insufficient_global_evidence")

@@ -1385,19 +1385,23 @@ def _build_allowed_citations(docs):
 
 _PROSE_DIRECTIVE = (
     # v14.2.1 simplification: trimmed from ~190 words to ~80. Citation-format
-    # material (evidence-ID syntax, multi-source preference, narrative-form
-    # guidance) moved to _SYSTEM_CITATION_INSTRUCTION where format belongs.
-    # "Do not restate the thesis" absorbed from the three per-section
-    # instructions so it lives in one place instead of three.
-    "Write in a scholarly register. Argue in direct positive claims; avoid "
-    "contrastive framings such as 'not X but Y', 'rather than', 'unlike', "
-    "or 'in contrast'. Vary sentence length; introduce claims as full "
-    "sentences rather than via colon setups. "
+    # material moved to _SYSTEM_CITATION_INSTRUCTION.
+    # v14.4: reframed as a "literature review organised around streams of
+    # related scholarship" — each section now presents one stream of work
+    # and synthesises across the sources within it. The per-section builders
+    # match the framing ("present this stream", "this stream challenges...",
+    # "this stream introduces..."). Streams are a more natural unit for
+    # literature-review prose than the older "chain of inference" metaphor.
+    "Write a scholarly literature review organised around streams of "
+    "related scholarship. Each section presents ONE stream and synthesises "
+    "across its sources. Argue in direct positive claims; avoid contrastive "
+    "framings such as 'not X but Y', 'rather than', 'unlike', or 'in "
+    "contrast'. Vary sentence length; introduce claims as full sentences "
+    "rather than via colon setups. "
     # v12 multi-doc rule.
     "Each paragraph must integrate at least two DISTINCT documents; do not "
     "cite the same document for more than two consecutive citations. "
-    # v12 anti-meta + topic restate (the latter pulled in from per-section
-    # builders; also enforced by the prev-tail strong directive in v14.2 cond D).
+    # v12 anti-meta + topic restate.
     "Make claims directly about the substantive question. Do NOT write meta-"
     "statements about the review itself ('this review', 'the literature "
     "reviewed here', 'as discussed above', 'we will examine'). "
@@ -1536,7 +1540,7 @@ ALLOWED CITATIONS:
 
 {_PROSE_DIRECTIVE}
 
-Build one chain of inference. Open by stating the shared mechanism the cluster holds in common, citing the supporting sources together (per the CLUSTER SYNTHESIS above if present, else the strongest 2-3 in Evidence). Narrow to one source for a specific phrase that establishes the mechanism; show how a second source confirms it under different conditions (period, region, measurement); trace one downstream implication. 260-300 words. End mid-thought.
+Present this stream of literature. Open by stating the shared mechanism this body of work converges on, citing the supporting sources together (per the CLUSTER SYNTHESIS above if present, else the strongest 2-3 in Evidence). Narrow to one source for a specific phrase that establishes the mechanism; show how a second source confirms it under different conditions (period, region, measurement); trace one downstream implication. 260-300 words. End mid-thought.
 
 Continue:"""
 
@@ -1561,7 +1565,7 @@ ALLOWED CITATIONS:
 
 {_PROSE_DIRECTIVE}
 
-Identify the specific assumption the supporting case rests on, then cite the evidence that breaks it inside the same sentence. When the CLUSTER SYNTHESIS above identifies a shared critical move across multiple sources, name it once with a multi-citation parenthetical. Force the reader to weigh the assumption against the counter-evidence. 200-240 words. End mid-thought.
+Present the stream of literature that challenges the supporting case. Identify the specific assumption this stream attacks, then cite the evidence it brings to bear inside the same sentence. When the CLUSTER SYNTHESIS above identifies a shared critical move across multiple sources, name it once with a multi-citation parenthetical. Force the reader to weigh the assumption against the counter-evidence. 200-240 words. End mid-thought.
 
 Continue:"""
 
@@ -1586,7 +1590,7 @@ ALLOWED CITATIONS:
 
 {_PROSE_DIRECTIVE}
 
-Pick the single scope condition that most narrows the supporting claim, and use one extended example to show what the thesis can and cannot explain under it. If the CLUSTER SYNTHESIS above names a scope condition shared across multiple sources, cite them together when introducing it. Treat the qualification as reshaping the question, not as a rejection. 220-260 words. End mid-thought.
+Present the stream of literature that complicates the supporting claim. Pick the single scope condition this stream introduces that most narrows the claim, and use one extended example to show what the thesis can and cannot explain under it. If the CLUSTER SYNTHESIS above names a scope condition shared across multiple sources, cite them together when introducing it. Treat the qualification as reshaping the question, not as a rejection. 220-260 words. End mid-thought.
 
 Continue:"""
 
