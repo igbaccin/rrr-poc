@@ -167,30 +167,38 @@ _ENFORCE_COVERAGE = True
 
 # v10: cite as 'Author (Year, p.N)'. Underscore-keyed canonical form retired.
 _SYSTEM_CITATION_INSTRUCTION = (
-    "CITATION FORMATS: two forms, picked by sentence role.\n"
-    "  NARRATIVE — author is the grammatical subject of the sentence:\n"
-    "    Author (Year, p.N)\n"
+    # v14.2.1 simplification: reorganised into BOUNDARY (architecturally
+    # enforced) and FORMAT (style) buckets so the model sees the hard rules
+    # first. Citation-format material moved here from _PROSE_DIRECTIVE
+    # (evidence-ID syntax + multi-source preference) since both belong with
+    # the format example, not with style guidance.
+    "CITATION FORMATS — two surfaces, picked by sentence role.\n"
+    "  NARRATIVE     (author is the subject)    Author (Year, p.N)\n"
     "    e.g. 'North and Weingast (1989, p.2) argue that institutions...'\n"
-    "  PARENTHETICAL — whole reference in parens, when the author is NOT\n"
-    "    the subject (citing as an aside, or citing multiple sources for a\n"
-    "    shared claim):\n"
-    "    (Author Year, p.N)\n"
+    "  PARENTHETICAL (author not the subject)   (Author Year, p.N)\n"
     "    e.g. '...credible commitment underpins growth (North and Weingast 1989, p.2).'\n"
-    "    Multi-source: '...established across the literature (North 1989, p.9; "
-    "Acemoglu et al. 2001, p.27).'\n\n"
-    "Use the narrative form when the author is the speaker in the sentence; "
-    "use the parenthetical form otherwise.\n\n"
-    "ALWAYS WRONG (never emit these):\n"
-    "  (North, 1989)             # missing page\n"
-    "  North (1989) p.9          # page outside the parens\n"
-    "  (p.5)                     # page-only, no author/year\n\n"
-    "Rules:\n"
-    "1. Copy each author label EXACTLY as it appears in the ALLOWED CITATIONS list below.\n"
-    "2. Use only the page numbers shown next to that author in the list.\n"
-    "3. Every citation must include a page number; never write a citation without a page.\n"
-    "4. One page per citation; never write 'pp.5-7' or 'pp.5, 7'.\n"
+    "    Multi-source: '...established across the literature "
+    "(North 1989, p.9; Acemoglu et al. 2001, p.27).'\n\n"
+    "You MAY also cite via an evidence ID such as [E0001]; postprocess "
+    "renders it into a validated page citation. When multiple sources support "
+    "the same point, prefer the grouped form: 'shared finding ([E0001]; "
+    "[E0007]; [E0014]).'\n\n"
+    "NEVER emit:\n"
+    "  (North, 1989)      missing page\n"
+    "  North (1989) p.9   page outside parens\n"
+    "  (p.5)              page-only, no author/year\n\n"
+    "BOUNDARY RULES (architecturally enforced; violations are sentence-stripped):\n"
+    "1. Cite only from the ALLOWED CITATIONS list. Copy author labels EXACTLY "
+    "and use only the page numbers shown for each author.\n"
+    "2. If a claim is not supported by the allowed evidence, state it WITHOUT "
+    "a citation. Do not invent citations.\n"
+    "3. QUOTED TEXT: text inside straight \" \" must be copy-pasted VERBATIM "
+    "from the Evidence section. Paraphrase OUTSIDE quotation marks. "
+    "Fabricated quotes are stripped from the final review.\n\n"
+    "FORMAT RULES:\n"
+    "4. Every citation includes a page; one page per citation; pages stay "
+    "inside the parens (never 'pp.5-7' or 'pp.5, 7').\n"
     "5. Never write page-only citations such as (p.5).\n"
-    "6. If a claim is not supported by the allowed evidence, state it without a citation; do not invent one.\n"
 )
 
 
@@ -565,16 +573,19 @@ def _strip_malformed_author_label_commas(text: str) -> tuple:
 # paragraph whose ONLY cite was a placeholder is correctly identified as
 # zero-cite and dropped.
 _AUTHOR_YEAR_PLACEHOLDER_RE = re.compile(
-    r"\s?\(Author(?:,)?\s+Year(?:,\s*p\.\s*\d+|,\s*p\.N)?\)"
+    # v14.2 widening: comma between Year and p. is now optional, so the no-comma
+    # form (Author Year p.N) — observed in the v14.1 smoke run 1 para 4 — is also
+    # stripped. The previous regex required either ",\s*p.\d+" or ",\s*p.N".
+    r"\s?\(Author(?:,)?\s+Year(?:(?:,\s*|\s+)p\.\s*(?:\d+|N))?\)"
 )
 
 
 def _strip_author_year_placeholder(text: str) -> tuple:
-    """v13.1 FIX-B: strip the literal "(Author, Year)" / "(Author Year)" /
-    "(Author, Year, p.N)" placeholder surfaces that the model occasionally
-    copies from the system prompt's generic exemplar. Also strips a leading
-    space so the surrounding sentence does not gain a double space.
-    Returns (cleaned_text, count).
+    """v13.1 FIX-B (widened in v14.2): strip the literal "(Author, Year)" /
+    "(Author Year)" / "(Author, Year, p.N)" / "(Author Year p.N)" placeholder
+    surfaces that the model occasionally copies from the system prompt's
+    generic exemplar. Also strips a leading space so the surrounding sentence
+    does not gain a double space. Returns (cleaned_text, count).
     """
     if not text:
         return text or "", 0
@@ -1370,26 +1381,24 @@ def _build_allowed_citations(docs):
 # =============================================================================
 
 _PROSE_DIRECTIVE = (
-    "Write in a scholarly register suited to historical methods. "
-    "Argue in direct positive claims; do not lean on contrastive framings such as "
-    "'not X but Y', 'rather than', 'unlike', or 'in contrast'. "
-    "Vary sentence length; do not produce runs of short staccato sentences. "
-    "Introduce claims as full sentences rather than via colon setups. "
-    "You may cite an evidence ID such as [E0001]; it will be rendered into a validated page citation. "
-    "When multiple sources in the evidence support the same point, cite them together in one "
-    "parenthetical reference rather than presenting each as a separate witness — e.g. "
-    "'the institutional turn is established across the literature ([E0001]; [E0007]; [E0014]).' "
-    "Save the named, narrative form 'Author (Year, p.N) argues that...' for moments when one "
-    "source's specific argument is the subject of the sentence. "
-    # v12: prevent single-author paragraphs (van-Zanden-monoculture failure).
-    "Each paragraph must integrate at least two DISTINCT documents. Do not cite "
-    "the same document for more than two consecutive citations; introduce another "
-    "source before returning. "
-    # v12: prevent meta-commentary about the review itself.
-    "Make claims directly about the substantive question. Do NOT write meta-statements "
-    "such as 'this review', 'the literature reviewed here', 'the sources cited', "
-    "'as discussed above', 'this paper argues', 'we will examine', or any other "
-    "reference to the review document itself."
+    # v14.2.1 simplification: trimmed from ~190 words to ~80. Citation-format
+    # material (evidence-ID syntax, multi-source preference, narrative-form
+    # guidance) moved to _SYSTEM_CITATION_INSTRUCTION where format belongs.
+    # "Do not restate the thesis" absorbed from the three per-section
+    # instructions so it lives in one place instead of three.
+    "Write in a scholarly register. Argue in direct positive claims; avoid "
+    "contrastive framings such as 'not X but Y', 'rather than', 'unlike', "
+    "or 'in contrast'. Vary sentence length; introduce claims as full "
+    "sentences rather than via colon setups. "
+    # v12 multi-doc rule.
+    "Each paragraph must integrate at least two DISTINCT documents; do not "
+    "cite the same document for more than two consecutive citations. "
+    # v12 anti-meta + topic restate (the latter pulled in from per-section
+    # builders; also enforced by the prev-tail strong directive in v14.2 cond D).
+    "Make claims directly about the substantive question. Do NOT write meta-"
+    "statements about the review itself ('this review', 'the literature "
+    "reviewed here', 'as discussed above', 'we will examine'). "
+    "Do not restate the topic or the thesis."
 )
 
 # v8 (R4): single canonical set of prompt builders. The previous file had two
@@ -1397,6 +1406,28 @@ _PROSE_DIRECTIVE = (
 # Each stance builder now has a structurally DISTINCT instruction so the
 # resulting paragraphs read as substantively different arguments rather than
 # three parallel templates with one verb swapped.
+
+def _prev_tail_block(previous_tail: str) -> str:
+    """v14.2 cond D: render the 'Previous ending: …' block with an optional
+    strong directive (RRR_WRITER_PREV_TAIL_STRONG=1) that explicitly tells the
+    writer NOT to restate the topic and instead continue from the tail. Returns
+    the formatted block; safe to include even when previous_tail is empty (the
+    opening section's first call has no prior chunk)."""
+    if not previous_tail:
+        return ""
+    block = f"Previous ending:\n...{previous_tail}\n"
+    # v14.2 default flipped 0 -> 1: the v14.2 cond D smoke showed the strong
+    # directive cut mean seam count from 3.3 (cond A) to 2.3 with zero LLM
+    # cost. Set RRR_WRITER_PREV_TAIL_STRONG=0 to reproduce v14.1 prompt shape.
+    if os.environ.get("RRR_WRITER_PREV_TAIL_STRONG", "1") == "1":
+        block += (
+            "\nIMPORTANT: Open your first sentence as a natural continuation "
+            "of the Previous ending above — pick up a thread, contrast a "
+            "finding, follow a scope condition. Do NOT begin by restating the "
+            "topic on its own; the reader has just read the previous section.\n"
+        )
+    return block
+
 
 def _build_opening_prompt(topic: str, stance_summary: str, evidence: str, allowed_list: str):
     return f"""Literature review on: {topic}
@@ -1488,11 +1519,10 @@ def _build_supports_prompt(topic: str, cluster: str, evidence: str, allowed_list
     # when the writer runs sequentially (RRR_WRITER_PARALLEL=0).
     synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
     prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
+    prev_block = _prev_tail_block(previous_tail)
     return f"""Continue this literature review on: {topic}
 
-Previous ending:
-...{previous_tail}
-
+{prev_block}
 {prior_section}Theme: {cluster}. These sources SUPPORT the thesis through corroborating mechanisms, measurements, or historical conditions.
 
 ALLOWED CITATIONS:
@@ -1503,7 +1533,7 @@ ALLOWED CITATIONS:
 
 {_PROSE_DIRECTIVE}
 
-Build one chain of inference. Open by stating the shared mechanism the cluster holds in common and cite the supporting sources together in one parenthetical (per the CLUSTER SYNTHESIS above if present, otherwise the strongest 2-3 sources in Evidence). Then narrow to one source for a specific quoted phrase that establishes the mechanism; show how a second source confirms it under different conditions (period, region, measurement); then trace one downstream implication that follows. Do not list. Do not restate the thesis. 260-300 words. End mid-thought.
+Build one chain of inference. Open by stating the shared mechanism the cluster holds in common, citing the supporting sources together (per the CLUSTER SYNTHESIS above if present, else the strongest 2-3 in Evidence). Narrow to one source for a specific phrase that establishes the mechanism; show how a second source confirms it under different conditions (period, region, measurement); trace one downstream implication. 260-300 words. End mid-thought.
 
 Continue:"""
 
@@ -1514,11 +1544,10 @@ def _build_critiques_prompt(topic: str, cluster: str, evidence: str, allowed_lis
     # v8 (R4) — distinct shape: force a choice. Shorter, sharper.
     synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
     prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
+    prev_block = _prev_tail_block(previous_tail)
     return f"""Continue this literature review on: {topic}
 
-Previous ending:
-...{previous_tail}
-
+{prev_block}
 {prior_section}Theme: {cluster}. These sources CHALLENGE the thesis by identifying weak assumptions, alternative causes, or contrary evidence.
 
 ALLOWED CITATIONS:
@@ -1529,7 +1558,7 @@ ALLOWED CITATIONS:
 
 {_PROSE_DIRECTIVE}
 
-Identify the specific assumption the supporting case rests on, then quote the evidence that breaks it inside the same sentence, not after it. When the CLUSTER SYNTHESIS above identifies a shared critical move across multiple sources, name it once with a multi-citation parenthetical. Force the reader to weigh the assumption against the counter-evidence; do not list qualifications. Do not restate the thesis. 200-240 words. End mid-thought.
+Identify the specific assumption the supporting case rests on, then cite the evidence that breaks it inside the same sentence. When the CLUSTER SYNTHESIS above identifies a shared critical move across multiple sources, name it once with a multi-citation parenthetical. Force the reader to weigh the assumption against the counter-evidence. 200-240 words. End mid-thought.
 
 Continue:"""
 
@@ -1540,11 +1569,10 @@ def _build_complicates_prompt(topic: str, cluster: str, evidence: str, allowed_l
     # v8 (R4) — distinct shape: pick the binding scope condition and develop it.
     synthesis_section = (synthesis_block + "\n\n") if synthesis_block else ""
     prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
+    prev_block = _prev_tail_block(previous_tail)
     return f"""Continue this literature review on: {topic}
 
-Previous ending:
-...{previous_tail}
-
+{prev_block}
 {prior_section}Theme: {cluster}. These sources COMPLICATE the thesis by setting scope conditions, contingencies, or measurement limits.
 
 ALLOWED CITATIONS:
@@ -1555,7 +1583,7 @@ ALLOWED CITATIONS:
 
 {_PROSE_DIRECTIVE}
 
-Do not list qualifications. Pick the single scope condition that most narrows the supporting claim, and use one extended example to show what the thesis can and cannot explain under that condition. If the CLUSTER SYNTHESIS above names a scope condition shared across multiple sources, cite them together in one parenthetical when introducing it. Treat the qualification as reshaping the question, not as a rejection. Do not restate the thesis. 220-260 words. End mid-thought.
+Pick the single scope condition that most narrows the supporting claim, and use one extended example to show what the thesis can and cannot explain under it. If the CLUSTER SYNTHESIS above names a scope condition shared across multiple sources, cite them together when introducing it. Treat the qualification as reshaping the question, not as a rejection. 220-260 words. End mid-thought.
 
 Continue:"""
 
@@ -1571,11 +1599,10 @@ def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous
     # resolution) is preserved but reframed as ACTIVE statements grounded in
     # the cited sources, not as hypothetical assessments of what would settle
     # the question.
+    prev_block = _prev_tail_block(previous_tail)
     return f"""Close this literature review on: {topic}
 
-Previous ending:
-...{previous_tail}
-
+{prev_block}
 ALLOWED CITATIONS:
 {allowed_list}
 
@@ -1662,8 +1689,12 @@ def _ollama_chat(prompt: str, metrics=None, stage="writer"):
 
 
 def _apply_full_essay_harmonisation(full_text: str, topic: str, metrics=None):
-    """v14.1 (Option A): one same-model LLM call that rewrites the FULL
-    assembled chunked essay for prose continuity.
+    """v14.1 (Option A): one LLM call that rewrites the FULL assembled chunked
+    essay for prose continuity. v14.2 added two knobs to address mistral-small's
+    citation-drift failures: RRR_HARMONISE_DRIFT_TOLERANCE (allow ≤N missing
+    tuples while still forbidding inventions of new documents) and
+    RRR_HARMONISE_MODEL (override the harmoniser model — useful for testing
+    qwen3:32b against mistral-small:24b on the same draft).
 
     Background. The v14 single-pass writer experiment (pod_outputs/
     runpod_20260628_213140) confirmed that the mistral family wraps up around
@@ -1673,28 +1704,41 @@ def _apply_full_essay_harmonisation(full_text: str, topic: str, metrics=None):
     expanding any individual writer call. The cross-section stitch (v11-B)
     already rewrites the FIRST SENTENCE of each interior section; this
     harmonisation pass goes broader, rewriting the whole essay's prose flow
-    while a strict citation-set check protects every (Doc_Year: p.N) token.
+    while a citation-set check protects every (Doc_Year: p.N) token.
 
     Operates on the canonical-form essay (citations already normalised to
     (Doc_Year: p.N) by the prior display->canonical step). On any verification
     failure the original text is returned unchanged.
 
     Returns (text, stats_dict). stats keys: applied (bool), fallback_reason,
-    cite_count_in, cite_count_out, len_in, len_out, duration_s.
+    cite_count_in, cite_count_out, len_in, len_out, duration_s, model,
+    drift_tolerance.
 
     Toggle: RRR_WRITER_HARMONISE (default 1; set 0 to disable for the v13.1.1
     chunked baseline comparison).
     """
+    harmonise_model = os.environ.get("RRR_HARMONISE_MODEL", _MODEL)
+    # v14.2 default flipped 0 -> 1: the v14.2 12-run shoot-out showed that with
+    # tolerance=0 mistral-small:24b rejected 3/3 full-essay rewrites; with
+    # tolerance=1 + invented-doc safety check, 2/3 accept (the 1 rejection was
+    # the safety net catching a malformed `_2001` cite). See current_status.md
+    # v14.2 section.
+    try:
+        drift_tol = max(0, int(os.environ.get("RRR_HARMONISE_DRIFT_TOLERANCE", "1")))
+    except ValueError:
+        drift_tol = 1
     stats = {
         "applied": False, "fallback_reason": "disabled",
         "cite_count_in": 0, "cite_count_out": 0,
         "len_in": len(full_text or ""), "len_out": len(full_text or ""),
         "duration_s": 0.0,
+        "model": harmonise_model, "drift_tolerance": drift_tol,
     }
     if not full_text or os.environ.get("RRR_WRITER_HARMONISE", "1") != "1":
         return full_text, stats
 
-    # Canonical cite tuples are the contract we must preserve EXACTLY.
+    # Canonical cite tuples are the contract we must preserve EXACTLY (default)
+    # or within drift_tol tuples (when RRR_HARMONISE_DRIFT_TOLERANCE is set).
     orig_cites = sorted([(m.group(1), int(m.group(2))) for m in CITE_RE.finditer(full_text)])
     stats["cite_count_in"] = len(orig_cites)
     if not orig_cites:
@@ -1741,7 +1785,7 @@ def _apply_full_essay_harmonisation(full_text: str, topic: str, metrics=None):
     try:
         import ollama
         res = ollama.chat(
-            model=_MODEL,
+            model=harmonise_model,
             messages=[{"role": "user", "content": prompt}],
             options=options,
             keep_alive=_KEEP_ALIVE,
@@ -1751,14 +1795,14 @@ def _apply_full_essay_harmonisation(full_text: str, topic: str, metrics=None):
     except Exception as e:
         stats["fallback_reason"] = f"llm_call_failed:{type(e).__name__}"
         if metrics:
-            metrics.record_llm("writer_harmonise", _MODEL, options=options,
+            metrics.record_llm("writer_harmonise", harmonise_model, options=options,
                                success=False, error=e)
         return full_text, stats
     duration = time.perf_counter() - start
     stats["duration_s"] = round(duration, 2)
     if metrics:
         metrics.record_llm(
-            "writer_harmonise", _MODEL, options=options,
+            "writer_harmonise", harmonise_model, options=options,
             duration_s=duration,
             prompt_chars=len(prompt),
             response_chars=len(raw),
@@ -1770,17 +1814,41 @@ def _apply_full_essay_harmonisation(full_text: str, topic: str, metrics=None):
         stats["fallback_reason"] = "empty_response"
         return full_text, stats
 
-    # Citation-preservation check: every (doc_id, page) tuple must still be present
-    # with the same multiplicity.
+    # Citation-preservation check. Default (drift_tol=0): every (doc_id, page)
+    # tuple must still be present with the same multiplicity. With drift_tol>0:
+    # allow up to `drift_tol` unique tuples to be dropped, but reject any new
+    # tuple whose doc_id was NOT cited anywhere in the original (prevents
+    # invention of new corpus references; allows the model to re-cite an
+    # existing doc at an existing page in a different position).
     new_cites = sorted([(m.group(1), int(m.group(2))) for m in CITE_RE.finditer(rewritten)])
     stats["cite_count_out"] = len(new_cites)
-    if new_cites != orig_cites:
-        missing = [c for c in orig_cites if c not in new_cites]
-        added = [c for c in new_cites if c not in orig_cites]
-        stats["fallback_reason"] = (
-            f"citation_drift (missing={len(missing)} added={len(added)})"
-        )
-        return full_text, stats
+    orig_set = set(orig_cites)
+    new_set = set(new_cites)
+    missing_tuples = orig_set - new_set
+    added_tuples = new_set - orig_set
+    orig_docs = {c[0] for c in orig_cites}
+    invented_doc_tuples = [c for c in added_tuples if c[0] not in orig_docs]
+    if drift_tol == 0:
+        if new_cites != orig_cites:
+            stats["fallback_reason"] = (
+                f"citation_drift (missing={len(missing_tuples)} added={len(added_tuples)})"
+            )
+            return full_text, stats
+    else:
+        if invented_doc_tuples:
+            stats["fallback_reason"] = (
+                f"invented_doc (new_docs={sorted({c[0] for c in invented_doc_tuples})[:3]} tol={drift_tol})"
+            )
+            return full_text, stats
+        if len(missing_tuples) > drift_tol:
+            stats["fallback_reason"] = (
+                f"too_many_missing (missing={len(missing_tuples)} tol={drift_tol})"
+            )
+            return full_text, stats
+        # Track diagnostic drift even when accepted.
+        stats["accepted_with_drift"] = {
+            "missing": len(missing_tuples), "added": len(added_tuples),
+        }
 
     # Length check: rewrite must be within [85%, 120%] of original character length.
     lo, hi = 0.85 * stats["len_in"], 1.20 * stats["len_in"]
@@ -1795,16 +1863,338 @@ def _apply_full_essay_harmonisation(full_text: str, topic: str, metrics=None):
     return rewritten, stats
 
 
+def _apply_per_paragraph_harmonisation(full_text: str, topic: str, metrics=None):
+    """v14.2 condition A: rewrite each paragraph independently for prose flow
+    while preserving every canonical citation tuple exactly within that
+    paragraph. Each paragraph with >=1 canonical citation is sent in isolation
+    with the original previous paragraph as context. Per-paragraph rejection
+    isolates cost — a 4/12 paragraph rejection still ships 8 improved
+    paragraphs, vs the full-essay pass that loses everything on a single drift.
+
+    Returns (text, stats_dict). stats keys mirror the full-essay function but
+    add paragraphs_total / paragraphs_with_cites / paragraphs_rewritten /
+    paragraphs_rejected / rejection_reasons dict.
+    """
+    import time
+    harmonise_model = os.environ.get("RRR_HARMONISE_MODEL", _MODEL)
+    stats = {
+        "applied": False,
+        "fallback_reason": "off",
+        "mode": "per_para",
+        "model": harmonise_model,
+        "paragraphs_total": 0,
+        "paragraphs_with_cites": 0,
+        "paragraphs_rewritten": 0,
+        "paragraphs_rejected": 0,
+        "rejection_reasons": {},
+        "cite_count_in": 0,
+        "cite_count_out": 0,
+        "len_in": len(full_text or ""),
+        "len_out": 0,
+        "duration_s": 0.0,
+    }
+    if not full_text or os.environ.get("RRR_WRITER_HARMONISE", "1") != "1":
+        return full_text, stats
+
+    paragraphs = full_text.split("\n\n")
+    stats["paragraphs_total"] = len(paragraphs)
+    orig_cites_total = [(m.group(1), int(m.group(2))) for m in CITE_RE.finditer(full_text)]
+    stats["cite_count_in"] = len(orig_cites_total)
+    if not orig_cites_total:
+        stats["fallback_reason"] = "no_canonical_cites_to_protect"
+        return full_text, stats
+
+    options = {"temperature": 0.3, "num_ctx": 8192, "num_predict": 1200, "top_p": 0.9}
+
+    start = time.perf_counter()
+    out_paras = []
+    prev_para_for_context = ""
+    for para in paragraphs:
+        cites_in_para = sorted(
+            [(m.group(1), int(m.group(2))) for m in CITE_RE.finditer(para)]
+        )
+        if not cites_in_para:
+            out_paras.append(para)
+            prev_para_for_context = para
+            continue
+        stats["paragraphs_with_cites"] += 1
+
+        prev_para_block = prev_para_for_context if prev_para_for_context else \
+            "[this is the opening paragraph of the review]"
+        prompt = (
+            "You are revising one paragraph of a literature review for prose "
+            "continuity with the previous paragraph. Rewrite the paragraph so:\n\n"
+            "- It FLOWS naturally from the previous paragraph (pick up a thread, "
+            "contrast a finding, follow a scope condition). Do NOT open by "
+            "restating the topic framing on its own.\n"
+            "- Every (Doc_Year: p.N) citation token appears EXACTLY as in the "
+            "original — same docs, same pages, same multiplicity. (Hard-checked; "
+            "on any drift the original paragraph ships unchanged.)\n"
+            "- Preserve every substantive claim. You may reorder sentences within "
+            "the paragraph if it improves flow.\n"
+            "- Length within plus-or-minus 20% of the input.\n"
+            "- Output ONLY the rewritten paragraph; no preamble, no labels.\n\n"
+            f"Topic: {topic}\n\n"
+            f"Previous paragraph:\n{prev_para_block}\n\n"
+            f"Paragraph to revise:\n{para}\n\n"
+            "Begin the revision now:"
+        )
+
+        try:
+            import ollama
+            res = ollama.chat(
+                model=harmonise_model,
+                messages=[{"role": "user", "content": prompt}],
+                options=options,
+                keep_alive=_KEEP_ALIVE,
+                stream=False,
+            )
+            raw = (res.get("message", {}).get("content") or "").strip()
+        except Exception as e:
+            stats["rejection_reasons"]["llm_error"] = (
+                stats["rejection_reasons"].get("llm_error", 0) + 1
+            )
+            out_paras.append(para)
+            prev_para_for_context = para
+            stats["paragraphs_rejected"] += 1
+            if metrics:
+                metrics.record_llm("writer_harmonise_para", harmonise_model,
+                                   options=options, success=False, error=e)
+            continue
+
+        rewritten_para = _strip_wrapping(raw)
+        if not rewritten_para:
+            stats["rejection_reasons"]["empty"] = (
+                stats["rejection_reasons"].get("empty", 0) + 1
+            )
+            out_paras.append(para)
+            prev_para_for_context = para
+            stats["paragraphs_rejected"] += 1
+            continue
+
+        new_cites = sorted(
+            [(m.group(1), int(m.group(2))) for m in CITE_RE.finditer(rewritten_para)]
+        )
+        if new_cites != cites_in_para:
+            stats["rejection_reasons"]["citation_drift"] = (
+                stats["rejection_reasons"].get("citation_drift", 0) + 1
+            )
+            out_paras.append(para)
+            prev_para_for_context = para
+            stats["paragraphs_rejected"] += 1
+            continue
+
+        lo, hi = 0.80 * len(para), 1.20 * len(para)
+        if not (lo <= len(rewritten_para) <= hi):
+            stats["rejection_reasons"]["length"] = (
+                stats["rejection_reasons"].get("length", 0) + 1
+            )
+            out_paras.append(para)
+            prev_para_for_context = para
+            stats["paragraphs_rejected"] += 1
+            continue
+
+        out_paras.append(rewritten_para)
+        prev_para_for_context = para  # use ORIGINAL prev for next context
+        stats["paragraphs_rewritten"] += 1
+        if metrics:
+            metrics.record_llm("writer_harmonise_para", harmonise_model,
+                               options=options,
+                               prompt_chars=len(prompt),
+                               response_chars=len(raw))
+
+    duration = time.perf_counter() - start
+    stats["duration_s"] = round(duration, 2)
+
+    new_text = "\n\n".join(out_paras)
+    stats["len_out"] = len(new_text)
+    stats["cite_count_out"] = sum(1 for _ in CITE_RE.finditer(new_text))
+
+    if stats["paragraphs_rewritten"] > 0:
+        stats["applied"] = True
+        stats["fallback_reason"] = "ok"
+    elif stats["paragraphs_with_cites"] == 0:
+        stats["fallback_reason"] = "no_paragraphs_with_cites"
+    else:
+        stats["fallback_reason"] = "all_paragraphs_rejected"
+    return new_text, stats
+
+
+_FABRICATED_QUOTE_RE = re.compile(r'"([^"\n]{20,})"')
+_NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
+
+
+def _normalise_for_quote_match(s: str) -> str:
+    """Lowercase + drop all quote marks + collapse whitespace + drop most
+    punctuation. Matches the script the workflow investigator used so the
+    in-pipeline check agrees with offline scans."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[\"'`“”‘’«»]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None):
+    """v14.2 fix #1: scan the assembled essay for every '"..."' span >=20 chars,
+    locate the nearest canonical (doc_id: p.N) citation within +/-200 chars,
+    and verify the normalised quoted text is a substring of
+    data/page_text/{doc_id}_page_{N}.txt. Sentences containing an
+    UNVERIFIED quote are stripped.
+
+    The check normalises both sides (lowercase, drop quote marks, collapse
+    whitespace) so OCR-spaced page text and the model's tidy prose can still
+    match. Runs AFTER _display_to_canonical (so the cite form is canonical and
+    doc_id is directly resolvable) and BEFORE harmonisation (so the harmoniser
+    operates on cleaned input). Pre-existing E1/E2 checks operate on the
+    same canonical form so the verifier shares the lookup contract.
+
+    Returns (text, stats_dict). stats keys:
+      checked_quotes, verified_real, fabricated_stripped,
+      fabricated_kept_no_citation, fabricated_kept_doc_not_in_corpus,
+      fabricated_kept_page_not_readable, fabrications[], duration_s.
+
+    The `fabrications` list records (quote, doc_id, page, action) for each
+    strip so the metric is auditable.
+
+    Disabled when RRR_QUOTE_VERIFY=0 (default 1). Defensive: any unexpected
+    error returns the original text unchanged with fallback_reason set.
+    """
+    import time
+    from rrr.paths import page_text_path
+
+    stats = {
+        "enabled": True,
+        "checked_quotes": 0,
+        "verified_real": 0,
+        "fabricated_stripped": 0,
+        "fabricated_kept_no_citation": 0,
+        "fabricated_kept_doc_not_in_corpus": 0,
+        "fabricated_kept_page_not_readable": 0,
+        "fabrications": [],
+        "duration_s": 0.0,
+        "fallback_reason": "ok",
+    }
+    if os.environ.get("RRR_QUOTE_VERIFY", "1") != "1":
+        stats["enabled"] = False
+        stats["fallback_reason"] = "disabled"
+        return full_text, stats
+    if not full_text:
+        stats["fallback_reason"] = "empty_text"
+        return full_text, stats
+
+    allowed_doc_set = set(allowed_docs or ())
+    start = time.perf_counter()
+    page_text_cache: dict = {}
+
+    def _load_page_text(doc_id: str, page: int):
+        key = (doc_id, page)
+        if key in page_text_cache:
+            return page_text_cache[key]
+        try:
+            p = page_text_path(doc_id, page)
+            if p.is_file():
+                txt = p.read_text(encoding="utf-8", errors="replace")
+                page_text_cache[key] = txt
+                return txt
+        except Exception:
+            pass
+        page_text_cache[key] = None
+        return None
+
+    spans_to_strip = []
+    for qm in _FABRICATED_QUOTE_RE.finditer(full_text):
+        stats["checked_quotes"] += 1
+        quote = qm.group(1)
+        q_start, q_end = qm.span()
+
+        win_start = max(0, q_start - 200)
+        win_end = min(len(full_text), q_end + 200)
+        window = full_text[win_start:win_end]
+        cites = list(_NEARBY_CANONICAL_CITE_RE.finditer(window))
+        if not cites:
+            stats["fabricated_kept_no_citation"] += 1
+            continue
+
+        q_center = (q_start + q_end) / 2 - win_start
+
+        def _dist(m, _q=q_center):
+            return abs((m.start() + m.end()) / 2 - _q)
+
+        nearest = min(cites, key=_dist)
+        doc_id = nearest.group(1)
+        try:
+            page = int(nearest.group(2))
+        except ValueError:
+            stats["fabricated_kept_no_citation"] += 1
+            continue
+
+        if doc_id not in allowed_doc_set:
+            stats["fabricated_kept_doc_not_in_corpus"] += 1
+            continue
+
+        page_txt = _load_page_text(doc_id, page)
+        if not page_txt:
+            stats["fabricated_kept_page_not_readable"] += 1
+            continue
+
+        norm_q = _normalise_for_quote_match(quote)
+        norm_page = _normalise_for_quote_match(page_txt)
+        if norm_q and norm_q in norm_page:
+            stats["verified_real"] += 1
+            continue
+
+        # Fabricated quote. Strip the SENTENCE containing it.
+        sent_start = q_start
+        while sent_start > 0 and full_text[sent_start - 1] not in ".?!\n":
+            sent_start -= 1
+        while sent_start < q_start and full_text[sent_start] in " \t":
+            sent_start += 1
+        sent_end = q_end
+        while sent_end < len(full_text) and full_text[sent_end - 1] not in ".?!\n":
+            sent_end += 1
+        spans_to_strip.append((sent_start, sent_end, quote, doc_id, page))
+
+    if spans_to_strip:
+        # Strip in reverse order so earlier strips do not shift later spans.
+        spans_to_strip.sort(key=lambda x: -x[0])
+        out = full_text
+        for sent_start, sent_end, quote, doc_id, page in spans_to_strip:
+            out = out[:sent_start] + out[sent_end:]
+            stats["fabricated_stripped"] += 1
+            stats["fabrications"].append({
+                "quote": quote[:240],
+                "doc_id": doc_id,
+                "page": page,
+                "action": "sentence_stripped",
+            })
+        out = re.sub(r"  +", " ", out)
+        out = re.sub(r"\s+\.", ".", out)
+        out = re.sub(r"\n[ \t]+\n", "\n\n", out)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+    else:
+        out = full_text
+
+    stats["duration_s"] = round(time.perf_counter() - start, 3)
+    return out, stats
+
+
 def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
-    """v11-B: rewrite the first sentence of each interior section so the
+    """v11-B: rewrite the first sentence(s) of each interior section so the
     review flows from section to section instead of each restating the topic
     framing. One batched LLM call. Falls back to the original chunks on any
-    parse / verification failure. Toggle via RRR_WRITER_STITCH (default ON).
+    parse / verification failure.
 
-    Verification: the rewritten opener must contain the SAME set of canonical
-    citations (Doc_Year: p.N) as the original; any addition or removal causes
-    that opener to be discarded. Only the opening sentence is replaced; the
-    rest of each section is untouched.
+    v14.2 cond D: RRR_WRITER_STITCH_SENTENCES (default 1) controls how many
+    opening sentences are rewritten together as a block. With N=3 the model
+    has more room to set up a transition that does not restate the topic,
+    instead of being forced to do all the work in a single sentence.
+
+    Verification: the rewritten opener block must contain the SAME set of
+    canonical citations (Doc_Year: p.N) as the original opener block; any
+    addition or removal causes that block to be discarded. Only the first N
+    sentences are replaced; the rest of each section is untouched.
     """
     import time
     # v13: RRR_WRITER_STITCH retired (always on). The v11-B stitch + v12
@@ -1815,38 +2205,52 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     if not chunks or len(chunks) < 4:
         return chunks
 
+    try:
+        stitch_n = max(1, int(os.environ.get("RRR_WRITER_STITCH_SENTENCES", "1")))
+    except ValueError:
+        stitch_n = 1
+
     interior_indices = list(range(1, len(chunks) - 1))
     extracts = []
     for i in interior_indices:
         sents = _split_sentences_for_cleanup(chunks[i])
         if not sents:
             continue
-        opener = sents[0].strip()
+        opener_sents = sents[:stitch_n]
+        opener = " ".join(s.strip() for s in opener_sents).strip()
         prev_sents = _split_sentences_for_cleanup(chunks[i - 1])
         prev_tail = prev_sents[-1].strip() if prev_sents else ""
         if not opener:
             continue
-        extracts.append({"index": i, "opener": opener, "prev_tail": prev_tail})
+        extracts.append({
+            "index": i,
+            "opener": opener,
+            "opener_sent_count": len(opener_sents),
+            "prev_tail": prev_tail,
+        })
 
     if len(extracts) < 2:
         return chunks
 
+    opener_unit = "sentence" if stitch_n == 1 else f"first {stitch_n} sentences"
     parts = [
         f"Topic of the literature review: {topic}",
         "",
-        "Below are the OPENING sentence of several adjacent sections in the "
-        "same review. Each currently restates the topic framing on its own, "
-        "which reads as several mini-essays stitched together. Rewrite each "
-        "OPENING so it flows from the previous section's last sentence — pick "
-        "up a thread, contrast a finding, follow a scope condition — rather "
-        "than re-introducing the topic.",
+        f"Below are the OPENING {opener_unit} of several adjacent sections in "
+        "the same review. Each currently restates the topic framing on its "
+        "own, which reads as several mini-essays stitched together. Rewrite "
+        f"each OPENING ({opener_unit}) so it flows from the previous "
+        "section's last sentence — pick up a thread, contrast a finding, "
+        "follow a scope condition — rather than re-introducing the topic.",
         "",
         "STRICT RULES:",
         "- Keep every (Doc_Year: p.N) citation token UNCHANGED.",
         "- Do NOT add or remove any citation.",
-        "- Do NOT exceed the original sentence length by more than ~20%.",
-        "- Return ONLY a single JSON object: "
-        '{"openings": [{"index": <int>, "rewritten": "<sentence>"}, ...]}',
+        "- Do NOT exceed the original block length by more than ~20%.",
+        f"- Return ONLY a single JSON object whose 'rewritten' field is the "
+        f"{opener_unit} (joined into one string, original sentence-boundary "
+        f"order preserved): "
+        '{"openings": [{"index": <int>, "rewritten": "<text>"}, ...]}',
         "",
         "Sections to stitch:",
     ]
@@ -1931,6 +2335,7 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     # a paraphrase. Floor at 4 so a 5-word topic doesn't trip on coincidence.
     paraphrase_threshold = max(4, int(0.66 * len(topic_tokens)))
 
+    opener_sent_count_by_index = {e["index"]: e["opener_sent_count"] for e in extracts}
     for r in rewrites:
         if not isinstance(r, dict):
             continue
@@ -1945,8 +2350,10 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         sents = _split_sentences_for_cleanup(new_chunks[idx])
         if not sents:
             continue
-        orig_opener = sents[0]
-        orig_cites = sorted(cite_token_re.findall(orig_opener))
+        n_open = opener_sent_count_by_index.get(idx, 1)
+        n_open = min(n_open, len(sents))
+        orig_opener_block = " ".join(s.strip() for s in sents[:n_open])
+        orig_cites = sorted(cite_token_re.findall(orig_opener_block))
         new_cites = sorted(cite_token_re.findall(rewritten))
         if orig_cites != new_cites:
             skipped_citation += 1
@@ -1974,8 +2381,7 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
             ):
                 skipped_tail_echo += 1
                 continue
-        sents[0] = rewritten
-        new_chunks[idx] = " ".join(sents)
+        new_chunks[idx] = " ".join([rewritten] + [s.strip() for s in sents[n_open:]])
         applied += 1
 
     if metrics:
@@ -2550,34 +2956,116 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     if display_to_canonical_count and metrics:
         metrics.inc("writer_display_to_canonical", display_to_canonical_count)
 
-    # v14.1 (Option A): full-essay harmonisation pass. One same-model LLM call
-    # rewrites the assembled chunked essay for prose continuity while a strict
-    # canonical-cite-set check protects every (Doc_Year: p.N) tuple. Sits AFTER
-    # display->canonical so it operates on a single stable citation surface,
-    # and BEFORE the validation/cleanup arms below so any prose it produces
-    # still passes through the same scrubbers as the original draft.
+    # v14.2 fix #1: quote verification. Scan every '"..."' span >=20 chars,
+    # locate the nearest canonical (doc_id: p.N) citation, and verify the
+    # quoted text against the actual page text. Sentences containing an
+    # UNVERIFIED quote are stripped. Runs AFTER display->canonical (so the
+    # cite form is canonical) and BEFORE harmonisation (so the harmoniser
+    # sees a clean draft). The v14.2 investigation found 2 fabrications in
+    # the 12-run smoke; the architecture's pre-fix validators only checked
+    # citation tuples and never inspected quoted prose. Toggle via
+    # RRR_QUOTE_VERIFY=0 to disable (default 1).
     if metrics:
-        with metrics.stage("writer_harmonise"):
-            full_text, harmonise_stats = _apply_full_essay_harmonisation(
-                full_text, topic, metrics=metrics,
+        with metrics.stage("writer_quote_verify"):
+            full_text, quote_verify_stats = _strip_fabricated_quotes(
+                full_text, allowed_docs, metrics=metrics,
             )
     else:
-        full_text, harmonise_stats = _apply_full_essay_harmonisation(
-            full_text, topic, metrics=None,
+        full_text, quote_verify_stats = _strip_fabricated_quotes(
+            full_text, allowed_docs, metrics=None,
         )
+    if metrics:
+        metrics.set("writer_quote_verification", quote_verify_stats)
+        if quote_verify_stats.get("fabricated_stripped"):
+            metrics.inc(
+                "writer_fabricated_quotes_stripped",
+                int(quote_verify_stats["fabricated_stripped"]),
+            )
+    if quote_verify_stats.get("fabricated_stripped"):
+        print(
+            f"[Writer] Quote verifier: {quote_verify_stats['fabricated_stripped']} "
+            f"fabricated quote(s) stripped from "
+            f"{quote_verify_stats['checked_quotes']} checked "
+            f"(verified_real={quote_verify_stats['verified_real']}, "
+            f"kept_no_cite={quote_verify_stats['fabricated_kept_no_citation']}, "
+            f"kept_doc_not_in_corpus={quote_verify_stats['fabricated_kept_doc_not_in_corpus']}, "
+            f"kept_page_unreadable={quote_verify_stats['fabricated_kept_page_not_readable']})"
+        )
+        for fab in quote_verify_stats["fabrications"][:5]:
+            print(
+                f"         - ({fab['doc_id']}: p.{fab['page']}) "
+                f"\"{fab['quote'][:120]}...\""
+            )
+    elif quote_verify_stats.get("checked_quotes"):
+        print(
+            f"[Writer] Quote verifier: {quote_verify_stats['verified_real']}/"
+            f"{quote_verify_stats['checked_quotes']} quotes verified as real "
+            f"(0 fabrications)"
+        )
+
+    # v14.1 / v14.2 harmonisation dispatcher. RRR_HARMONISE_MODE selects:
+    #   "full"     — v14.1 single-LLM-call full-essay rewrite (default)
+    #   "per_para" — v14.2 cond A: per-paragraph rewrite, per-para citation
+    #                guard; rejection isolated to one paragraph
+    #   "off"      — skip the post-hoc rewrite entirely (use when relying on
+    #                chunk-gen-side fixes: extended stitch + strong prev-tail)
+    # Sits AFTER display->canonical so it operates on a stable citation
+    # surface, BEFORE validation/cleanup so anything it produces still passes
+    # through the same scrubbers as the original draft.
+    harmonise_mode = os.environ.get("RRR_HARMONISE_MODE", "full").lower()
+    if harmonise_mode == "off" or os.environ.get("RRR_WRITER_HARMONISE", "1") != "1":
+        harmonise_stats = {
+            "applied": False,
+            "fallback_reason": "mode_off" if harmonise_mode == "off" else "disabled",
+            "mode": harmonise_mode,
+            "cite_count_in": 0, "cite_count_out": 0,
+            "len_in": len(full_text), "len_out": len(full_text),
+            "duration_s": 0.0,
+        }
+    elif harmonise_mode == "per_para":
+        if metrics:
+            with metrics.stage("writer_harmonise"):
+                full_text, harmonise_stats = _apply_per_paragraph_harmonisation(
+                    full_text, topic, metrics=metrics,
+                )
+        else:
+            full_text, harmonise_stats = _apply_per_paragraph_harmonisation(
+                full_text, topic, metrics=None,
+            )
+    else:  # "full" (default)
+        if metrics:
+            with metrics.stage("writer_harmonise"):
+                full_text, harmonise_stats = _apply_full_essay_harmonisation(
+                    full_text, topic, metrics=metrics,
+                )
+        else:
+            full_text, harmonise_stats = _apply_full_essay_harmonisation(
+                full_text, topic, metrics=None,
+            )
+        harmonise_stats.setdefault("mode", "full")
     if metrics:
         metrics.set("writer_harmonisation", harmonise_stats)
         if harmonise_stats.get("applied"):
             metrics.inc("writer_harmonisation_applied")
     if harmonise_stats.get("applied"):
-        print(
-            f"[Writer] Harmonisation applied: "
-            f"{harmonise_stats['len_in']}ch -> {harmonise_stats['len_out']}ch, "
-            f"{harmonise_stats['cite_count_in']} cites preserved, "
-            f"{harmonise_stats['duration_s']}s"
-        )
+        if harmonise_mode == "per_para":
+            print(
+                f"[Writer] Harmonisation (per-para) applied: "
+                f"{harmonise_stats['paragraphs_rewritten']}/"
+                f"{harmonise_stats['paragraphs_with_cites']} paragraphs "
+                f"rewritten, {harmonise_stats['duration_s']}s "
+                f"(rejected: {dict(harmonise_stats.get('rejection_reasons') or {})})"
+            )
+        else:
+            print(
+                f"[Writer] Harmonisation (full) applied: "
+                f"{harmonise_stats['len_in']}ch -> {harmonise_stats['len_out']}ch, "
+                f"{harmonise_stats['cite_count_in']} cites preserved, "
+                f"{harmonise_stats['duration_s']}s"
+            )
     else:
-        print(f"[Writer] Harmonisation skipped/rejected: {harmonise_stats.get('fallback_reason')}")
+        print(f"[Writer] Harmonisation skipped/rejected: mode={harmonise_mode} "
+              f"reason={harmonise_stats.get('fallback_reason')}")
 
     # v13: removed the legacy final-assembly arms (_repair_year_only_citations,
     # _fix_ajr_abbreviation, _strip_placeholder_citations, _extract_citation_dumps,

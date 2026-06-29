@@ -4,11 +4,17 @@ import os, json, re, time
 # v13: RRR_PLANNER_T/CTX/PRED, RRR_PLANNER_TERMS_T/CTX/PRED, RRR_PLANNER_PROBE_CAP
 # retired. These were per-stage CTX/PRED/T tuning knobs the v8-v12 work
 # converged on; no caller in scripts/, README, or pod configs overrode them.
-_PLANNER_OPTIONS = {"temperature": 0.1, "num_ctx": 2048, "num_predict": 700}
+# v14.2: temperature 0.1 -> 0.0 on planner stages. Per the v14.2
+# investigation, the planner is the only LLM call upstream of BM25 retrieval,
+# and its output (probes) is NOT cached on disk — so any sampling at T>0
+# perturbs evidence extraction across runs even with identical topic + model.
+# At T=0 the same (topic, model, prompt) input deterministically returns the
+# same probes (modulo backend non-determinism, but mistral-small is stable).
+_PLANNER_OPTIONS = {"temperature": 0.0, "num_ctx": 2048, "num_predict": 700}
 # v9 (R7): second-stage planner asks for domain technical vocabulary the topic
 # statement does not contain. Smaller budget than stage 1 because we want a
-# tight list of phrases.
-_TERMS_OPTIONS = {"temperature": 0.1, "num_ctx": 2048, "num_predict": 300}
+# tight list of phrases. v14.2: T 0.1 -> 0.0 for the same reason as above.
+_TERMS_OPTIONS = {"temperature": 0.0, "num_ctx": 2048, "num_predict": 300}
 # v9 (R7): max probes after merging stage 1 + stage 2. Stage 1 caps at 8; stage
 # 2 can add up to (PROBE_CAP - len(stage1)) novel technical phrases.
 _PROBE_CAP = 12

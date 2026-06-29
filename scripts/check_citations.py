@@ -1,19 +1,37 @@
 #!/usr/bin/env python3
 """
-check_citations.py — E1/E2/E3 citation integrity checker.
+check_citations.py — citation + quote integrity checker.
 
-Parses a composed review (.md) and checks every (DocId: p.N) citation against
-the corpus metadata.csv and per-document page counts in data/*.json.
+Parses a composed review (.md) and checks every citation surface against the
+corpus (metadata.csv + per-doc page counts in data/*.json), then verifies any
+direct-quoted prose against the actual page_text on disk.
 
-Error taxonomy:
-    E1  Fabricated document — doc_id not in metadata.csv
-    E2  Invalid page       — cited page exceeds doc's content-page count
-    E3  Format violation   — citation-like pattern that misses strict format
+v14.2 error taxonomy (expanded from the original E1/E2/E3):
+    E1  Fabricated document    — doc_id not in metadata.csv (canonical /
+                                  display / loose surfaces all checked)
+    E2  Invalid page           — cited page exceeds doc's content-page count
+    E3  Format violation       — citation-like pattern that misses strict
+                                  format. Now HARD-only: page-only (p.5),
+                                  doc-without-page, multi-page citation,
+                                  square-bracket dump. Author-year-text
+                                  surfaces (e.g. "Hopkins (2009)" without a
+                                  page) are no longer E3 — they appear in
+                                  e3_soft for visibility but do NOT count
+                                  toward the hard failure score.
+    E4  Fabricated quote       — text inside straight double quotes near a
+                                  cite whose normalised page_text does NOT
+                                  contain the quoted span. Direct architectural
+                                  violation; the writer invented words and
+                                  attributed them to a real source.
+    E5  Mis-attributed quote   — quoted text DOES appear in the corpus on a
+                                  different page of the SAME doc than the
+                                  cited page. Real material, wrong attribution.
 
 CLI:
     python3 scripts/check_citations.py runs/review_composed.md
     python3 scripts/check_citations.py runs/review_composed.md --json results.json
     python3 scripts/check_citations.py runs/review_composed.md --json -   # stdout
+    python3 scripts/check_citations.py runs/review_composed.md --no-quote-check
 
 Import:
     from check_citations import check_file, check_review
@@ -128,13 +146,14 @@ _LOOSE_AUTHOR_YEAR_RE = re.compile(
     r")\s+(\d{4})[a-z]?(?!\s*[:,]?\s*p\.)"
 )
 
-# E3 patterns: citation-like strings that fail the strict format
-_E3_PATTERNS = [
+# E3 (HARD) — citation-shaped strings that are clearly wrong:
+#   - canonical-form cite missing a page
+#   - bare page-only cite, e.g. (p.5)
+#   - multi-page packed citation, e.g. (Foo: p.5, p.7)
+#   - square-bracket evidence-id dump that survived the renderer
+_E3_HARD_PATTERNS = [
     ("doc_without_page", re.compile(r"\((?=[^)]*[A-Za-z0-9_&.\-]+_\d{4})(?![^)]*:\s*p\.)[^)]*\)")),
     ("page_only", re.compile(r"\((?:pp?\.)\s*\d+(?:\s*(?:,|-|and)\s*(?:pp?\.)?\s*\d+)*\)", re.IGNORECASE)),
-    ("author_year_text", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?\s*\(\d{{4}}\)")),
-    ("author_year_possessive", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?'s\s*\(\d{{4}}\)")),
-    ("author_year_parenthetical", re.compile(rf"\({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?,\s*\d{{4}}\)")),
     ("multi_page_citation", re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\s*,\s*p\.\d+[^)]*\)")),
     ("square_bracket_dump", re.compile(
         r"^\s*\[[^\]\n]*[A-Za-z0-9_&.\-]+:\s*p\.\d+[^\]\n]*(?:;\s*[A-Za-z0-9_&.\-]+:\s*p\.\d+|,\s*p\.\d+)[^\]\n]*\]\s*$",
@@ -142,14 +161,93 @@ _E3_PATTERNS = [
     )),
 ]
 
+# E3 (SOFT) — display-form narrative mentions WITHOUT a page number. These are
+# legitimate prose surfaces in many cases (e.g. "Hopkins (2009) argues that..."
+# followed by a fully-paged citation later in the paragraph), and the writer
+# system prompt does already require pages on every cite. We count them for
+# visibility (`e3_soft` in the result) but do NOT count them in `e3` so the
+# v14.1 false-positive over-counting against well-formed reviews is gone.
+_E3_SOFT_PATTERNS = [
+    ("author_year_text", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?\s*\(\d{{4}}\)")),
+    ("author_year_possessive", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?'s\s*\(\d{{4}}\)")),
+    ("author_year_parenthetical", re.compile(rf"\({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?,\s*\d{{4}}\)")),
+]
+
+# E4 / E5 helpers — straight-double-quoted spans of >=20 chars; nearby
+# canonical (doc: p.N) cite within +/- 200 chars.
+_QUOTED_SPAN_RE = re.compile(r'"([^"\n]{20,})"')
+_NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
+# Display-form cite for quote attribution lookup when the canonical form is
+# absent (e.g. when checking the FINAL user-facing review where cites have
+# already been display-rewritten). We re-use the existing DISPLAY_CITE_RE /
+# DISPLAY_PAREN_CITE_RE patterns when checking display-form reviews.
+_QUOTE_WINDOW_CHARS = 200
+
+
+def _normalise_for_quote_match(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[\"'`“”‘’«»]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _load_page_text(doc_id: str, page: int, page_text_dir: str):
+    """Read data/page_text/{doc_id}_page_{N}.txt; return None on miss."""
+    try:
+        p = os.path.join(page_text_dir, f"{doc_id}_page_{int(page)}.txt")
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8", errors="replace") as f:
+                return f.read()
+    except Exception:
+        pass
+    return None
+
+
+def _find_other_pages_with_quote(doc_id: str, quote: str, page_text_dir: str, exclude_page: int):
+    """E5 detection: scan ALL pages of a doc for the normalised quote span.
+    Returns the page number(s) where the quote DOES appear (excluding the
+    cited page). Empty list means the quote is truly fabricated, not just
+    mis-attributed."""
+    if not os.path.isdir(page_text_dir):
+        return []
+    needle = _normalise_for_quote_match(quote)
+    if not needle:
+        return []
+    matches = []
+    import glob as _glob
+    for path in _glob.glob(os.path.join(page_text_dir, f"{doc_id}_page_*.txt")):
+        fname = os.path.basename(path)
+        m = re.match(rf"^{re.escape(doc_id)}_page_(\d+)\.txt$", fname)
+        if not m:
+            continue
+        page = int(m.group(1))
+        if page == exclude_page:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if needle in _normalise_for_quote_match(f.read()):
+                    matches.append(page)
+        except Exception:
+            continue
+    return sorted(matches)
+
 
 def _load_valid_docs(metadata_path):
-    """Load set of valid doc_ids from metadata CSV."""
+    """Load set of valid doc_ids from metadata CSV (stdlib csv — no pandas
+    dependency so the checker works in minimal environments)."""
     if not os.path.isfile(metadata_path):
         return set()
-    import pandas as pd
-    df = pd.read_csv(metadata_path)
-    return set(str(x) for x in df["doc_id"])
+    import csv as _csv
+    out = set()
+    with open(metadata_path, encoding="utf-8") as f:
+        reader = _csv.DictReader(f)
+        for row in reader:
+            did = row.get("doc_id")
+            if did:
+                out.add(str(did))
+    return out
 
 
 def _load_doc_max_pages(data_dir):
@@ -180,14 +278,22 @@ def _load_doc_max_pages(data_dir):
     return doc_max
 
 
-def check_review(text, metadata_path="metadata.csv", data_dir="data"):
+def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_check=True):
     """
-    Check a review text string for E1/E2/E3 errors.
+    Check a review text string for E1/E2/E3/E4/E5 errors.
 
-    Returns dict with n_citations, e1, e2, e3, docs_cited, details, word_count.
+    Returns dict with:
+      n_citations, e1, e2, e3, e3_soft, e4, e5,
+      docs_cited, n_docs_cited, word_count,
+      e1_details, e2_details, e3_details, e3_soft_details,
+      e4_details, e5_details, quotes_checked, quotes_verified.
+
+    `quote_check` toggles the E4/E5 scan (cheap; off only for backwards
+    compatibility with callers that don't want disk reads of page_text).
     """
     valid_docs = _load_valid_docs(metadata_path)
     doc_max = _load_doc_max_pages(data_dir)
+    page_text_dir = os.path.join(data_dir, "page_text")
 
     # v13.1 (FIX-F): build the author/year lookups from the corpus so we can
     # resolve display-form citations the writer emits ("Author (Year, p.N)"
@@ -359,53 +465,167 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data"):
         else:
             docs_cited.add(did)
 
-    # E3: loose citation patterns outside strict format. v13.1 (FIX-F): also
-    # exclude spans that were already classified by the display-form scan
-    # above — otherwise legitimate "Author (Year, p.N)" surfaces get
-    # double-counted as E3 (author_year_text/author_year_parenthetical).
+    # E3 HARD: format violations that are unambiguously broken (page-only,
+    # canonical cite missing a page, multi-page packed cite, bracket dump).
+    # v13.1 (FIX-F): exclude spans already classified by the display-form scan
+    # so a legitimate "Author (Year, p.N)" surface is not double-counted.
     e3 = 0
     e3_details = []
     accounted_spans = strict_spans + display_spans
-    for reason, pat in _E3_PATTERNS:
+    for reason, pat in _E3_HARD_PATTERNS:
         for m in pat.finditer(text):
             if not any(s <= m.start() < e for s, e in accounted_spans):
                 e3 += 1
                 ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
                 e3_details.append({"reason": reason, "raw": m.group(0), "context": ctx})
 
+    # E3 SOFT: display-form author-year mentions without a page number. These
+    # do not count toward the hard E3 score but are surfaced for visibility.
+    # The writer prompt asks for pages on every cite — a high e3_soft count
+    # signals the writer is dropping pages, which is a prose-quality concern
+    # rather than a fabrication.
+    e3_soft = 0
+    e3_soft_details = []
+    for reason, pat in _E3_SOFT_PATTERNS:
+        for m in pat.finditer(text):
+            if not any(s <= m.start() < e for s, e in accounted_spans):
+                e3_soft += 1
+                ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
+                e3_soft_details.append({"reason": reason, "raw": m.group(0), "context": ctx})
+
+    # E4 / E5: quote-text integrity. Scan every "..." span >=20 chars, find
+    # the nearest cite (canonical or display), and check whether the quoted
+    # text appears in the cited doc's page text. If not on the cited page but
+    # present on a different page of the same doc -> E5 (mis-attribution). If
+    # absent from every page of that doc -> E4 (fabricated).
+    e4 = 0
+    e5 = 0
+    e4_details = []
+    e5_details = []
+    quotes_checked = 0
+    quotes_verified = 0
+    if quote_check and os.path.isdir(page_text_dir):
+        for qm in _QUOTED_SPAN_RE.finditer(text):
+            quote = qm.group(1)
+            q_start, q_end = qm.span()
+            win_start = max(0, q_start - _QUOTE_WINDOW_CHARS)
+            win_end = min(len(text), q_end + _QUOTE_WINDOW_CHARS)
+            window = text[win_start:win_end]
+
+            # Look for canonical cites first; fall back to display cites.
+            doc_id = None
+            page = None
+            canonical_cites = list(_NEARBY_CANONICAL_CITE_RE.finditer(window))
+            if canonical_cites:
+                q_center = (q_start + q_end) / 2 - win_start
+                nearest = min(canonical_cites,
+                              key=lambda m: abs((m.start() + m.end()) / 2 - q_center))
+                doc_id = nearest.group(1)
+                try:
+                    page = int(nearest.group(2))
+                except ValueError:
+                    pass
+            else:
+                # Fallback: display cite resolution (for final user-facing reviews).
+                disp_matches = []
+                for pat in (DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE):
+                    for m in pat.finditer(window):
+                        disp_matches.append(m)
+                if disp_matches:
+                    q_center = (q_start + q_end) / 2 - win_start
+                    nearest = min(disp_matches,
+                                  key=lambda m: abs((m.start() + m.end()) / 2 - q_center))
+                    label, year = nearest.group(1), nearest.group(2)
+                    try:
+                        page = int(nearest.group(3))
+                    except (ValueError, IndexError):
+                        page = None
+                    doc_id = _resolve_display_label(label, year)
+
+            ctx = text[max(0, q_start - 80):q_end + 80].replace("\n", " ").strip()
+            if not doc_id or page is None or doc_id not in valid_docs:
+                # No actionable attribution — skip the quote check.
+                continue
+            quotes_checked += 1
+            page_txt = _load_page_text(doc_id, page, page_text_dir)
+            if page_txt is None:
+                continue
+            norm_q = _normalise_for_quote_match(quote)
+            if norm_q and norm_q in _normalise_for_quote_match(page_txt):
+                quotes_verified += 1
+                continue
+            # Quote is not on the cited page. Check other pages of the same
+            # doc — if it appears elsewhere, that's E5 (mis-attribution);
+            # otherwise E4 (fabrication).
+            other_pages = _find_other_pages_with_quote(doc_id, quote, page_text_dir,
+                                                       exclude_page=page)
+            if other_pages:
+                e5 += 1
+                e5_details.append({
+                    "doc_id": doc_id, "cited_page": page,
+                    "found_on_pages": other_pages,
+                    "quote": quote[:240], "context": ctx,
+                })
+            else:
+                e4 += 1
+                e4_details.append({
+                    "doc_id": doc_id, "cited_page": page,
+                    "quote": quote[:240], "context": ctx,
+                })
+
     word_count = len(re.findall(r"\b\w+\b", text))
 
+    # v14.2: n_citations now sums canonical + display + loose. Final
+    # user-facing reviews are always in display form (the canonical form is
+    # only the internal validation surface), so counting canonical-only made
+    # the checker report n_citations=0 on every real review — a confusing
+    # gap that masked review quality.
+    n_canonical = len(citations)
+    n_display = len(display_spans)
+    n_total_citations = n_canonical + n_display
+
     return {
-        "n_citations": len(citations),
+        "n_citations": n_total_citations,
+        "n_canonical_citations": n_canonical,
+        "n_display_citations": n_display,
         "e1": e1, "e2": e2, "e3": e3,
+        "e3_soft": e3_soft,
+        "e4": e4, "e5": e5,
         "docs_cited": sorted(docs_cited),
         "n_docs_cited": len(docs_cited),
         "word_count": word_count,
+        "quotes_checked": quotes_checked,
+        "quotes_verified": quotes_verified,
         "e1_details": e1_details,
         "e2_details": e2_details,
         "e3_details": e3_details,
+        "e3_soft_details": e3_soft_details,
+        "e4_details": e4_details,
+        "e5_details": e5_details,
     }
 
 
-def check_file(path, metadata_path="metadata.csv", data_dir="data"):
+def _empty_result(reason):
+    return {
+        "n_citations": 0, "e1": 0, "e2": 0, "e3": 0, "e3_soft": 0,
+        "e4": 0, "e5": 0,
+        "docs_cited": [], "n_docs_cited": 0, "word_count": 0,
+        "quotes_checked": 0, "quotes_verified": 0,
+        "e1_details": [], "e2_details": [], "e3_details": [],
+        "e3_soft_details": [], "e4_details": [], "e5_details": [],
+        "refusal": True, "reason": reason,
+    }
+
+
+def check_file(path, metadata_path="metadata.csv", data_dir="data", quote_check=True):
     """Check a review file by path. Handles missing/empty files as refusal."""
     if not os.path.isfile(path):
-        return {
-            "n_citations": 0, "e1": 0, "e2": 0, "e3": 0,
-            "docs_cited": [], "n_docs_cited": 0, "word_count": 0,
-            "e1_details": [], "e2_details": [],
-            "refusal": True, "reason": "file_not_found",
-        }
+        return _empty_result("file_not_found")
     with open(path, encoding="utf-8") as f:
         text = f.read()
     if len(text.strip()) < 100:
-        return {
-            "n_citations": 0, "e1": 0, "e2": 0, "e3": 0,
-            "docs_cited": [], "n_docs_cited": 0, "word_count": 0,
-            "e1_details": [], "e2_details": [],
-            "refusal": True, "reason": "empty_output",
-        }
-    r = check_review(text, metadata_path, data_dir)
+        return _empty_result("empty_output")
+    r = check_review(text, metadata_path, data_dir, quote_check=quote_check)
     r["refusal"] = False
     return r
 
@@ -417,11 +637,14 @@ if __name__ == "__main__":
     ap.add_argument("review", help="Path to review markdown file")
     ap.add_argument("--metadata", default="metadata.csv")
     ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--no-quote-check", action="store_true",
+                    help="Skip E4/E5 (quoted-text verification against page_text)")
     ap.add_argument("--json", nargs="?", const="-", default=None,
                     help="Output JSON (path, or '-' for stdout)")
     args = ap.parse_args()
 
-    result = check_file(args.review, args.metadata, args.data_dir)
+    result = check_file(args.review, args.metadata, args.data_dir,
+                        quote_check=not args.no_quote_check)
 
     if args.json is not None:
         out = json.dumps(result, indent=2, ensure_ascii=False)
@@ -431,11 +654,19 @@ if __name__ == "__main__":
             with open(args.json, "w", encoding="utf-8") as f:
                 f.write(out)
     else:
-        print(f"Citations: {result['n_citations']}   Words: {result.get('word_count', 0)}")
-        print(f"E1 (fabricated doc):  {result['e1']}")
-        print(f"E2 (invalid page):   {result['e2']}")
-        print(f"E3 (format):         {result['e3']}")
-        print(f"Docs cited:          {result['n_docs_cited']}")
+        print(f"Citations: {result['n_citations']} "
+              f"(canonical={result.get('n_canonical_citations', 0)}, "
+              f"display={result.get('n_display_citations', 0)})   "
+              f"Words: {result.get('word_count', 0)}")
+        print(f"E1 (fabricated doc):       {result['e1']}")
+        print(f"E2 (invalid page):         {result['e2']}")
+        print(f"E3 (hard format):          {result['e3']}")
+        print(f"  e3_soft (no-page mention): {result.get('e3_soft', 0)}")
+        print(f"E4 (fabricated quote):     {result.get('e4', 0)}")
+        print(f"E5 (mis-attributed quote): {result.get('e5', 0)}")
+        print(f"  quotes checked / verified: {result.get('quotes_checked', 0)} / "
+              f"{result.get('quotes_verified', 0)}")
+        print(f"Docs cited:                {result['n_docs_cited']}")
         if result.get("refusal"):
             print(f"REFUSAL: {result.get('reason', 'unknown')}")
         if result["e1_details"]:
@@ -456,6 +687,20 @@ if __name__ == "__main__":
                 print(f"  {d['doc_id']}: cited p.{d['cited_page']}, "
                       f"max p.{d['max_valid_page']} (+{d['overshoot']})")
         if result.get("e3_details"):
-            print("\nE3 details:")
+            print("\nE3 (hard) details:")
             for d in result["e3_details"][:20]:
                 print(f"  {d['reason']}: {d['raw']}")
+        if result.get("e3_soft_details"):
+            print(f"\ne3_soft details (first 5 of {len(result['e3_soft_details'])}):")
+            for d in result["e3_soft_details"][:5]:
+                print(f"  {d['reason']}: {d['raw']}")
+        if result.get("e4_details"):
+            print("\nE4 (FABRICATED QUOTE) details:")
+            for d in result["e4_details"]:
+                print(f"  {d['doc_id']} p.{d['cited_page']}: \"{d['quote'][:120]}...\"")
+        if result.get("e5_details"):
+            print("\nE5 (MIS-ATTRIBUTED QUOTE) details:")
+            for d in result["e5_details"]:
+                pages = ", ".join(f"p.{p}" for p in d["found_on_pages"][:5])
+                print(f"  {d['doc_id']} cited p.{d['cited_page']} -> actually on {pages}: "
+                      f"\"{d['quote'][:120]}...\"")
