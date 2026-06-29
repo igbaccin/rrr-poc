@@ -1,11 +1,21 @@
 import argparse, os, pandas as pd, re
-from pdfminer.high_level import extract_text
+import pymupdf
 from rrr.utils import sha256_file, ensure_dir, save_json
 from rrr.paths import data_path
 from rrr.text import normalize_text, sentence_spans
 from multiprocessing import Pool, cpu_count
 
-# Reference section markers (case-insensitive check done separately)
+# v14.3: extractor swapped pdfminer.six -> PyMuPDF after the v14.3 extraction
+# audit (workflow wf_b750f0f0-eeb) showed PyMuPDF: 14-44x faster, 0 fi/fl
+# ligatures vs pdfminer's 3186 across 488 pages, 0 double-space runs (vs
+# pervasive), preserves per-character font/superscript metadata. Cleanup
+# pipeline in scripts/clean_page_text.py handles residual artifacts.
+
+# Reference section markers (case-insensitive check done separately).
+# v14.3: dropped the leading `\b` boundary on the inline REFERENCES match so
+# glued headers like `control.REFERENCESAlatas` (observed in Stoler_1989 p.23,
+# Austin_2007 p.24, Austin_2008 p.26, Allen_2001 p.31, Kuznets_1973 p.12,
+# Peters_2004 p.38) get detected. The line-anchored patterns stay strict.
 _REF_HEADERS = [
     r'^\s*REFERENCES\s*$',
     r'^\s*References\s*$',
@@ -21,15 +31,47 @@ _REF_HEADERS = [
     r'^\s*SOURCES\s*$',
 ]
 
+# v14.3: inline matcher catches glued reference-headers (no leading word
+# boundary). Returns a re.Match so we can use the match's position to split
+# the page.
+_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)', re.IGNORECASE)
+
+
 def _has_reference_header(page_text: str) -> bool:
-    """Check if page contains a reference section header."""
+    """Check if page contains a reference section header (line-anchored or
+    glued inline)."""
     for pattern in _REF_HEADERS:
         if re.search(pattern, page_text, re.MULTILINE):
             return True
-    # Also check for header followed by typical reference formatting
-    if re.search(r'\bREFERENCES\b', page_text, re.IGNORECASE):
+    if _INLINE_REFERENCES_RE.search(page_text):
         return True
     return False
+
+
+def _truncate_at_reference_header(page_text: str) -> tuple:
+    """v14.3: when a reference header appears mid-page (line-anchored or
+    glued inline), return (text_before_header, True). When no header,
+    return (page_text, False).
+
+    Captures the v14.3 audit finding that pages like Allen_2001 p.31 have
+    `control.REFERENCESAlatas, S. (1977)...` — the page's pre-header content
+    is real main text and should be kept; everything after is the start of
+    the reference list and should be dropped along with subsequent pages.
+    """
+    earliest = len(page_text)
+    found = False
+    for pattern in _REF_HEADERS:
+        m = re.search(pattern, page_text, re.MULTILINE)
+        if m and m.start() < earliest:
+            earliest = m.start()
+            found = True
+    m_inline = _INLINE_REFERENCES_RE.search(page_text)
+    if m_inline and m_inline.start() < earliest:
+        earliest = m_inline.start()
+        found = True
+    if found:
+        return page_text[:earliest].rstrip(), True
+    return page_text, False
 
 def _is_reference_dense(page_text: str) -> bool:
     """Check if page has dense reference-list patterns."""
@@ -85,8 +127,19 @@ def _find_reference_start(pages: list) -> int:
     return -1
 
 def extract_pages(pdf_path: str):
-    text = extract_text(pdf_path)
-    pages = text.split("\x0c")
+    """v14.3: extract per-page text using PyMuPDF (was pdfminer.six).
+
+    PyMuPDF returns a Document where each page exposes `get_text()`. Unlike
+    pdfminer's high-level `extract_text` (which splits on form-feed and
+    leaves ligatures + double-spaces from column-flowed layouts), PyMuPDF
+    reads the PDF's text objects directly and produces cleaner output.
+    Empty pages (commonly the JSTOR splash or a between-section blank) are
+    dropped post-strip. normalize_text still applies for unicode hyphen /
+    quote canonicalisation; the scripts/clean_page_text.py pass adds the
+    heavier-weight cleanup steps.
+    """
+    with pymupdf.open(pdf_path) as doc:
+        pages = [page.get_text() for page in doc]
     pages = [p.strip() for p in pages if p.strip()]
     pages = [normalize_text(p) for p in pages]
     return pages
@@ -106,10 +159,10 @@ def _process_one(row_dict):
     try:
         h = sha256_file(pdf)
         pages = extract_pages(pdf)
-        
+
         # Find where references start
         ref_start = _find_reference_start(pages)
-        
+
         # Determine which pages to keep
         if ref_start > 0:
             content_pages = pages[:ref_start]
@@ -117,6 +170,19 @@ def _process_one(row_dict):
         else:
             content_pages = pages
             ref_pages = 0
+
+        # v14.3: when the FIRST reference page contains main-text content
+        # before the header (e.g. Allen_2001 p.31: "...political control.
+        # REFERENCES Alatas, S. (1977)..."), truncate that page so the main
+        # text is kept and the references portion is dropped. Without this,
+        # the entire page (with its mixed content) was dropped, losing real
+        # main-text claims; or kept whole, surfacing the reference list to BM25.
+        if ref_start > 0:
+            boundary_page = pages[ref_start]
+            trimmed, truncated = _truncate_at_reference_header(boundary_page)
+            if truncated and trimmed:
+                content_pages = content_pages + [trimmed]
+                ref_pages -= 1
         
         # Write only content pages
         for i, ptxt in enumerate(content_pages, start=1):
