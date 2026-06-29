@@ -185,10 +185,23 @@ _QUOTE_WINDOW_CHARS = 200
 
 
 def _normalise_for_quote_match(s: str) -> str:
+    """Normalise for verbatim-quote substring matching.
+
+    v14.2.2: added ellipsis-strip (`...` / `…` markers the model uses to
+    indicate quote truncation are removed before the substring check) and
+    OCR hyphen-line-break joining (pdfminer often produces `deteriora-tion`
+    where the original PDF had a soft hyphen at a line end; we rejoin so a
+    modern-prose quote of `deterioration` matches). Symmetric: applied to
+    both the quote AND the page text so legit hyphenated compounds like
+    `long-run` survive — both sides normalise to `longrun`.
+    """
     if not s:
         return ""
     s = s.lower()
     s = re.sub(r"[\"'`“”‘’«»]", "", s)
+    s = s.replace("…", " ")
+    s = re.sub(r"\.{2,}", " ", s)
+    s = re.sub(r"([a-z])-\s*([a-z])", r"\1\2", s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 

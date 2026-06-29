@@ -192,9 +192,12 @@ _SYSTEM_CITATION_INSTRUCTION = (
     "and use only the page numbers shown for each author.\n"
     "2. If a claim is not supported by the allowed evidence, state it WITHOUT "
     "a citation. Do not invent citations.\n"
-    "3. QUOTED TEXT: text inside straight \" \" must be copy-pasted VERBATIM "
-    "from the Evidence section. Paraphrase OUTSIDE quotation marks. "
-    "Fabricated quotes are stripped from the final review.\n\n"
+    "3. QUOTED TEXT: DEFAULT TO PARAPHRASE. Reserve quotation marks (\" \") "
+    "for SHORT phrases (≤12 words) where you copy-pasted the exact wording "
+    "from the Evidence section. Multi-sentence quotes, ellipsis-truncated "
+    "quotes ('...' inside \" \"), and paraphrased-but-quoted material are "
+    "all fabrications and get stripped from the final review. When in "
+    "doubt, paraphrase WITHOUT quotation marks.\n\n"
     "FORMAT RULES:\n"
     "4. Every citation includes a page; one page per citation; pages stay "
     "inside the parens (never 'pp.5-7' or 'pp.5, 7').\n"
@@ -2025,13 +2028,39 @@ _NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 
 
 def _normalise_for_quote_match(s: str) -> str:
-    """Lowercase + drop all quote marks + collapse whitespace + drop most
-    punctuation. Matches the script the workflow investigator used so the
-    in-pipeline check agrees with offline scans."""
+    """Normalise for verbatim-quote substring matching.
+
+    Lowercases, drops quote marks (straight + smart) and ellipsis markers,
+    joins OCR hyphen-line-breaks (`deteriora-tion` from the PDF extractor
+    becomes `deterioration` so a modern-prose quote of `deterioration` can
+    match the original page text), and collapses whitespace.
+
+    v14.2.2: added ellipsis-strip + hyphen-join after the v14.2.1 smoke
+    showed two false-positive strips — Nunn p.4 had `deteriora-tion` in
+    the page text vs `deterioration` in the model output; Acemoglu p.33
+    had a real first-half quote that the model truncated with `...`. Both
+    are now matched correctly.
+    """
     if not s:
         return ""
     s = s.lower()
+    # Drop quote marks (straight + curly/smart).
     s = re.sub(r"[\"'`“”‘’«»]", "", s)
+    # Drop ellipsis markers (the model often inserts `...` or `…` to mark
+    # truncation inside what is otherwise a verbatim quote; the cited
+    # text after the ellipsis IS on the page, but the strict substring
+    # check fails because the literal `...` is not).
+    s = s.replace("…", " ")
+    s = re.sub(r"\.{2,}", " ", s)
+    # Join OCR hyphen-line-breaks: `word-\nword`, `word- word`, and the
+    # in-text `word-word` artifact where pdfminer inserted a hyphen at a
+    # line-end without preserving the newline. Conservative: only join
+    # when the hyphen sits between two lowercase alphabetic chars (so
+    # legit compounds like `long-run`, `cross-section` survive — they
+    # have lowercase on both sides too, hmm, see note). The pdfminer
+    # OCR pattern is `letter-letter` mid-word; the model paraphrasing
+    # writes the dehyphenated form. We rejoin to make them match.
+    s = re.sub(r"([a-z])-\s*([a-z])", r"\1\2", s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
