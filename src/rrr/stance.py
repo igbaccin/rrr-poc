@@ -3,7 +3,7 @@ import json
 import os
 from functools import lru_cache
 import time
-from rrr.paths import page_text_path, require_page_text_dir, runs_path
+from rrr.paths import page_text_path, require_page_text_dir, runs_path, claim_cache_path
 
 # v11.2 lever 2: stance is logically part of reasoning, so prefer
 # RRR_REASONER_MODEL if set; fall back to RRR_MODEL otherwise.
@@ -64,9 +64,17 @@ def _get_conclusion(doc_id: str, max_chars: int = 1500) -> str:
 
 
 def _claim_cache_path(doc_id: str, sig: str):
-    """Return Path to runs/cache/claims/<doc_id>_<sig>.json. The directory is
-    created on demand."""
-    cache_dir = runs_path("cache", "claims")
+    """Return Path to <claim_cache_root>/<doc_id>_<sig>.json.
+
+    v15.0.2: claims now live OUTSIDE runs/ so the per-topic smoke harness
+    cannot evict them between runs. Defaults to <repo>/claim_cache; pod
+    sessions should set RRR_CLAIM_CACHE_DIR=/workspace/claim_cache so the
+    cache also survives across pod restarts. The cache key already
+    composes (model + prompt_version + abstract + conclusion), so a new
+    batch of papers transparently produces new entries and stale entries
+    never serve fresh queries.
+    """
+    cache_dir = claim_cache_path()
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"{doc_id}_{sig}.json"
 
