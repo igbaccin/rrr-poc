@@ -55,3 +55,16 @@ def runs_path(*parts) -> Path:
 
 def logs_path(*parts) -> Path:
     return repo_path("logs", *parts)
+
+
+def claim_cache_path(*parts) -> Path:
+    """Persistent, content-keyed claim cache root.
+
+    Lives OUTSIDE runs/ so the smoke harness (which wipes runs/cache between
+    topics) cannot evict it. Override with RRR_CLAIM_CACHE_DIR to point at a
+    location that survives across sessions (e.g. /workspace/claim_cache on an
+    ephemeral pod), making per-paper claim extraction a true one-time cost.
+    """
+    override = os.environ.get("RRR_CLAIM_CACHE_DIR")
+    base = Path(override).expanduser() if override else repo_path("claim_cache")
+    return base.joinpath(*parts)

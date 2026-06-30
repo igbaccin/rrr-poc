@@ -1,7 +1,9 @@
 from typing import List
 import os, subprocess, json, re, ast, hashlib, time
 from rrr.utils import ensure_dir
-from rrr.stance import classify_evidence_stance
+# v15: classify_evidence_stance no longer called — discrete per-paper stance
+# replaced by corpus-level outline (build_outline) from rrr.outline.
+from rrr.outline import build_outline
 from rrr.metrics import RunMetrics
 from rrr.manifest import write_run_manifest
 from rrr.paths import runs_path, logs_path
@@ -1446,6 +1448,24 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         }
 
     def enrich_doc(doc):
+        # v15: per-doc enrichment SHRINKS to claim extraction only. The fused
+        # stance+mechanism call (v14.4) is gone — corpus-level outline now
+        # handles clustering and the per-cluster posture replaces per-doc
+        # stance. Claim extraction stays (cached per paper, content-keyed) so
+        # the outline.cluster_papers call has accurate inputs.
+        did = doc["doc_id"]
+        from rrr.stance import extract_paper_claim
+        claim_info = extract_paper_claim(did, metrics=metrics)
+        paper_claim = claim_info.get("claim", "")
+        metrics.inc("docs_kept")
+        enriched = dict(doc)
+        enriched["claim"] = paper_claim
+        enriched["claim_source"] = claim_info.get("source", "")
+        return enriched
+
+    # v15: legacy fused/mechanism path retained as dead code below for
+    # reference; not called from the main pipeline. Cleanup in a follow-up.
+    def _v14_enrich_doc_legacy(doc):
         did = doc["doc_id"]
         valid_quotes = doc.get("quotes", [])
         ev_texts = []
@@ -1454,12 +1474,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             clipped = (text[:220] + "...") if len(text) > 220 else text
             ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
 
-        # v14.4 Shape B: extract the paper's central claim from abstract +
-        # conclusion BEFORE the stance call. This is cached per-paper (not per
-        # topic), so the cost amortises across all topics run against the same
-        # corpus. The cached claim is injected into the fused stance prompt so
-        # the classifier sees what the paper ARGUES, not just BM25-selected
-        # snippets that are often biased toward concessive/descriptive prose.
         from rrr.stance import extract_paper_claim
         claim_info = extract_paper_claim(did, metrics=metrics)
         paper_claim = claim_info.get("claim", "")
@@ -1660,34 +1674,10 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 if res:
                     doc_summaries.append(res)
 
-    print("[Layered-T2] clustering mechanisms...")
-    with metrics.stage("clustering"):
-        mech_to_cluster = _cluster_mechanisms(doc_summaries, topic, metrics=metrics)
-
-    for doc in doc_summaries:
-        primary = None
-        for m in doc.get("mechanisms", []):
-            m = (m or "").strip()
-            if m:
-                primary = m
-                break
-        doc["cluster"] = mech_to_cluster.get(primary, "Other") if primary else "Other"
-
-    # v11-C: cluster-level synthesis. One LLM call per (stance, cluster) bucket
-    # of >=2 docs producing a shared mechanism + supporting/qualifying split.
-    # The writer renders this as a multi-doc citation block instead of
-    # presenting each doc as a separate witness.
-    cluster_syntheses_raw = {}
-    with metrics.stage("cluster_synthesis"):
-        cluster_syntheses_raw = _synthesise_clusters(doc_summaries, topic, metrics=metrics)
-    # Serialise tuple keys to "stance::cluster_label" for JSON storage.
-    cluster_syntheses = {
-        f"{stance}::{cluster_label}": synth
-        for (stance, cluster_label), synth in cluster_syntheses_raw.items()
-    }
-    if cluster_syntheses_raw:
-        print(f"[Layered-T2] cluster syntheses: {len(cluster_syntheses_raw)} produced")
-
+    # v15: assign evidence IDs and persist per-doc artefacts FIRST so the
+    # outline builder (and the writer downstream) can reference stable
+    # evidence anchors. Outline is built next from the persisted doc
+    # summaries (claim + quotes).
     evidence_id_count = _assign_evidence_ids(doc_summaries)
     metrics.set("evidence_ids_assigned", evidence_id_count)
 
@@ -1712,71 +1702,98 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     metrics.set("topic_fit_represented_share", topic_fit.get("represented_share"))
     print(f"[Layered-T2] per-document sweep complete: {kept} docs summarised")
 
-    # Print stance distribution
-    from collections import Counter
-    stance_counts = Counter(d.get("stance", "tangential") for d in doc_summaries)
-    metrics.set("stance_distribution", dict(stance_counts))
-    print(f"[Layered-T2] stance distribution: {dict(stance_counts)}")
+    # v15: corpus-level OUTLINE replaces per-paper stance + within-stance
+    # cluster synthesis. Three LLM calls (Stage 1 cluster + Stage 2 posture
+    # per cluster + Stage 3 order) produce an outline_plan with topic_shape,
+    # clusters, postures, and the section order for the writer.
+    print("[Layered-T2] building corpus-level outline (v15)...")
+    with metrics.stage("outline"):
+        outline_plan = build_outline(topic, doc_summaries, metrics=metrics)
+    if outline_plan is None:
+        print("[Layered-T2] refusal=outline_failed (Stage 1 returned no clusters)")
+        write_run("T2_LAYERED_GLOBAL", topic,
+                  {"docs_seen": len(all_doc_ids), "docs_represented": kept},
+                  {"refusal": True, "reason": "outline_failed",
+                   "explanation": "Outline Stage 1 (clustering) failed to "
+                                  "produce a valid plan. Inspect "
+                                  "metrics.llm_calls for the failure mode."})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", "outline_failed")
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
+                   "refusal": "outline_failed"},
+        )
+        metrics.save()
+        return
 
-    # v14.4: corpus-fit refusal. If the dominant stance is `tangential` for a
-    # large fraction of admitted docs, the corpus does not substantively
-    # engage with the topic — refuse to write a literature review rather than
-    # composing one over thin coverage. Threshold tunable via
-    # RRR_TANGENTIAL_REFUSAL_THRESHOLD (default 0.7). Disable with =1.0.
-    # Also emits a softer bucket-sanity warning when ANY of the substantive
-    # stances (supports/critiques/complicates) is empty despite >=10 admitted
-    # docs — this often signals stance-classifier failure rather than corpus
-    # composition (e.g. the v14.3 INST runs had 0 critiques because the
-    # classifier was systematically rounding critique-with-rival-cause down
-    # to complicates).
+    # Propagate cluster_id and relation onto each doc_summary so existing
+    # downstream code that walks doc_summaries (writer's evidence id map,
+    # citation validators) keeps working. Unassigned docs get cluster_id=""
+    # and relation="unassigned".
+    cluster_id_by_doc = {}
+    relation_by_doc = {}
+    for c in outline_plan.get("clusters", []):
+        for did in c.get("doc_ids", []):
+            cluster_id_by_doc[did] = c["cluster_id"]
+            relation_by_doc[did] = c["relation"]
+    for d in doc_summaries:
+        did = d.get("doc_id", "")
+        d["cluster_id"] = cluster_id_by_doc.get(did, "")
+        d["relation"] = relation_by_doc.get(did, "unassigned")
+
+    # Surface relation distribution + topic shape on metrics for smoke
+    # inspection. The smoke contract: AJR/Nunn must land in
+    # `upstream_of_topic_cause` (not `rival_to_topic_cause`).
+    metrics.set("outline_topic_shape", outline_plan.get("topic_shape"))
+    metrics.set("relation_distribution", outline_plan.get("relation_distribution"))
+    metrics.set("outline_unassigned_share", outline_plan.get("unassigned_share"))
+    metrics.set("outline_clusters_count", len(outline_plan.get("clusters", [])))
+    print(f"[Layered-T2] topic_shape={outline_plan.get('topic_shape')} "
+          f"clusters={len(outline_plan.get('clusters', []))} "
+          f"unassigned_share={outline_plan.get('unassigned_share')} "
+          f"relations={outline_plan.get('relation_distribution')}")
+
+    # v15: corpus-fit refusal — fires when too many admitted papers could not
+    # be clustered into any stream. This is the structural analogue of
+    # v14.4's tangential-fraction refusal but driven by the outline's own
+    # unassigned bucket, which is a much sharper signal than per-paper
+    # stance because Stage 1 sees the whole corpus at once. Threshold knob:
+    # RRR_UNASSIGNED_REFUSAL_THRESHOLD (default 0.5). Disable with >=1.0.
     try:
-        tangential_threshold = float(os.environ.get("RRR_TANGENTIAL_REFUSAL_THRESHOLD", "0.7"))
+        unassigned_threshold = float(os.environ.get("RRR_UNASSIGNED_REFUSAL_THRESHOLD", "0.5"))
     except ValueError:
-        tangential_threshold = 0.7
-    # Guard against a zero or negative threshold accidentally refusing
-    # every run that has >=5 admitted docs (since 0.0 satisfies '>= 0.0'
-    # even when tangential_share is 0). Valid range is (0.0, 1.0]; clamp
-    # anything outside that to disable the check.
-    if tangential_threshold <= 0.0 or tangential_threshold > 1.0:
-        tangential_threshold = 1.01  # effectively disabled
-    total_admitted = sum(stance_counts.values()) or 1
-    tangential_share = stance_counts.get("tangential", 0) / total_admitted
-    metrics.set("tangential_share", round(tangential_share, 3))
-    empty_substantive_buckets = [
-        b for b in ("supports", "critiques", "complicates")
-        if stance_counts.get(b, 0) == 0
-    ]
-    if empty_substantive_buckets and total_admitted >= 10:
-        metrics.set("empty_substantive_buckets", empty_substantive_buckets)
-        print(f"[Layered-T2] WARN: empty stance buckets despite {total_admitted} "
-              f"admitted docs: {empty_substantive_buckets} — possible "
-              f"stance-classifier mis-routing; inspect cache/fused/ for misclassifications")
-    if tangential_share >= tangential_threshold and total_admitted >= 5:
+        unassigned_threshold = 0.5
+    if unassigned_threshold <= 0.0 or unassigned_threshold > 1.0:
+        unassigned_threshold = 1.01  # effectively disabled
+    unassigned_share = float(outline_plan.get("unassigned_share") or 0.0)
+    total_admitted = outline_plan.get("admitted_total") or kept
+    if unassigned_share >= unassigned_threshold and total_admitted >= 5:
         print(f"[Layered-T2] refusal=corpus_off_topic "
-              f"(tangential {stance_counts.get('tangential',0)}/{total_admitted} "
-              f"= {tangential_share:.0%} >= threshold {tangential_threshold:.0%})")
+              f"(unassigned {len(outline_plan.get('unassigned_doc_ids', []))}/"
+              f"{total_admitted} = {unassigned_share:.0%} >= "
+              f"threshold {unassigned_threshold:.0%})")
         write_run("T2_LAYERED_GLOBAL", topic,
                   {"docs_seen": len(all_doc_ids), "docs_represented": kept,
-                   "tangential_share": round(tangential_share, 3)},
+                   "unassigned_share": unassigned_share},
                   {"refusal": True, "reason": "corpus_off_topic",
                    "explanation": (
-                       f"{stance_counts.get('tangential',0)} of {total_admitted} "
-                       f"admitted documents do not substantively engage with this "
-                       f"topic's thesis. The corpus appears to be a poor fit for "
-                       f"the question. Consider a different corpus or a different "
+                       f"{len(outline_plan.get('unassigned_doc_ids', []))} of "
+                       f"{total_admitted} admitted documents could not be "
+                       f"clustered into any stream of literature about this "
+                       f"topic. The corpus appears to be a poor fit for the "
+                       f"question. Consider a different corpus or a different "
                        f"topic."
                    )})
         metrics.set("refusal", True)
         metrics.set("refusal_reason", "corpus_off_topic")
         write_run_manifest(
-            "T2_LAYERED_GLOBAL",
-            topic,
-            meta_path,
-            _MODEL,
-            plan=plan_obj,
+            "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
             extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
                    "refusal": "corpus_off_topic",
-                   "stance_distribution": dict(stance_counts)},
+                   "outline_topic_shape": outline_plan.get("topic_shape"),
+                   "relation_distribution": outline_plan.get("relation_distribution"),
+                   "unassigned_share": unassigned_share},
         )
         metrics.save()
         return
@@ -1799,53 +1816,54 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         return
 
     import collections
-    def _render_review_narrative(topic, doc_summaries, meta_n_total):
-        def norm(s): return re.sub(r"\s+"," ",(s or "").strip())
-        counts = collections.Counter(x.get("stance","tangential") for x in doc_summaries)
-        
-        cluster_counts = collections.Counter(x.get("cluster", "Other") for x in doc_summaries)
-        
-        def top_mechs(stance,k=8):
-            c=collections.Counter()
-            for x in doc_summaries:
-                if x.get("stance")==stance:
-                    for m in x.get("mechanisms",[]):
-                        m=norm(m)
-                        if m: c[m]+=1
-            return [m for m,_ in c.most_common(k)]
-        def notable(stance,k=6):
-            cand=[(x.get("citation") or x["doc_id"], x.get("avg_score", 0))
-                  for x in doc_summaries if x.get("stance")==stance]
-            cand.sort(key=lambda t:t[1], reverse=True)
-            return cand[:k]
-
-        lines=[]
+    def _render_review_narrative(topic, doc_summaries, meta_n_total, outline_plan):
+        # v15: narrative summary is the outline plan rendered as markdown.
+        # No stance buckets. Sections are streams ordered by Stage 3.
+        clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
+        doc_by_id = {d.get("doc_id"): d for d in doc_summaries}
+        lines = []
         lines.append("# Literature review\n")
         lines.append(f"**Topic:** {topic}\n")
-        lines.append(f"**Coverage:** {len(doc_summaries)} of {meta_n_total} documents.\n")
-        lines.append("**Stance distribution:** " + ", ".join(
-            f"{k}: {counts.get(k,0)}" for k in ["supports","critiques","complicates","tangential"]
-        ) + "\n")
-        lines.append("**Thematic clusters:** " + ", ".join(
-            f"{k} ({v})" for k, v in cluster_counts.most_common()
-        ) + "\n")
+        lines.append(f"**Topic shape:** {outline_plan.get('topic_shape','?')}\n")
+        lines.append(f"**Coverage:** {len(doc_summaries)} of {meta_n_total} documents "
+                     f"({len(clusters_by_id)} streams, "
+                     f"{len(outline_plan.get('unassigned_doc_ids', []))} unassigned).\n")
+        relations = outline_plan.get("relation_distribution", {}) or {}
+        if relations:
+            lines.append("**Relation distribution:** " +
+                         ", ".join(f"{k}: {v}" for k, v in sorted(relations.items())) + "\n")
         lines.append("---\n")
-        for sec in ["supports","critiques","complicates"]:
-            if counts.get(sec,0)==0: continue
-            lines.append(f"## {sec.capitalize()}\n")
-            mechs = top_mechs(sec, 8)
-            if mechs:
-                lines.append("**Common mechanisms/themes:**")
-                lines += [f"- {m}" for m in mechs] + [""]
-            nd = notable(sec, 6)
-            if nd:
-                lines.append("**Notable documents (by evidence relevance):**")
-                lines += [f"- {c} - avg score {s:.1f}" for c, s in nd] + [""]
-
+        for cid in outline_plan.get("ordered_cluster_ids", []) or list(clusters_by_id.keys()):
+            c = clusters_by_id.get(cid)
+            if not c:
+                continue
+            lines.append(f"## {c.get('shared_thread', cid)}  ({cid} — {c.get('relation','?')})\n")
+            elab = (c.get("elaboration") or "").strip()
+            if elab:
+                lines.append(f"**Stream posture:** {elab}\n")
+            disagreement = (c.get("internal_disagreement") or "").strip()
+            if disagreement:
+                lines.append(f"**Internal disagreement:** {disagreement}\n")
+            citations = []
+            for did in c.get("doc_ids", []):
+                d = doc_by_id.get(did) or {}
+                cite = d.get("citation") or did
+                citations.append((cite, d.get("avg_score", 0)))
+            citations.sort(key=lambda t: t[1], reverse=True)
+            if citations:
+                lines.append("**Sources:**")
+                lines += [f"- {c0} - avg score {s0:.1f}" for c0, s0 in citations] + [""]
+        unassigned_ids = outline_plan.get("unassigned_doc_ids", []) or []
+        if unassigned_ids:
+            lines.append(f"## Unassigned ({len(unassigned_ids)})\n")
+            for did in unassigned_ids:
+                d = doc_by_id.get(did) or {}
+                lines.append(f"- {d.get('citation', did)}")
+            lines.append("")
         return "\n".join(lines)
 
     ensure_dir(str(runs_path()))
-    
+
     ledger_data = {
         "topic": topic,
         "plan": plan_obj,
@@ -1859,9 +1877,11 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             "docs_selected_for_llm": len(selected_docs),
         },
         "docs": doc_summaries,
-        # v11-C: cluster-level synthesis keyed by "stance::cluster_label".
-        # Empty when RRR_CLUSTER_SYNTHESIS=0 or every cluster is a singleton.
-        "cluster_syntheses": cluster_syntheses,
+        # v15: outline_plan is now the corpus-level structure the writer
+        # consumes. It replaces the v11-C cluster_syntheses keyed by
+        # "stance::cluster_label" — clusters are top-level, not nested under
+        # discrete stance buckets.
+        "outline_plan": outline_plan,
         "restarts_required": restart_attempt
     }
     with metrics.stage("write_ledger"):
@@ -1870,23 +1890,49 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         with open(runs_path("plan.json"), "w", encoding="utf-8") as f:
             json.dump(plan_obj, f, indent=2, ensure_ascii=False)
 
-    narrative_md = _render_review_narrative(topic, doc_summaries, len(all_doc_ids))
+    narrative_md = _render_review_narrative(topic, doc_summaries, len(all_doc_ids), outline_plan)
     with open(runs_path("review_narrative.md"), "w", encoding="utf-8") as f:
         f.write(narrative_md)
 
     if not getattr(args, "narrative_only", False):
-        md_lines = [f"# Literature Review\n", f"**Topic:** {topic}\n", f"\n**Coverage:** {kept} of {len(all_doc_ids)} documents.\n", "\n---\n"]
-        def stance_key(s):
-            return {"supports":0, "complicates":1, "critiques":2, "tangential":3}.get(s.get("stance","tangential"), 3)
-        for entry in sorted(doc_summaries, key=stance_key):
-            md_lines.append(f"## {entry['citation']}")
-            md_lines.append(f"**Stance:** {entry['stance']} | **Cluster:** {entry.get('cluster', 'Other')} | **Relevance:** {entry.get('avg_score', 0):.1f}")
-            if entry["mechanisms"]:
-                md_lines.append("**Mechanisms:**"); [md_lines.append(f"- {m}") for m in entry["mechanisms"]]
-            if entry["quotes"]:
-                md_lines.append("**Quotes (page-level, with scores):**")
-                for q in entry["quotes"][:MD_QUOTE_CAP]:
-                    md_lines.append(f"- p.{q['page']} [score={q.get('score',0):.0f}]: \"{q['text']}\"")
+        md_lines = [f"# Literature Review\n", f"**Topic:** {topic}\n",
+                    f"\n**Coverage:** {kept} of {len(all_doc_ids)} documents.\n",
+                    f"\n**Topic shape:** {outline_plan.get('topic_shape','?')}\n",
+                    "\n---\n"]
+        # v15: appendix groups docs by their cluster + relation, in the
+        # outline's ordered_cluster_ids. Unassigned docs are listed last.
+        clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
+        doc_by_id = {d.get("doc_id"): d for d in doc_summaries}
+        for cid in outline_plan.get("ordered_cluster_ids", []) or list(clusters_by_id.keys()):
+            c = clusters_by_id.get(cid)
+            if not c:
+                continue
+            md_lines.append(f"## {c.get('shared_thread', cid)}  ({cid} — {c.get('relation','?')})\n")
+            elab = (c.get("elaboration") or "").strip()
+            if elab:
+                md_lines.append(f"**Stream posture:** {elab}\n")
+            for did in c.get("doc_ids", []):
+                entry = doc_by_id.get(did)
+                if not entry:
+                    continue
+                md_lines.append(f"### {entry.get('citation', did)}")
+                md_lines.append(f"**Relation:** {entry.get('relation', '?')} | "
+                                f"**Cluster:** {entry.get('cluster_id', '')} | "
+                                f"**Relevance:** {entry.get('avg_score', 0):.1f}")
+                claim = (entry.get("claim") or "").strip()
+                if claim:
+                    md_lines.append(f"**Claim:** {claim}")
+                if entry.get("quotes"):
+                    md_lines.append("**Quotes (page-level, with scores):**")
+                    for q in entry["quotes"][:MD_QUOTE_CAP]:
+                        md_lines.append(f"- p.{q['page']} [score={q.get('score',0):.0f}]: \"{q['text']}\"")
+                md_lines.append("")
+        unassigned_ids = outline_plan.get("unassigned_doc_ids", []) or []
+        if unassigned_ids:
+            md_lines.append(f"## Unassigned ({len(unassigned_ids)})\n")
+            for did in unassigned_ids:
+                entry = doc_by_id.get(did) or {}
+                md_lines.append(f"- {entry.get('citation', did)}")
             md_lines.append("")
         with open(runs_path("T2_review.md"), "w", encoding="utf-8") as f:
             f.write("\n".join(md_lines))

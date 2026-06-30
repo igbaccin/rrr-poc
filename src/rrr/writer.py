@@ -233,36 +233,35 @@ def _format_quote(q) -> str:
 
 
 def _format_doc_entry(d) -> str:
-    # Format doc entry with stance label for writer context.
-    # v9 (R3): when the fused stance+mechanism call produced rationale /
-    # mechanism / contested fields, surface them so the writer prompt has
-    # substantive per-doc anchors instead of just the stance label. Falls back
-    # silently when those fields are absent (legacy two-call path).
-    # v10: include the human-readable author-year label so the writer copies
-    # 'Acemoglu et al. (2002, p.5)' directly instead of inventing surface form.
+    """v15: per-doc evidence block for the writer. The header carries doc id
+    + display citation surface; the body carries the paper's CLAIM (from
+    Stage 0 claim extraction) plus 1-2 evidence quotes. Legacy v9-v14 fields
+    (stance, mechanism, rationale, contested, mechanisms) are no longer
+    set by the v15 reasoner — when present (from a stale ledger) they are
+    rendered for diagnostic continuity, but the new path renders only
+    `claim + quotes` per doc.
+    """
     did = str(d.get("doc_id", "")).strip()
-    stance = d.get("stance", "tangential")
     author_label = _doc_id_to_author_label(did)
-    header = f"[{did}] cite as {author_label!s}  [STANCE: {stance.upper()}]"
-    lines = [header]
+    lines = [f"[{did}] cite as {author_label!s}"]
+    claim = str(d.get("claim", "") or "").strip()
+    if claim:
+        lines.append(f"  Paper's central claim: {_clip(claim, n=240)}")
+    # Diagnostic continuity: render the legacy v14.4 anchors when present.
     lead_mechanism = str(d.get("mechanism", "") or "").strip()
     if lead_mechanism:
-        lines.append(f"  Lead mechanism: {_clip(lead_mechanism, n=180)}")
+        lines.append(f"  Lead mechanism (legacy): {_clip(lead_mechanism, n=180)}")
     rationale = str(d.get("rationale", "") or "").strip()
     if rationale:
-        lines.append(f"  Why this stance: {_clip(rationale, n=220)}")
+        lines.append(f"  Why this stance (legacy): {_clip(rationale, n=220)}")
     contested = str(d.get("contested", "") or "").strip()
     if contested:
-        lines.append(f"  What this contests: {_clip(contested, n=220)}")
+        lines.append(f"  What this contests (legacy): {_clip(contested, n=220)}")
     mechanisms = [str(m).strip() for m in d.get("mechanisms", []) if str(m).strip()]
     if mechanisms:
-        lines.append("  Mechanisms:")
+        lines.append("  Mechanisms (legacy):")
         for m in mechanisms[:2]:
             lines.append(f"  - {_clip(m, n=180)}")
-    # v12: cap quotes per doc shown to the writer. The v11.1 smoke produced
-    # paragraphs that leaned on a single source for four consecutive citations
-    # because the prompt surfaced four pages from that doc. Capping at 2
-    # forces the writer to integrate at least one other source per claim.
     quotes_per_doc = int(os.environ.get("RRR_WRITER_QUOTES_PER_DOC", "2"))
     qs = d.get("quotes") or []
     for q in qs[:max(1, quotes_per_doc)]:
@@ -1595,6 +1594,148 @@ Present the stream of literature that complicates the supporting claim. Pick the
 Continue:"""
 
 
+# =============================================================================
+# v15: single stream-section builder. Replaces the per-stance triplet
+# (_build_supports_prompt / _build_critiques_prompt / _build_complicates_prompt).
+# The cluster's posture (free-text elaboration + structural relation) is the
+# section's substantive claim; the writer never sees "supports / critiques /
+# complicates" vocabulary in its instructions.
+# =============================================================================
+
+# Human-readable, topic-agnostic glosses for each per-shape relation enum
+# value. Used by the section prompt to tell the writer HOW this stream stands
+# to the topic — structurally, never with bucket vocabulary.
+_RELATION_OPENERS = {
+    # causal shape (6 values)
+    "same_as_topic_cause":
+        "this stream develops the topic's claim using the same causal "
+        "variable under different phrasing or as a more specific instance",
+    "upstream_of_topic_cause":
+        "this stream identifies an ANTECEDENT that flows INTO the topic's "
+        "causal variable as a trigger; the stream's account complements "
+        "rather than competes with the topic's claim",
+    "downstream_of_topic_cause":
+        "this stream studies a DOWNSTREAM consequence of the topic's causal "
+        "variable; the topic's claim is taken as given and the stream adds "
+        "what follows from it",
+    "rival_to_topic_cause":
+        "this stream proposes a RIVAL cause that does NOT operate through "
+        "the topic's variable and offers a genuinely competing explanation",
+    "scope_condition":
+        "this stream identifies WHEN the topic's claim holds and when it "
+        "does not — a contingency or scope restriction on the topic's account",
+    "adjacent":
+        "this stream addresses a related but distinct question and engages "
+        "the topic only obliquely",
+    # comparative shape (5 values)
+    "endorses_topic":
+        "this stream AFFIRMS the topic's comparative judgment with "
+        "convergent evidence",
+    "reverses_topic":
+        "this stream reaches the OPPOSITE comparative verdict and reads the "
+        "evidence as supporting the inverse claim",
+    "qualifies_topic":
+        "this stream ACCEPTS the topic's comparison only under specific "
+        "conditions and identifies when the comparison breaks down",
+    "methodological_critique":
+        "this stream challenges the WAY the comparison is constructed — "
+        "the measurement, sample, or framing — without directly endorsing "
+        "or reversing the topic's verdict",
+    # descriptive shape (4 values)
+    "confirms_description":
+        "this stream's account is CONSISTENT with the topic's description "
+        "and adds corroborating evidence for the same pattern",
+    "contradicts_description":
+        "this stream's account is INCOMPATIBLE with the topic's "
+        "description and reports a different pattern in the same subject",
+    "adds_nuance":
+        "this stream ACCEPTS the topic's description but refines its scope, "
+        "magnitude, or mechanism",
+}
+
+
+def _format_outline_block(cluster: dict, doc_to_evidence_ids) -> str:
+    """v15: render a cluster's outline posture into a prompt-ready block.
+
+    Replaces v11-C's `_format_cluster_synthesis_block`. The new block carries
+    (a) the free-text elaboration the writer should render verbatim as the
+    section's posture, (b) a multi-citation list of the cluster's papers via
+    evidence IDs (the writer is told to use these together when stating the
+    shared claim), (c) internal disagreement if any.
+    """
+    if not cluster or not isinstance(cluster, dict):
+        return ""
+
+    def _eids(doc_ids):
+        out = []
+        for did in doc_ids or []:
+            ids = doc_to_evidence_ids.get(did) or []
+            if ids:
+                out.append(ids[0])
+        return out
+
+    eids = _eids(cluster.get("doc_ids", []))
+    elaboration = (cluster.get("elaboration") or "").strip()
+    disagreement = (cluster.get("internal_disagreement") or "").strip()
+    if not elaboration:
+        return ""
+
+    lines = [
+        "STREAM POSTURE (use this as the section's substantive claim about "
+        "the world; do NOT print it verbatim, but anchor the section's "
+        "argument to it):",
+        f"  {elaboration}",
+    ]
+    if len(eids) >= 2:
+        cite_block = "; ".join(f"[{e}]" for e in eids[:5])
+        lines.append(
+            f"Cite these stream members together once when stating the shared "
+            f"posture: ({cite_block})"
+        )
+    if disagreement:
+        lines.append(f"Internal disagreement to acknowledge in passing: {disagreement}")
+    return "\n".join(lines)
+
+
+def _build_stream_prompt(topic: str, cluster_label: str, evidence: str,
+                         allowed_list: str, previous_tail: str,
+                         outline_block: str = "",
+                         claims_so_far: str = "",
+                         relation: str = "",
+                         topic_shape: str = ""):
+    """v15: single section builder. Same arity as the legacy per-stance
+    builders so the dispatcher loop in compose_from_ledger does not need to
+    branch on shape. `relation` and `topic_shape` are passed through so the
+    prompt can name the stream's structural relation to the topic — without
+    any supports/critiques/complicates vocabulary.
+    """
+    outline_section = (outline_block + "\n\n") if outline_block else ""
+    prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
+    prev_block = _prev_tail_block(previous_tail)
+    relation_gloss = _RELATION_OPENERS.get(relation or "", "")
+    relation_line = (
+        f"Structural relation of this stream to the topic ({relation or 'unspecified'}): "
+        f"{relation_gloss}.\n"
+        if relation_gloss else ""
+    )
+    return f"""Continue this literature review on: {topic}
+
+{prev_block}
+{prior_section}Stream: {cluster_label}.
+{relation_line}
+ALLOWED CITATIONS:
+{allowed_list}
+
+{outline_section}Evidence:
+{evidence}
+
+{_PROSE_DIRECTIVE}
+
+Present this stream of literature. Open with a direct, substantive claim grounded in the STREAM POSTURE above — never name the stream's structural relation in the prose (no 'this stream supports/critiques/complicates'); express the relation by the shape of the argument and the sources you cite together. Cite the stream's lead and one supporting source in the same sentence when stating the shared claim. Develop the claim through one specific mechanism, condition, or pattern the sources jointly establish; trace one downstream implication that another source in the stream sharpens or qualifies. 220-300 words. End mid-thought; the next section continues the review.
+
+Continue:"""
+
+
 def _build_closing_prompt(topic: str, evidence: str, allowed_list: str, previous_tail: str):
     # v8 (R4/R6): closing must synthesise without restating prior section claims;
     # do not paraphrase the same two mechanisms that opened.
@@ -2485,92 +2626,88 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     author_year_to_docid = _build_author_year_lookup(allowed_docs)
     evidence_id_map = _build_evidence_id_map(docs)
 
-    # v11-C: read cluster syntheses from the ledger and build the doc -> [evidence_ids]
-    # reverse lookup we need to render multi-citation parentheticals. Each
-    # synthesis is keyed as "stance::cluster_label" in the ledger; unpack into a
-    # tuple-keyed dict for lookup during chunk_plan construction.
-    cluster_syntheses_raw = data.get("cluster_syntheses", {}) or {}
-    cluster_syntheses = {}
-    for key, synth in cluster_syntheses_raw.items():
-        if "::" not in key or not isinstance(synth, dict):
-            continue
-        stance_part, _, cluster_part = key.partition("::")
-        cluster_syntheses[(stance_part, cluster_part)] = synth
+    # v15: read the corpus-level OUTLINE PLAN instead of stance-bucketed
+    # cluster_syntheses. Each cluster is top-level (no nested-under-stance
+    # structure), has a relation tag + free-text elaboration, and a
+    # pre-computed section order.
+    outline_plan = data.get("outline_plan") or {}
+    if not outline_plan or not outline_plan.get("clusters"):
+        raise SystemExit("Ledger missing outline_plan or outline produced no clusters.")
+    topic_shape = outline_plan.get("topic_shape") or "causal"
+    clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
+    ordered_cluster_ids = (
+        outline_plan.get("ordered_cluster_ids")
+        or list(clusters_by_id.keys())
+    )
+
+    # Reverse lookup: doc_id -> evidence_ids (used by outline blocks for
+    # multi-citation parentheticals).
     doc_to_evidence_ids = defaultdict(list)
     for eid, ev in evidence_id_map.items():
         did = (ev.get("doc_id") or "").strip()
         if did:
             doc_to_evidence_ids[did].append(eid)
-    # Sort each doc's evidence IDs so the first one is deterministic (E0001 < E0002).
     for did in list(doc_to_evidence_ids.keys()):
         doc_to_evidence_ids[did] = sorted(doc_to_evidence_ids[did])
-    if cluster_syntheses:
-        print(f"[Writer] cluster syntheses loaded: {len(cluster_syntheses)}")
-        if metrics:
-            metrics.set("writer_cluster_syntheses_loaded", len(cluster_syntheses))
 
-    # Bucket by stance first, then by cluster
-    stance_buckets = defaultdict(lambda: defaultdict(list))
-    for d in docs:
-        stance = _get_stance(d)
-        cluster = _get_cluster(d)
-        stance_buckets[stance][cluster].append(d)
+    docs_by_id = {d.get("doc_id"): d for d in docs}
 
-    stance_counts = {s: sum(len(cl) for cl in clusters.values()) 
-                     for s, clusters in stance_buckets.items()}
-    
-    stance_summary = f"Of {len(docs)} sources, {stance_counts.get('supports', 0)} support the thesis, " \
-                     f"{stance_counts.get('critiques', 0)} offer critiques, and " \
-                     f"{stance_counts.get('complicates', 0)} add nuance or qualifications."
-    
-    print(f"[Writer] Stance distribution: {dict(stance_counts)}")
-
-    # Build chunk sequence with adaptive cluster count
-    chunk_plan = []
-    
-    def rank_clusters(stance):
-        if stance not in stance_buckets:
-            return []
-        clusters = stance_buckets[stance]
-        ranked = sorted(
-            clusters.items(),
-            key=lambda kv: sum(_score_doc(x) for x in kv[1]),
-            reverse=True
+    # Relation distribution summary for the opening prompt — describes the
+    # corpus's structural shape without any supports/critiques vocabulary.
+    relation_dist = outline_plan.get("relation_distribution") or {}
+    relation_summary_parts = []
+    for relation in sorted(relation_dist.keys()):
+        n = relation_dist[relation]
+        gloss = _RELATION_OPENERS.get(relation, relation.replace("_", " "))
+        relation_summary_parts.append(
+            f"{n} source(s) in streams whose relation to the topic is: {gloss}"
         )
-        n_docs = stance_counts.get(stance, 0)
-        max_clusters = _max_clusters_for_stance(n_docs)
-        return ranked[:max_clusters]
-    
-    def _synth_block(stance, cluster_label):
-        synth = cluster_syntheses.get((stance, cluster_label))
-        return _format_cluster_synthesis_block(synth, doc_to_evidence_ids)
+    stance_summary = (
+        f"Topic shape: {topic_shape}. Of {len(docs)} sources, " +
+        "; ".join(relation_summary_parts) + "." if relation_summary_parts
+        else f"Topic shape: {topic_shape}. {len(docs)} sources across "
+             f"{len(clusters_by_id)} streams."
+    )
+    print(f"[Writer] topic_shape={topic_shape} clusters={len(clusters_by_id)} "
+          f"relations={relation_dist}")
 
-    for cluster, cluster_docs in rank_clusters("supports"):
-        chunk_plan.append(("supports", cluster, cluster_docs,
-                           _build_supports_prompt, _synth_block("supports", cluster)))
+    # Build chunk_plan in the cluster order Stage 3 picked. Each entry uses
+    # the single v15 stream-section builder, partial-applied with the
+    # cluster's relation + topic_shape.
+    from functools import partial
+    chunk_plan = []
+    for cid in ordered_cluster_ids:
+        c = clusters_by_id.get(cid)
+        if not c or not c.get("doc_ids"):
+            continue
+        cluster_docs = [docs_by_id[did] for did in c["doc_ids"] if did in docs_by_id]
+        if not cluster_docs:
+            continue
+        outline_block = _format_outline_block(c, doc_to_evidence_ids)
+        builder = partial(_build_stream_prompt,
+                          relation=c.get("relation", ""),
+                          topic_shape=topic_shape)
+        # Reuse the legacy 5-tuple shape so the dispatcher loop below works
+        # unchanged. Position 0 ("stance") now carries the relation; position
+        # 1 ("cluster") carries the cluster's shared_thread label.
+        chunk_plan.append((
+            c.get("relation", "stream"),
+            c.get("shared_thread") or cid,
+            cluster_docs,
+            builder,
+            outline_block,
+        ))
 
-    for cluster, cluster_docs in rank_clusters("critiques"):
-        chunk_plan.append(("critiques", cluster, cluster_docs,
-                           _build_critiques_prompt, _synth_block("critiques", cluster)))
-
-    for cluster, cluster_docs in rank_clusters("complicates"):
-        chunk_plan.append(("complicates", cluster, cluster_docs,
-                           _build_complicates_prompt, _synth_block("complicates", cluster)))
-    
     if not chunk_plan:
-        raise SystemExit("No documents to write about.")
+        raise SystemExit("No clusters produced any documents to write about.")
 
-    supports_clusters = sum(1 for s, *_ in chunk_plan if s == "supports")
-    critiques_clusters = sum(1 for s, *_ in chunk_plan if s == "critiques")
-    complicates_clusters = sum(1 for s, *_ in chunk_plan if s == "complicates")
-    print(f"[Writer] Adaptive clusters: supports={supports_clusters}, critiques={critiques_clusters}, complicates={complicates_clusters}")
-    print(f"[Writer] Generating {len(chunk_plan) + 2} sections (opening + {len(chunk_plan)} stance sections + closing)...")
+    print(f"[Writer] Generating {len(chunk_plan) + 2} sections "
+          f"(opening + {len(chunk_plan)} stream sections + closing)...")
     if metrics:
         metrics.set("writer_chunk_plan", {
-            "supports": supports_clusters,
-            "critiques": critiques_clusters,
-            "complicates": complicates_clusters,
-            "total_stance_sections": len(chunk_plan),
+            "topic_shape": topic_shape,
+            "clusters_total": len(chunk_plan),
+            "relation_distribution": dict(relation_dist),
         })
 
     chunks = []
@@ -2729,11 +2866,12 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         raw = _ollama_chat(prompt, metrics=metrics, stage=stage)
         return finalize_covered_chunk(raw, prompt, chunk_docs, section_kind, stage)
 
-    # Generate opening
+    # v15: opening docs draw the top-2 by score from EACH cluster in the
+    # chunk plan, then the top 6 overall. This keeps the opening's evidence
+    # diversified across streams without referencing any stance bucket.
     opening_docs = []
-    for stance in ["supports", "complicates", "critiques"]:
-        for cluster, cluster_docs in stance_buckets[stance].items():
-            opening_docs.extend(sorted(cluster_docs, key=_score_doc, reverse=True)[:2])
+    for relation, cluster_label, cluster_docs, _builder, _block in chunk_plan:
+        opening_docs.extend(sorted(cluster_docs, key=_score_doc, reverse=True)[:2])
     opening_docs = sorted(opening_docs, key=_score_doc, reverse=True)[:6]
     
     allowed_list = _list_allowed_citations(opening_docs, allowed_pages_by_doc)
@@ -3550,7 +3688,15 @@ def compose_from_ledger_single_pass(ledger_path=None, metrics=None):
     instructions, sends ONE chat call to the writer model, runs the full v13.1.1
     postprocess pipeline on the response, and writes review_composed.md plus
     review_cited_docs.json. Mirrors compose_from_ledger's signature and output
-    contract so downstream readers don't need changes."""
+    contract so downstream readers don't need changes.
+
+    v15: NOT YET PORTED to outline_plan. v14.x cluster_syntheses no longer
+    appear in the ledger. Use RRR_WRITER_MODE=chunked (the v15 default).
+    """
+    raise SystemExit(
+        "[Writer] single-pass mode is not v15-compatible — outline_plan "
+        "replaced cluster_syntheses. Use RRR_WRITER_MODE=chunked (default)."
+    )
     ledger_path = ledger_path or str(runs_path("review_ledger.json"))
     if not os.path.isfile(ledger_path):
         raise SystemExit(f"Ledger not found: {ledger_path}")
