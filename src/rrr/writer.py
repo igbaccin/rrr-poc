@@ -114,6 +114,23 @@ _DOUBLE_PAREN_CITE_RE = re.compile(
 _NESTED_PAGE_SUFFIX_RE = re.compile(
     r"\(\(([A-Za-z0-9_&.\-]+):\s*p\.\d+\):\s*p\.\d+\)"
 )
+# v15.7: display-form double-paren patterns the audit found 50 times in the
+# v15.6 smoke shipped to users. Display surfaces:
+#   ((Author Year, p.N))          — single paren-display cite wrapped
+#   ((Author Year, p.N); (Author2 Year2, p.M)) — group of paren-display cites
+#   ((Author Year, p.N) (Author2 Year2, p.M))  — same, space-joined
+_DOUBLE_PAREN_DISPLAY_RE = re.compile(
+    r"\(\(((?:(?i:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
+    r"(?:\s+(?:and\s+(?:(?i:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
+    r"|et\s+al\.))?"
+    r"\s+\d{4}[a-z]?(?:,\s*|\s+)p\.\s*\d+)\)\)"
+)
+# Outer paren wrapping a group of inner display-paren cites separated by
+# whitespace or semicolons. Conservative: inner must be two or more cite
+# units wrapped together with no other prose in the outer paren.
+_DOUBLE_PAREN_DISPLAY_GROUP_RE = re.compile(
+    r"\(((?:\([^()]+?\)[\s;,]*){2,})\)"
+)
 
 # v10: detect-then-LLM-rewrite style enforcement. We deliberately do NOT
 # substitute forbidden words mechanically because the right replacement is
@@ -224,12 +241,19 @@ def _clip(s: str, n=260) -> str:
 
 
 def _format_quote(q) -> str:
+    # v15.7: removed trailing render_citation. The display surface
+    # 'Author (Year, p.N)' shown here was the model's training set for
+    # copy-pasting the forbidden surface into its prose. Provenance is
+    # carried by the [E####] marker plus the descriptive line ('from paper
+    # X, page Y') so the writer can attribute correctly without ever
+    # seeing the surface it is forbidden to emit.
     did = str(q.get("doc_id", "")).strip()
     pg = int(q.get("page", 0) or 0)
     tx = _clip(q.get("text", ""), n=260)
     eid = str(q.get("evidence_id", "")).strip()
     prefix = f"[{eid}] " if eid else ""
-    return f'{prefix}"{tx}" {render_citation(did, pg)}'
+    suffix = f" (from {did}, p.{pg})" if did and pg else ""
+    return f'{prefix}"{tx}"{suffix}'
 
 
 def _format_doc_entry(d) -> str:
@@ -270,10 +294,12 @@ def _format_doc_entry(d) -> str:
 
 
 def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
-    # v10: emit display form 'Author (Year, p.N)' so the writer can copy-paste
-    # directly. Each line maps an evidence_id to its rendered display citation.
-    # When the ledger lacks evidence_ids we fall back to a per-doc summary:
-    # 'Acemoglu et al. (2002): pp.5, 27, 33'.
+    # v15.7: emit DESCRIPTIVE provenance only — never the rendered display
+    # surface. Each line maps [E####] to (paper doc_id, page) plus the
+    # author surname as plain text. The writer's system prompt forbids
+    # display form '(Author Year, p.N)' yet the v15.5/v15.6 list shown
+    # the surface 32+ times per prompt, which is the source of the 16
+    # display-form leaks the v15.6 audit found. Closing the source.
     lines = []
     evidence_lines = []
     for d in docs:
@@ -282,16 +308,17 @@ def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
             eid = str(q.get("evidence_id", "")).strip()
             page = int(q.get("page", 0) or 0)
             if eid and did and page:
-                evidence_lines.append(f"  - [{eid}] -> {render_citation(did, page)}")
+                surnames = _author_surnames_only(_doc_id_to_author_label(did))
+                evidence_lines.append(
+                    f"  - [{eid}] (paper {did}, page {page}; author surname: {surnames})"
+                )
         if evidence_lines:
             continue
         pages = sorted(list(allowed_pages_by_doc.get(did, set())))
         if pages:
-            author_label = _doc_id_to_author_label(did)
-            # strip trailing ')' from the label and re-emit with pages
-            base = author_label[:-1] if author_label.endswith(")") else author_label
+            surnames = _author_surnames_only(_doc_id_to_author_label(did))
             page_str = ", ".join(f"p.{p}" for p in pages[:6])
-            lines.append(f"  - {base}, {page_str})")
+            lines.append(f"  - (paper {did}, pages {page_str}; author surname: {surnames})")
     if evidence_lines:
         return "\n".join(evidence_lines[:32])
     return "\n".join(lines)
@@ -325,7 +352,9 @@ _EID_LOOKBACK_CHARS = 80
 
 
 def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
-    """v15.6: context-aware evidence-ID renderer. For each [E####] marker:
+    """v15.7: context-aware evidence-ID renderer + attribution gate.
+
+    For each [E####] marker:
       - if the author label is IMMEDIATELY before the marker (the
         immediate prior text ends with the surname label), render as
         just '(Year, p.N)' so the result forms 'Author (Year, p.N)' —
@@ -333,25 +362,66 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
       - otherwise render as the parenthetical '(Author Year, p.N)' —
         which DISPLAY_PAREN_CITE_RE recognises.
 
+    v15.7 (attribution gate): if the lookback finds a DIFFERENT surname
+    immediately before the marker than the doc_id's expected surnames,
+    REFUSE the bare-year form (which would attach the wrong author to
+    the cite). Emit '(CorrectAuthor Year, p.N)' instead so the prose's
+    wrong surname is at least not reinforced by a year-only cite the
+    reader will attribute to that surname. Record the snippet in
+    stats['attribution_mismatches'] so the caller can decide whether to
+    trigger a coverage retry.
+
     v15.5 used a substring-anywhere-in-last-60-chars check, which fired
     on 'Mokyr argues that institutions follow from technology [E0001]'
     and rendered the marker as a bare '(1989, p.5)' embedded in lowercase
-    prose. That bare-year form matches NEITHER DISPLAY_CITE_RE nor
-    DISPLAY_PAREN_CITE_RE nor CITE_RE, so paragraphs whose only cites
-    were bare-year were dropped by _drop_zero_citation_paragraphs at
-    final assembly. The stricter adjacency check below guarantees every
-    rendered citation is visible to at least one downstream regex.
+    prose. v15.6 tightened to immediate-adjacency. v15.7 adds the
+    attribution check at the same lookback so the renderer becomes the
+    single integrity gate.
+
+    Returns (text, stats) where stats is a dict with keys:
+        replacements: int (count of [E####] markers expanded)
+        unknown_eids: int (count of markers whose eid was not in evidence_map)
+        unknown_eid_snippets: list[str] (up to 10 ~120-char snippets)
+        attribution_mismatches: int (count of prose-surname/eid-author mismatches)
+        attribution_mismatch_snippets: list[dict] with keys
+            {snippet, prose_surname, expected_surnames, eid, doc_id, page}
     """
+    stats = {
+        "replacements": 0,
+        "unknown_eids": 0,
+        "unknown_eid_snippets": [],
+        "attribution_mismatches": 0,
+        "attribution_mismatch_snippets": [],
+    }
     if not text:
-        return text or "", 0
+        return text or "", stats
     pattern = re.compile(r"\[([Ee]\d{4})\]")
     out_parts: list = []
     last_end = 0
-    replacements = 0
+    # v15.7: pre-build a known-surname set across the evidence_map so the
+    # attribution check can recognise "prose surname is a valid author
+    # surname for SOME other doc" — distinguishing a genuine wrong-author
+    # binding from a model artefact like "He argues" where the immediate
+    # lookback token is a pronoun.
+    known_surnames = set()
+    for _ev in evidence_map.values():
+        _did = _ev.get("doc_id", "")
+        _lbl = _author_surnames_only(_doc_id_to_author_label(_did))
+        if _lbl:
+            known_surnames.add(_lbl.lower())
     for match in pattern.finditer(text):
         eid = match.group(1).upper()
         ev = evidence_map.get(eid)
         if not ev:
+            stats["unknown_eids"] += 1
+            if len(stats["unknown_eid_snippets"]) < 10:
+                lo = max(0, match.start() - 60)
+                hi = min(len(text), match.end() + 60)
+                stats["unknown_eid_snippets"].append(text[lo:hi].replace("\n", " "))
+            # Leave the bare [E####] marker in place — downstream
+            # _drop_zero_citation_paragraphs treats it as a recognised
+            # cite (v15.7) so the LLM's prose around an unknown marker
+            # is not silently lost.
             continue
         doc_id = ev["doc_id"]
         page = int(ev["page"])
@@ -366,10 +436,11 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
         # model may capitalise particle prefixes (Van/van).
         prefix = text[max(0, match.start() - _EID_LOOKBACK_CHARS):match.start()]
         immediate = prefix.rstrip()
+        author_immediately_before = False
+        prose_surname_mismatch = None
         if surnames:
             escaped = re.escape(surnames)
             adjacency_re = re.compile(rf"(?<![A-Za-z0-9_]){escaped}$", re.IGNORECASE)
-            # Also accept if immediate is exactly the label (start of string).
             author_immediately_before = (
                 immediate.lower().endswith(surnames.lower())
                 and (
@@ -377,10 +448,41 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
                     or bool(adjacency_re.search(immediate))
                 )
             )
-        else:
-            author_immediately_before = False
+            # v15.7 attribution gate: if THIS doc's surname is not
+            # adjacent, check whether some OTHER known author surname is.
+            # If yes, that is a prose-vs-cite mismatch — record and force
+            # case-B (parenthetical with correct author) so the bare-year
+            # would not be misread as belonging to the prose surname.
+            if not author_immediately_before:
+                for other_surnames in known_surnames:
+                    if other_surnames == surnames.lower():
+                        continue
+                    other_esc = re.escape(other_surnames)
+                    other_re = re.compile(
+                        rf"(?<![A-Za-z0-9_]){other_esc}$", re.IGNORECASE
+                    )
+                    if other_re.search(immediate):
+                        prose_surname_mismatch = other_surnames
+                        break
 
-        if author_immediately_before and year:
+        if prose_surname_mismatch:
+            stats["attribution_mismatches"] += 1
+            if len(stats["attribution_mismatch_snippets"]) < 20:
+                stats["attribution_mismatch_snippets"].append({
+                    "snippet": (immediate[-80:] + match.group(0)).replace("\n", " "),
+                    "prose_surname": prose_surname_mismatch,
+                    "expected_surnames": surnames,
+                    "eid": eid,
+                    "doc_id": doc_id,
+                    "page": page,
+                })
+            # Force case-B with the CORRECT author so the wrong-named
+            # prose surname is not reinforced by a bare-year cite.
+            if surnames and year:
+                rendered = f"({surnames} {year}, p.{page})"
+            else:
+                rendered = render_citation(doc_id, page)
+        elif author_immediately_before and year:
             # Author label is right before the marker: emit bare
             # (Year, p.N). Surrounding prose forms 'Author (Year, p.N)'
             # which DISPLAY_CITE_RE matches.
@@ -396,9 +498,9 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
         out_parts.append(text[last_end:match.start()])
         out_parts.append(rendered)
         last_end = match.end()
-        replacements += 1
+        stats["replacements"] += 1
     out_parts.append(text[last_end:])
-    return "".join(out_parts), replacements
+    return "".join(out_parts), stats
 
 
 # v14 FIX-BRACKET: catch [Doc_Year] / [Doc&Doc_Year] form the model invents when
@@ -457,13 +559,16 @@ def _strip_wrapping(text: str) -> str:
 
 
 def _collapse_double_parens(text: str) -> tuple:
-    # v8 (R5): collapse ((DocId: p.N)) -> (DocId: p.N). Returns (text, count).
-    # v9.1: also collapse ((DocId: p.X): p.Y) -> (DocId: p.X). The inner page
-    # wins because it was the model's own evidence-id-rendered citation, while
-    # the outer ": p.Y" is the model's redundant attempt at a page suffix.
+    # v8 (R5): collapse ((DocId: p.N)) -> (DocId: p.N).
+    # v9.1: also collapse ((DocId: p.X): p.Y) -> (DocId: p.X).
+    # v15.7: extended to the THREE display-form patterns the v15.6 audit
+    # found 50 times in production output while writer_double_paren_collapsed
+    # reported 0 (the helper had no call site in the chunked path AND the
+    # regex was canonical-only). All three normalise (cite_inner) by stripping
+    # the redundant outer parens.
     count = 0
 
-    def repl_double(m):
+    def repl_inner_only(m):
         nonlocal count
         count += 1
         return "(" + m.group(1) + ")"
@@ -471,15 +576,28 @@ def _collapse_double_parens(text: str) -> tuple:
     def repl_nested_suffix(m):
         nonlocal count
         count += 1
-        # m.group(1) is just the DocId; we need to preserve the original inner
-        # page so reconstruct it by re-running the inner regex on the match.
         inner = re.match(r"\(\(([A-Za-z0-9_&.\-]+:\s*p\.\d+)\):\s*p\.\d+\)", m.group(0))
         if inner:
             return "(" + inner.group(1) + ")"
         return m.group(0)
 
-    text, _ = (_DOUBLE_PAREN_CITE_RE.subn(repl_double, text))
+    def repl_group(m):
+        nonlocal count
+        inner = m.group(1).strip().rstrip(";,").strip()
+        # Sanity: every char inside must be either a single-paren cite or
+        # whitespace/punctuation. We've already constrained that via the
+        # regex, but double-check no stray prose.
+        if re.search(r"[A-Za-z][A-Za-z0-9]{2,}", re.sub(r"\([^()]*\)", "", inner)):
+            return m.group(0)
+        count += 1
+        # Re-join the inner cites with '; ' for a clean group.
+        cites = re.findall(r"\([^()]+?\)", inner)
+        return "; ".join(cites)
+
+    text, _ = (_DOUBLE_PAREN_CITE_RE.subn(repl_inner_only, text))
     text, _ = (_NESTED_PAGE_SUFFIX_RE.subn(repl_nested_suffix, text))
+    text, _ = (_DOUBLE_PAREN_DISPLAY_RE.subn(repl_inner_only, text))
+    text, _ = (_DOUBLE_PAREN_DISPLAY_GROUP_RE.subn(repl_group, text))
     return text, count
 
 
@@ -788,11 +906,20 @@ def _drop_zero_citation_paragraphs(text: str, keep_closing: bool = False) -> tup
     kept = []
     removed = []
     kept_closing_snippet = None
+    # v15.7: recognise unrendered [E####] markers as a citation form too.
+    # When the renderer can't map a marker (unknown eid), it leaves the
+    # bare marker in place AND bumps writer_unknown_evidence_id. Without
+    # this check, the surrounding prose would be silently dropped as
+    # zero-citation when the real failure is a single bad marker. The
+    # bare marker is greppable for debugging and shows up in the quality
+    # manifest.
+    _UNRENDERED_EID_RE = re.compile(r"\[[Ee]\d{4}\]")
     for i, para in enumerate(paragraphs):
         has_canonical = bool(CITE_RE.search(para))
         has_display_narrative = bool(DISPLAY_CITE_RE.search(para))
         has_display_paren = bool(DISPLAY_PAREN_CITE_RE.search(para))
-        if has_canonical or has_display_narrative or has_display_paren:
+        has_unrendered_eid = bool(_UNRENDERED_EID_RE.search(para))
+        if has_canonical or has_display_narrative or has_display_paren or has_unrendered_eid:
             kept.append(para)
             continue
         snippet = re.sub(r"\s+", " ", para.strip())[:200]
@@ -1046,17 +1173,60 @@ def _redundancy_tokens(sentence: str) -> set:
     return {t for t in raw if len(t) >= 4 and t not in _REDUNDANCY_STOPWORDS}
 
 
-def _sentence_citation_pairs(sentence: str):
+def _sentence_citation_pairs(sentence: str, display_lookup=None):
+    # v15.7: was canonical-only; now resolves display surfaces too via
+    # parse_citations + display_lookup. Drop-aware-of-surface so the
+    # redundancy walker doesn't keep a sentence that "has no canonical
+    # cite" simply because the cite is in display form.
     pairs = set()
-    for m in re.finditer(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)", sentence):
-        try:
-            pairs.add((m.group(1), int(m.group(2))))
-        except Exception:
+    for c in parse_citations(sentence, display_lookup=display_lookup):
+        if c["doc_id"] is None:
             continue
+        pairs.add((c["doc_id"], c["page"]))
     return pairs
 
 
-def _drop_cross_section_redundancy(text: str, min_token_overlap: int = 4):
+def _sentence_doc_ids(sentence: str, display_lookup=None) -> set:
+    """v15.7: helper for the attribution-aware drop guard. Returns just the
+    doc_id set (no pages) for a sentence."""
+    return {p[0] for p in _sentence_citation_pairs(sentence, display_lookup=display_lookup)}
+
+
+def _drop_would_strand_surname(prev_text: str, sent: str, allowed_docs,
+                                 display_lookup=None) -> bool:
+    """v15.7 drop-aware-of-surname guard. Returns True if dropping `sent`
+    would leave the IMMEDIATELY-PRECEDING prose in prev_text with an
+    author surname that has no surviving cite of theirs in the dropped-
+    sentence's cite set — exactly the GD 04 Kuznets→Mokyr failure class.
+
+    Heuristic: take the last 80 chars of prev_text, scan for any known
+    author surname (from allowed_docs / display_lookup), and check if any
+    of those surnames maps to a doc_id in sent's cite set. If yes, the
+    drop strands the surname (because the cite that gave it semantic
+    cover would be removed).
+    """
+    if not prev_text or not sent:
+        return False
+    tail = prev_text[-120:]
+    sent_doc_ids = _sentence_doc_ids(sent, display_lookup=display_lookup)
+    if not sent_doc_ids:
+        return False
+    # Build surname -> doc_ids index for the allowed corpus.
+    surname_to_docids: dict = {}
+    for did in (allowed_docs or set()):
+        surnames = _author_surnames_only(_doc_id_to_author_label(did)).lower()
+        if surnames:
+            surname_to_docids.setdefault(surnames, set()).add(did)
+    # Check tail for any surname whose doc set overlaps sent's cites.
+    tail_lower = tail.lower()
+    for surnames, dids in surname_to_docids.items():
+        if surnames in tail_lower and (dids & sent_doc_ids):
+            return True
+    return False
+
+
+def _drop_cross_section_redundancy(text: str, min_token_overlap: int = 4,
+                                     display_lookup=None, allowed_docs=None):
     """v9 (R6): walk the assembled review sentence by sentence; drop a sentence
     when BOTH:
       (a) every (doc, page) citation it contains has already been cited earlier
@@ -1085,7 +1255,7 @@ def _drop_cross_section_redundancy(text: str, min_token_overlap: int = 4):
                 continue
             kept_sentences = []
             for sent in sentences:
-                sent_pairs = _sentence_citation_pairs(sent)
+                sent_pairs = _sentence_citation_pairs(sent, display_lookup=display_lookup)
                 # No citation: keep (we never drop uncited prose here)
                 if not sent_pairs:
                     kept_sentences.append(sent)
@@ -1100,6 +1270,16 @@ def _drop_cross_section_redundancy(text: str, min_token_overlap: int = 4):
                 this_tokens = _redundancy_tokens(sent)
                 max_overlap = max((len(this_tokens & prev) for prev in seen_tokens), default=0)
                 if max_overlap >= min_token_overlap:
+                    # v15.7: drop-aware-of-surname guard. Refuse the drop
+                    # when removing `sent` would leave a preceding-prose
+                    # surname stranded (its only cite was in `sent`).
+                    prev_text = " ".join(kept_sentences)
+                    if _drop_would_strand_surname(
+                        prev_text, sent, allowed_docs, display_lookup=display_lookup,
+                    ):
+                        kept_sentences.append(sent)
+                        seen_tokens.append(this_tokens)
+                        continue
                     snippet = re.sub(r"\s+", " ", sent.strip())[:140]
                     removed_examples.append({
                         "snippet": snippet + ("…" if len(snippet) == 140 else ""),
@@ -1131,16 +1311,19 @@ def _split_sentences_for_cleanup(line: str):
     return [p.replace(sentinel, ".") for p in parts if p.strip()]
 
 
-def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) -> tuple:
-    # v13: retired the loose-pattern arm per architecture item A-030.
-    # Evidence-id rendering (A-013) + display_lookup gating supersede the
-    # author-year-text / page-only / multipage / doc-without-page scrubs. Only
-    # the strict CITE_RE arm survives; it removes sentences citing canonical
-    # (Doc_Year: p.N) tokens that don't appear in the validated allowed_pairs
-    # set. The canonical surface is only present here as an intermediate
-    # produced by _chunk_display_to_canonical / render_citation_canonical, so
-    # this gates display→canonical rewrites that resolved to an out-of-corpus
-    # author label or an invalid (doc, page) pair.
+def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None,
+                                display_lookup=None) -> tuple:
+    # v15.7: surface-agnostic via parse_citations(text, display_lookup).
+    # Previously CITE_RE-only — counted writer_removed_citations=0 in all
+    # v15.6 runs while the audit found 5 mis-attribution blockers and 16
+    # display-form leaks. With display_lookup provided, display-form
+    # cites resolve to a doc_id and the validator can detect:
+    #   - unknown_doc: doc_id not in allowed_docs (cite to a paper outside
+    #     this chunk's allowed set)
+    #   - invalid_page: doc_id known but (doc, page) not in allowed_pairs
+    #   - unresolved_display: display-form whose (label, year) does not
+    #     resolve via display_lookup at all (probably an author label the
+    #     model invented or a collision in the lookup)
     allowed_lower = {did.lower() for did in allowed_docs}
     lower_to_canonical = {did.lower(): did for did in allowed_docs}
     allowed_pairs = set(allowed_pairs or [])
@@ -1149,15 +1332,24 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None) 
 
     def find_invalid_citations_in_text(txt):
         invalid = []
-        for m in CITE_RE.finditer(txt):
-            doc_id = m.group(1)
-            page = int(m.group(2))
+        for c in parse_citations(txt, display_lookup=display_lookup):
+            page = int(c["page"])
+            doc_id = c["doc_id"]
+            if doc_id is None:
+                # Display-form that did not resolve via display_lookup.
+                invalid.append((
+                    c["start"], c["end"],
+                    c.get("label") or "?",
+                    page,
+                    "unresolved_display",
+                ))
+                continue
             if doc_id.lower() not in allowed_lower:
-                invalid.append((m.start(), m.end(), doc_id, page, "unknown_doc"))
+                invalid.append((c["start"], c["end"], doc_id, page, "unknown_doc"))
                 continue
             canonical = lower_to_canonical.get(doc_id.lower(), doc_id)
             if allowed_pairs and (canonical, page) not in allowed_pairs:
-                invalid.append((m.start(), m.end(), canonical, page, "invalid_page"))
+                invalid.append((c["start"], c["end"], canonical, page, "invalid_page"))
         return invalid
 
     invalid_citations = find_invalid_citations_in_text(text)
@@ -1353,10 +1545,18 @@ def _writer_parallel_workers(n_chunks: int) -> int:
     return max(1, min(workers, n_chunks))
 
 
-def _strict_cited_doc_ids(text: str, allowed_pairs=None) -> set:
+def _strict_cited_doc_ids(text: str, allowed_pairs=None, display_lookup=None) -> set:
+    # v15.7: parse_citations now iterates all three surfaces. Pass
+    # display_lookup so display-form cites resolve to a doc_id (without
+    # it they yield doc_id=None and are invisible to the coverage audit
+    # — exactly the v15.5 silent-failure mode that produced the writer
+    # collapse). When allowed_pairs is empty all resolved cites are
+    # counted; otherwise only (doc, page) pairs in allowed_pairs.
     allowed_pairs = set(allowed_pairs or [])
     cited = set()
-    for c in parse_citations(text):
+    for c in parse_citations(text, display_lookup=display_lookup):
+        if c["doc_id"] is None:
+            continue
         pair = (c["doc_id"], c["page"])
         if not allowed_pairs or pair in allowed_pairs:
             cited.add(c["doc_id"])
@@ -1374,7 +1574,13 @@ def _coverage_requirement(chunk_docs, section_kind: str) -> int:
 
 def _audit_section_coverage(text: str, chunk_docs, section_kind: str):
     chunk_pairs, chunk_allowed_docs, _ = _build_allowed_citations(chunk_docs)
-    cited = _strict_cited_doc_ids(text, allowed_pairs=chunk_pairs)
+    # v15.7: pass a display_lookup built from chunk_allowed_docs so the
+    # audit can resolve display-form cites natively (no canonical
+    # conversion needed).
+    chunk_display_lookup_local = _build_display_lookup(chunk_allowed_docs)
+    cited = _strict_cited_doc_ids(
+        text, allowed_pairs=chunk_pairs, display_lookup=chunk_display_lookup_local,
+    )
     required = _coverage_requirement(chunk_docs, section_kind)
     return {
         "section": section_kind,
@@ -1384,6 +1590,14 @@ def _audit_section_coverage(text: str, chunk_docs, section_kind: str):
         "provided_doc_count": len(chunk_allowed_docs),
         "ok": len(cited) >= required,
     }
+
+
+# v15.7: sentinel prefix on coverage-fallback patch sentences. Final
+# assembly drops these unless removing them would push the section
+# below its coverage floor. v15.6 run 04 shipped a patch sentence
+# verbatim as the first line of the review ("A further source records
+# ... (Kuznets_1973: p.7).") — a UX failure mode this sentinel fixes.
+_COVERAGE_PATCH_SENTINEL = "[[COV-PATCH]] "
 
 
 def _append_coverage_fallback(text: str, chunk_docs, required_docs: int, allowed_pairs=None) -> tuple:
@@ -1407,7 +1621,11 @@ def _append_coverage_fallback(text: str, chunk_docs, required_docs: int, allowed
             continue
         pg = int(quote.get("page", 0) or 0)
         tx = _clip(quote.get("text", ""), n=180)
-        additions.append(f'A further source records "{tx}" {render_citation(did, pg)}.')
+        # v15.7: prepend sentinel; final assembly strips these unless
+        # removing them would push the section below coverage.
+        additions.append(
+            f'{_COVERAGE_PATCH_SENTINEL}A further source records "{tx}" {render_citation(did, pg)}.'
+        )
         cited.add(did)
         if len(cited) >= required_docs:
             break
@@ -1422,16 +1640,77 @@ def _append_coverage_fallback(text: str, chunk_docs, required_docs: int, allowed
     return patched.strip(), len(additions)
 
 
+def _strip_coverage_patches_when_safe(text: str, allowed_docs, allowed_pairs,
+                                        display_lookup=None) -> tuple:
+    """v15.7: walk the assembled essay paragraph-by-paragraph; for each
+    paragraph that contains a coverage-patch sentence (prefixed with the
+    sentinel), test whether removing the patch sentence still leaves the
+    paragraph above its coverage floor (>=1 cited doc — paragraphs already
+    pass the section-level coverage at this point; this is a per-paragraph
+    safety check). Drop patch sentences when safe, strip the sentinel when
+    not. Returns (cleaned_text, n_dropped, n_kept).
+    """
+    if not text or _COVERAGE_PATCH_SENTINEL not in text:
+        return text, 0, 0
+    allowed_pairs = set(allowed_pairs or [])
+    n_dropped = 0
+    n_kept = 0
+    out_paras = []
+    for para in text.split("\n\n"):
+        if _COVERAGE_PATCH_SENTINEL not in para:
+            out_paras.append(para)
+            continue
+        sentences = _split_sentences_for_cleanup(para)
+        non_patch_sents = [s for s in sentences if _COVERAGE_PATCH_SENTINEL not in s]
+        joined_non_patch = " ".join(non_patch_sents)
+        non_patch_cited = _strict_cited_doc_ids(
+            joined_non_patch,
+            allowed_pairs=allowed_pairs,
+            display_lookup=display_lookup,
+        )
+        if len(non_patch_cited) >= 1:
+            # Paragraph stands on its own — drop the patch sentences.
+            new_para = " ".join(non_patch_sents).strip()
+            if new_para:
+                out_paras.append(new_para)
+                n_dropped += sum(
+                    1 for s in sentences if _COVERAGE_PATCH_SENTINEL in s
+                )
+            else:
+                # Empty after drop — keep with sentinel stripped.
+                cleaned = para.replace(_COVERAGE_PATCH_SENTINEL, "")
+                out_paras.append(cleaned)
+                n_kept += sum(
+                    1 for s in sentences if _COVERAGE_PATCH_SENTINEL in s
+                )
+        else:
+            # Patch is load-bearing — strip sentinel, keep sentence.
+            cleaned = para.replace(_COVERAGE_PATCH_SENTINEL, "")
+            out_paras.append(cleaned)
+            n_kept += sum(
+                1 for s in sentences if _COVERAGE_PATCH_SENTINEL in s
+            )
+    cleaned_text = "\n\n".join(out_paras)
+    return cleaned_text, n_dropped, n_kept
+
+
 def _coverage_retry_prompt(original_prompt: str, prior_chunk: str, required_docs: int) -> str:
+    # v15.7: retry prompt now demands [E####] markers consistent with
+    # _SYSTEM_CITATION_INSTRUCTION. The previous version forbade
+    # author-year citations and demanded canonical '(DocId: p.N)' — both
+    # contradicting the system prompt's '[E####] only' rule. The new
+    # version restates the marker contract and asks for at least N
+    # distinct DOCS-worth of markers (the audit checks doc coverage, not
+    # marker count).
     return f"""{original_prompt}
 
 Coverage repair:
-The previous draft failed the citation coverage rule. Write the section again using only the allowed citations above.
+The previous draft failed the citation coverage rule. Write the section again using only [E####] markers drawn from the ALLOWED CITATIONS list at the top of this prompt.
 
 Requirements:
-- Cite at least {required_docs} different provided documents when that many are available.
-- Every paragraph must include at least one strict citation in the form (DocId: p.N).
-- Do not use page-only citations, author-year citations, or citations without pages.
+- Cite at least {required_docs} DIFFERENT papers when that many are listed. (One paper can contribute multiple markers; the count is of distinct papers.)
+- Every paragraph must include at least one [E####] marker.
+- Use ONLY [E####] markers from the ALLOWED CITATIONS list. Do not invent IDs. Do not write '(Author Year, p.N)', 'Author (Year, p.N)', '(DocId: p.N)' or any other citation surface — the renderer expands every [E####] into the correct surface.
 - Preserve the same substantive role and word range.
 
 Previous draft:
@@ -1836,12 +2115,23 @@ def _build_stream_prompt(topic: str, cluster_label: str, evidence: str,
                          outline_block: str = "",
                          claims_so_far: str = "",
                          relation: str = "",
-                         topic_shape: str = ""):
+                         topic_shape: str = "",
+                         lead_surname: str = "",
+                         forbidden_opener_surnames: list = None):
     """v15: single section builder. Same arity as the legacy per-stance
     builders so the dispatcher loop in compose_from_ledger does not need to
     branch on shape. `relation` and `topic_shape` are passed through so the
     prompt can name the stream's structural relation to the topic — without
     any supports/critiques/complicates vocabulary.
+
+    v15.7: `lead_surname` + `forbidden_opener_surnames` is the
+    parallel-writer guard. Each section computes its lead author from
+    outline_plan's lead_doc_id upfront; downstream sections are told
+    explicitly which surnames they MUST NOT use as the section opener.
+    Closes the INST 02 cloned-author-opener class ('Austin emphasizes
+    ... patterns and paths' appearing in 3 different chunks with 3
+    different cites) which the parallel writer's empty claims_so_far
+    silenced in v15.6.
     """
     outline_section = (outline_block + "\n\n") if outline_block else ""
     prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
@@ -1852,11 +2142,28 @@ def _build_stream_prompt(topic: str, cluster_label: str, evidence: str,
         f"{relation_gloss}.\n"
         if relation_gloss else ""
     )
+    forbid_line = ""
+    if forbidden_opener_surnames:
+        forbid_list = "; ".join(sorted(set(forbidden_opener_surnames)))
+        forbid_line = (
+            f"OPENER GUARD: Do NOT open this section with any of these author "
+            f"surnames as the topic-sentence subject (they are the lead authors "
+            f"of OTHER sections): {forbid_list}. They may still be cited inside "
+            f"the section if their evidence is in your ALLOWED CITATIONS list, "
+            f"but the OPENING SENTENCE must be led by a different surname.\n"
+        )
+    lead_line = ""
+    if lead_surname:
+        lead_line = (
+            f"SECTION LEAD: Open with a sentence whose grammatical subject "
+            f"names '{lead_surname}' (this cluster's lead author). The cite "
+            f"that anchors the opener must resolve to {lead_surname}'s paper.\n"
+        )
     return f"""Continue this literature review on: {topic}
 
 {prev_block}
 {prior_section}Stream: {cluster_label}.
-{relation_line}
+{relation_line}{lead_line}{forbid_line}
 ALLOWED CITATIONS:
 {allowed_list}
 
@@ -2306,6 +2613,31 @@ _FABRICATED_QUOTE_RE = re.compile(r'"([^"\n]{20,})"')
 _NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 
 
+def _is_period_inside_paren(text: str, idx: int) -> bool:
+    """v15.7: True if the '.' at text[idx] sits inside an unclosed '(' on the
+    same line. Used by the sentence-boundary walker in _strip_fabricated_quotes
+    so a period inside '(Author 2005, p.49)' is NOT treated as a sentence
+    terminator — that was the v15.6 audit's broken-cite-stub bug producing
+    '(Ogilvie_2007: p.' floating in prose after a quote-strip.
+    """
+    if idx < 0 or idx >= len(text):
+        return False
+    # Walk back to the previous newline or start; count parens.
+    depth = 0
+    i = idx - 1
+    while i >= 0 and text[i] != "\n":
+        ch = text[i]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            if depth == 0:
+                # Unclosed open-paren before this period → period is inside it.
+                return True
+            depth -= 1
+        i -= 1
+    return False
+
+
 def _normalise_for_quote_match(s: str) -> str:
     """Normalise for verbatim-quote substring matching.
 
@@ -2344,7 +2676,8 @@ def _normalise_for_quote_match(s: str) -> str:
     return s.strip()
 
 
-def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None):
+def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
+                              display_lookup=None):
     """v14.2 fix #1: scan the assembled essay for every '"..."' span >=20 chars,
     locate the nearest canonical (doc_id: p.N) citation within +/-200 chars,
     and verify the normalised quoted text is a substring of
@@ -2420,23 +2753,23 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None):
         win_start = max(0, q_start - 200)
         win_end = min(len(full_text), q_end + 200)
         window = full_text[win_start:win_end]
-        cites = list(_NEARBY_CANONICAL_CITE_RE.finditer(window))
+        # v15.7: find nearest cite across ALL surfaces using parse_citations.
+        # Previously CITE_RE-only — missed display-form cites entirely,
+        # which after the surface flip is all of them.
+        cites = list(parse_citations(window, display_lookup=display_lookup))
+        cites = [c for c in cites if c["doc_id"] is not None]
         if not cites:
             stats["fabricated_kept_no_citation"] += 1
             continue
 
         q_center = (q_start + q_end) / 2 - win_start
 
-        def _dist(m, _q=q_center):
-            return abs((m.start() + m.end()) / 2 - _q)
+        def _dist(c, _q=q_center):
+            return abs((c["start"] + c["end"]) / 2 - _q)
 
         nearest = min(cites, key=_dist)
-        doc_id = nearest.group(1)
-        try:
-            page = int(nearest.group(2))
-        except ValueError:
-            stats["fabricated_kept_no_citation"] += 1
-            continue
+        doc_id = nearest["doc_id"]
+        page = int(nearest["page"])
 
         if doc_id not in allowed_doc_set:
             stats["fabricated_kept_doc_not_in_corpus"] += 1
@@ -2454,14 +2787,42 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None):
             continue
 
         # Fabricated quote. Strip the SENTENCE containing it.
+        # v15.7: previous boundary walk halted on '.' inside '(Doc: p.N)'
+        # producing stubs like '(Ogilvie_2007: p.' floating in the prose.
+        # Use a smarter walk that treats a '.' inside an unclosed '('
+        # as not a sentence terminator.
         sent_start = q_start
-        while sent_start > 0 and full_text[sent_start - 1] not in ".?!\n":
+        while sent_start > 0:
+            ch = full_text[sent_start - 1]
+            if ch == "\n":
+                break
+            if ch in ".?!" and not _is_period_inside_paren(full_text, sent_start - 1):
+                break
             sent_start -= 1
         while sent_start < q_start and full_text[sent_start] in " \t":
             sent_start += 1
         sent_end = q_end
-        while sent_end < len(full_text) and full_text[sent_end - 1] not in ".?!\n":
+        while sent_end < len(full_text):
+            prev_ch = full_text[sent_end - 1]
+            if prev_ch == "\n":
+                break
+            if prev_ch in ".?!" and not _is_period_inside_paren(full_text, sent_end - 1):
+                break
             sent_end += 1
+        # v15.7: drop-aware-of-surname guard. If stripping this sentence
+        # would strand a surname in the prior 120 chars (the cite that
+        # gave the surname semantic cover lives in `sent`), keep the
+        # sentence — better to ship a fabricated-quote sentence than a
+        # confidently-wrong attribution. Record the skip so the quality
+        # manifest can flag it.
+        sent_text = full_text[sent_start:sent_end]
+        prev_text = full_text[max(0, sent_start - 200):sent_start]
+        if _drop_would_strand_surname(
+            prev_text, sent_text, allowed_doc_set, display_lookup=display_lookup,
+        ):
+            stats.setdefault("strand_guard_kept", 0)
+            stats["strand_guard_kept"] += 1
+            continue
         spans_to_strip.append((sent_start, sent_end, quote, doc_id, page))
 
     if spans_to_strip:
@@ -2808,7 +3169,28 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # Build chunk_plan in the cluster order Stage 3 picked. Each entry uses
     # the single v15 stream-section builder, partial-applied with the
     # cluster's relation + topic_shape.
+    # v15.7: compute lead author surname per cluster from outline_plan's
+    # lead_doc_id (Stage 2 field). Each cluster's prompt then knows which
+    # surname to OPEN with and which surnames are reserved by OTHER
+    # clusters' openers — closing the parallel-writer cloned-opener gap.
     from functools import partial
+    cluster_lead_surnames: dict = {}
+    for cid in ordered_cluster_ids:
+        c = clusters_by_id.get(cid)
+        if not c:
+            continue
+        lead_did = (c.get("lead_doc_id") or "").strip()
+        if not lead_did:
+            # Fall back to the first doc_id in the cluster.
+            doc_ids = c.get("doc_ids") or []
+            lead_did = doc_ids[0] if doc_ids else ""
+        if lead_did:
+            label = _doc_id_to_author_label(lead_did)
+            cluster_lead_surnames[cid] = _author_surnames_only(label)
+        else:
+            cluster_lead_surnames[cid] = ""
+    all_lead_surnames = {s for s in cluster_lead_surnames.values() if s}
+
     chunk_plan = []
     for cid in ordered_cluster_ids:
         c = clusters_by_id.get(cid)
@@ -2818,9 +3200,13 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         if not cluster_docs:
             continue
         outline_block = _format_outline_block(c, doc_to_evidence_ids)
+        this_lead = cluster_lead_surnames.get(cid, "")
+        forbidden = sorted(s for s in all_lead_surnames if s and s != this_lead)
         builder = partial(_build_stream_prompt,
                           relation=c.get("relation", ""),
-                          topic_shape=topic_shape)
+                          topic_shape=topic_shape,
+                          lead_surname=this_lead,
+                          forbidden_opener_surnames=forbidden)
         # Reuse the legacy 5-tuple shape so the dispatcher loop below works
         # unchanged. Position 0 ("stance") now carries the relation; position
         # 1 ("cluster") carries the cluster's shared_thread label.
@@ -2856,6 +3242,13 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # v14 FIX-BRACKET: count [Doc_Year] bracket-id rewrites across all chunks
     # and the final assembly pass.
     total_bracket_id_rewrites = 0
+    # v15.7: track renderer-side attribution gate + unknown-eid signal across
+    # chunks so the quality manifest and finalize_covered_chunk can act on them.
+    total_unknown_eids = 0
+    total_attribution_mismatches = 0
+    total_attribution_retries = 0
+    unknown_eid_snippets: list = []
+    attribution_mismatch_snippets: list = []
     section_coverage = []
     
     # v10: display->canonical lookup built once per run. The writer is asked
@@ -2886,6 +3279,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         nonlocal total_removed_citations, total_style_removed, total_evidence_id_renders
         nonlocal total_double_paren_collapsed, total_author_led_openings
         nonlocal total_bracket_id_rewrites
+        nonlocal total_unknown_eids, total_attribution_mismatches
 
         chunk = _strip_wrapping(chunk)
         # v15.5: the writer now produces ONLY [E####] evidence-ID markers.
@@ -2894,8 +3288,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # prose) or the parenthetical '(Author Year, p.N)' (otherwise).
         # This eliminates the display->canonical->display surface-cycling
         # the older pipeline needed.
-        chunk, evidence_renders = _render_evidence_id_citations(chunk, evidence_id_map)
-        total_evidence_id_renders += evidence_renders
+        # v15.7: renderer now also acts as attribution gate — returns stats
+        # dict with attribution_mismatches that finalize_covered_chunk uses
+        # to decide whether to trigger a coverage retry.
+        chunk, render_stats = _render_evidence_id_citations(chunk, evidence_id_map)
+        total_evidence_id_renders += render_stats["replacements"]
+        total_unknown_eids += render_stats["unknown_eids"]
+        unknown_eid_snippets.extend(render_stats["unknown_eid_snippets"])
+        total_attribution_mismatches += render_stats["attribution_mismatches"]
+        attribution_mismatch_snippets.extend(render_stats["attribution_mismatch_snippets"])
 
         # v14 FIX-BRACKET: catch [Doc_Year] bracketed canonical doc_ids the
         # model invents when it confuses bracket-evidence-id syntax with the
@@ -2905,22 +3306,24 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         )
         total_bracket_id_rewrites += bracket_rewrites
 
-        # v15.6: re-enable display->canonical conversion at the START of
-        # per-chunk postprocess. v15.5 retired the call on the assumption
-        # the writer no longer emits display form; transitively it does,
-        # via _render_evidence_id_citations. Without canonical conversion,
-        # _strict_cited_doc_ids (used by the coverage audit) cannot resolve
-        # display-form labels to doc_ids (parse_citations yields doc_id=None
-        # for DISPLAY_CITE_RE and skips DISPLAY_PAREN_CITE_RE entirely), so
-        # every section's audit reported 0 cited docs, the coverage fallback
-        # fired on every section, and the final assembly only kept the
-        # fallback's canonical "A further source records..." sentences — the
-        # LLM prose was then dropped by _drop_zero_citation_paragraphs.
-        chunk = _chunk_display_to_canonical(chunk)
+        # v15.7: _chunk_display_to_canonical retired. The validators
+        # (_audit_section_coverage, _remove_invalid_citations,
+        # _drop_cross_section_redundancy, _strict_cited_doc_ids) now
+        # consume display-form citations natively via parse_citations +
+        # display_lookup. The canonical surface is no longer used as an
+        # internal validation form. The user-facing output is display
+        # form '(Author Year, p.N)' / 'Author (Year, p.N)' — no more
+        # display→canonical→display surface-cycling.
+        # v15.7: wire _collapse_double_parens into the chunked path. v15.6
+        # reported writer_double_paren_collapsed=0 in every run because
+        # the only call site was in the dead single-pass code; the audit
+        # found 50 ((...)) wrappings shipped to users.
+        chunk, dp_collapsed = _collapse_double_parens(chunk)
+        total_double_paren_collapsed += dp_collapsed
         # v8 (R5): observe author-led-opening violations and count them.
-        total_author_led_openings += _count_author_led_openings(chunk)
-
-        # v8 (R5): observe author-led-opening violations and count them.
+        # v15.7: was being called TWICE (the comment was duplicated and so was
+        # the call); single invocation now matches every other observation
+        # point in postprocess_chunk.
         total_author_led_openings += _count_author_led_openings(chunk)
 
         # v13: removed the legacy pre-cleanup arms (_strip_placeholder_citations,
@@ -2934,22 +3337,72 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         chunk = _strip_conclusion(chunk)
         if _writer_enforcement_enabled():
             chunk_allowed_pairs, chunk_allowed_docs, _ = _build_allowed_citations(chunk_docs)
+            chunk_display_lookup_local = _build_display_lookup(chunk_allowed_docs)
             chunk, removed = _remove_invalid_citations(
                 chunk,
                 chunk_allowed_docs,
                 allowed_pairs=chunk_allowed_pairs,
+                display_lookup=chunk_display_lookup_local,
             )
             total_removed_citations += len(removed)
 
         chunk, style_removed = _remove_style_violations(chunk)
         total_style_removed += len(style_removed)
 
-        return chunk, 0, 0, 0, len(style_removed)
+        return chunk, 0, 0, 0, len(style_removed), render_stats
 
     def finalize_covered_chunk(raw, prompt, chunk_docs, section_kind, stage):
-        nonlocal total_coverage_fallbacks
-        chunk, repairs, placeholders, ajr, style_removed = postprocess_chunk(raw, chunk_docs)
+        nonlocal total_coverage_fallbacks, total_attribution_retries
+        chunk, repairs, placeholders, ajr, style_removed, render_stats = postprocess_chunk(raw, chunk_docs)
         audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+
+        # v15.7: renderer-as-attribution-gate triggers a coverage retry when
+        # the renderer detected a prose-surname-vs-eid-author mismatch. The
+        # gate ALREADY fixed the cite shape (emits '(CorrectAuthor Year, p.N)'
+        # instead of bare year), but the prose still names the wrong author.
+        # A retry gives the writer a fresh attempt with the original prompt;
+        # if the retry still mismatches, we accept the self-healed render and
+        # surface the mismatch in the quality manifest.
+        attribution_retry_done = False
+        if (
+            _writer_enforcement_enabled()
+            and render_stats["attribution_mismatches"] > 0
+        ):
+            if metrics:
+                metrics.inc("writer_attribution_retries")
+            total_attribution_retries += 1
+            attribution_retry_done = True
+            retry_prompt = _coverage_retry_prompt(
+                prompt, chunk, audit["required_cited_docs"],
+            )
+            raw_retry = _ollama_chat(
+                retry_prompt, metrics=metrics, stage=f"{stage}_attribution_retry",
+            )
+            chunk_retry, repairs_r, placeholders_r, ajr_r, style_removed_r, render_stats_retry = postprocess_chunk(
+                raw_retry, chunk_docs,
+            )
+            audit_retry = _audit_section_coverage(chunk_retry, chunk_docs, section_kind)
+            # Only accept the retry if it (a) clears the audit, AND (b) has
+            # fewer attribution mismatches than the original. Otherwise keep
+            # the original (already self-healed by the renderer).
+            retry_better = (
+                audit_retry["ok"]
+                and render_stats_retry["attribution_mismatches"]
+                < render_stats["attribution_mismatches"]
+            )
+            if retry_better:
+                chunk = chunk_retry
+                audit = audit_retry
+                repairs += repairs_r
+                placeholders += placeholders_r
+                ajr += ajr_r
+                style_removed += style_removed_r
+                if metrics:
+                    metrics.inc("writer_attribution_retry_accepted")
+            else:
+                if metrics:
+                    metrics.inc("writer_attribution_retry_rejected")
+
         if audit["ok"] or not _writer_enforcement_enabled():
             return chunk, repairs, placeholders, ajr, style_removed, audit
 
@@ -2971,14 +3424,20 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         if audit["ok"]:
             return chunk, repairs, placeholders, ajr, style_removed, audit
 
-        # Deterministic fallback couldn't reach the required doc count. Escalate
-        # to LLM coverage retry as the last resort.
-        if metrics:
-            metrics.inc("writer_section_coverage_retries")
-        retry_prompt = _coverage_retry_prompt(prompt, chunk, audit["required_cited_docs"])
-        raw = _ollama_chat(retry_prompt, metrics=metrics, stage=f"{stage}_coverage_retry")
-        chunk, repairs2, placeholders2, ajr2, style_removed2 = postprocess_chunk(raw, chunk_docs)
-        audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+        # Deterministic fallback couldn't reach the required doc count.
+        # Escalate to LLM coverage retry as the last resort — but skip it if
+        # we already did the attribution retry on this section, to avoid
+        # paying two LLM retries.
+        if not attribution_retry_done:
+            if metrics:
+                metrics.inc("writer_section_coverage_retries")
+            retry_prompt = _coverage_retry_prompt(prompt, chunk, audit["required_cited_docs"])
+            raw = _ollama_chat(retry_prompt, metrics=metrics, stage=f"{stage}_coverage_retry")
+            chunk, repairs2, placeholders2, ajr2, style_removed2, _retry_stats = postprocess_chunk(raw, chunk_docs)
+            audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
+        else:
+            repairs2 = placeholders2 = ajr2 = 0
+            style_removed2 = 0
         if not audit["ok"]:
             # Final deterministic top-up in case the LLM retry made partial progress.
             chunk, fallback_count2 = _append_coverage_fallback(
@@ -3234,8 +3693,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     # Final assembly
     full_text = "\n\n".join(chunks)
-    full_text, final_evidence_renders = _render_evidence_id_citations(full_text, evidence_id_map)
-    total_evidence_id_renders += final_evidence_renders
+    # v15.7: final-assembly renderer is a safety net (per-chunk pass already
+    # ran). Any new mismatches detected here are surfaced in the quality
+    # manifest but cannot retry — at this point the writer LLM has finished.
+    full_text, final_render_stats = _render_evidence_id_citations(full_text, evidence_id_map)
+    total_evidence_id_renders += final_render_stats["replacements"]
+    total_unknown_eids += final_render_stats["unknown_eids"]
+    unknown_eid_snippets.extend(final_render_stats["unknown_eid_snippets"])
+    total_attribution_mismatches += final_render_stats["attribution_mismatches"]
+    attribution_mismatch_snippets.extend(final_render_stats["attribution_mismatch_snippets"])
 
     # v14 FIX-BRACKET: final-assembly bracket-id rewrite for [Doc_Year] residue
     # that survived per-chunk postprocess (rare but possible if a chunk join
@@ -3245,35 +3711,12 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     )
     total_bracket_id_rewrites += final_bracket_rewrites
 
-    # v10: bring everything to the CANONICAL surface for validation. The model
-    # is asked for display form 'Author (Year, p.N)'; we map it back to the
-    # canonical '(Doc_Year: p.N)' so the existing validator (which knows about
-    # allowed_pairs in canonical form) can do its work unchanged.
+    # v15.7: _display_to_canonical retired at final assembly. The user-facing
+    # surface is now display ('Author (Year, p.N)' / '(Author Year, p.N)')
+    # end-to-end. Downstream validators consume display surfaces natively via
+    # parse_citations + display_lookup. The display_lookup itself is still
+    # built here because validators want it for doc_id resolution.
     display_lookup = _build_display_lookup(allowed_docs)
-    display_to_canonical_count = 0
-
-    def _display_to_canonical(text):
-        nonlocal display_to_canonical_count
-
-        def repl(m):
-            nonlocal display_to_canonical_count
-            label = m.group(1).strip().lower()
-            year = m.group(2)
-            page = int(m.group(3))
-            did = display_lookup.get((label, year))
-            if did:
-                display_to_canonical_count += 1
-                return render_citation_canonical(did, page)
-            return m.group(0)
-
-        # v10.2: handle both display shapes
-        text = DISPLAY_CITE_RE.sub(repl, text)
-        text = DISPLAY_PAREN_CITE_RE.sub(repl, text)
-        return text
-
-    full_text = _display_to_canonical(full_text)
-    if display_to_canonical_count and metrics:
-        metrics.inc("writer_display_to_canonical", display_to_canonical_count)
 
     # v14.2 fix #1: quote verification. Scan every '"..."' span >=20 chars,
     # locate the nearest canonical (doc_id: p.N) citation, and verify the
@@ -3288,10 +3731,12 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         with metrics.stage("writer_quote_verify"):
             full_text, quote_verify_stats = _strip_fabricated_quotes(
                 full_text, allowed_docs, metrics=metrics,
+                display_lookup=display_lookup,
             )
     else:
         full_text, quote_verify_stats = _strip_fabricated_quotes(
             full_text, allowed_docs, metrics=None,
+            display_lookup=display_lookup,
         )
     if metrics:
         metrics.set("writer_quote_verification", quote_verify_stats)
@@ -3322,69 +3767,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             f"(0 fabrications)"
         )
 
-    # v14.1 / v14.2 harmonisation dispatcher. RRR_HARMONISE_MODE selects:
-    #   "full"     — v14.1 single-LLM-call full-essay rewrite (default)
-    #   "per_para" — v14.2 cond A: per-paragraph rewrite, per-para citation
-    #                guard; rejection isolated to one paragraph
-    #   "off"      — skip the post-hoc rewrite entirely (use when relying on
-    #                chunk-gen-side fixes: extended stitch + strong prev-tail)
-    # Sits AFTER display->canonical so it operates on a stable citation
-    # surface, BEFORE validation/cleanup so anything it produces still passes
-    # through the same scrubbers as the original draft.
-    harmonise_mode = os.environ.get("RRR_HARMONISE_MODE", "full").lower()
-    if harmonise_mode == "off" or os.environ.get("RRR_WRITER_HARMONISE", "1") != "1":
-        harmonise_stats = {
-            "applied": False,
-            "fallback_reason": "mode_off" if harmonise_mode == "off" else "disabled",
-            "mode": harmonise_mode,
-            "cite_count_in": 0, "cite_count_out": 0,
-            "len_in": len(full_text), "len_out": len(full_text),
-            "duration_s": 0.0,
-        }
-    elif harmonise_mode == "per_para":
-        if metrics:
-            with metrics.stage("writer_harmonise"):
-                full_text, harmonise_stats = _apply_per_paragraph_harmonisation(
-                    full_text, topic, metrics=metrics,
-                )
-        else:
-            full_text, harmonise_stats = _apply_per_paragraph_harmonisation(
-                full_text, topic, metrics=None,
-            )
-    else:  # "full" (default)
-        if metrics:
-            with metrics.stage("writer_harmonise"):
-                full_text, harmonise_stats = _apply_full_essay_harmonisation(
-                    full_text, topic, metrics=metrics,
-                )
-        else:
-            full_text, harmonise_stats = _apply_full_essay_harmonisation(
-                full_text, topic, metrics=None,
-            )
-        harmonise_stats.setdefault("mode", "full")
-    if metrics:
-        metrics.set("writer_harmonisation", harmonise_stats)
-        if harmonise_stats.get("applied"):
-            metrics.inc("writer_harmonisation_applied")
-    if harmonise_stats.get("applied"):
-        if harmonise_mode == "per_para":
-            print(
-                f"[Writer] Harmonisation (per-para) applied: "
-                f"{harmonise_stats['paragraphs_rewritten']}/"
-                f"{harmonise_stats['paragraphs_with_cites']} paragraphs "
-                f"rewritten, {harmonise_stats['duration_s']}s "
-                f"(rejected: {dict(harmonise_stats.get('rejection_reasons') or {})})"
-            )
-        else:
-            print(
-                f"[Writer] Harmonisation (full) applied: "
-                f"{harmonise_stats['len_in']}ch -> {harmonise_stats['len_out']}ch, "
-                f"{harmonise_stats['cite_count_in']} cites preserved, "
-                f"{harmonise_stats['duration_s']}s"
-            )
-    else:
-        print(f"[Writer] Harmonisation skipped/rejected: mode={harmonise_mode} "
-              f"reason={harmonise_stats.get('fallback_reason')}")
+    # v15.7: harmonisation retired. The v14.1/v14.2 full-essay and
+    # per-paragraph rewriters were rejected in 4/4 v15.6 smoke runs as
+    # 'too_many_missing' (drift_tolerance=1 against 8-15 actual missing
+    # tuples). Cost: ~75s/run of LLM time for zero applied output. The
+    # drift-check used CITE_RE only, so it was structurally blind to
+    # display-form citations the harmoniser might drop. The v15.7 approach
+    # is to fix attribution and surface coherence upstream (renderer-as-
+    # attribution-gate + cleaner ALLOWED CITATIONS block + drop-aware
+    # postproc) rather than try to repair the assembled essay post-hoc.
+    # _apply_full_essay_harmonisation / _apply_per_paragraph_harmonisation
+    # and the RRR_HARMONISE_* env knobs remain in the module as dead code
+    # for diagnostic continuity; no call site in the production path.
 
     # v13: removed the legacy final-assembly arms (_repair_year_only_citations,
     # _fix_ajr_abbreviation, _strip_placeholder_citations, _extract_citation_dumps,
@@ -3397,7 +3791,10 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         if metrics:
             metrics.set("writer_bypass_validation", True)
     else:
-        full_text, removed_citations = _remove_invalid_citations(full_text, allowed_docs, allowed_pairs=allowed_pairs)
+        full_text, removed_citations = _remove_invalid_citations(
+            full_text, allowed_docs, allowed_pairs=allowed_pairs,
+            display_lookup=display_lookup,
+        )
         total_removed_citations += len(removed_citations)
     if removed_citations:
         print(f"[Writer] Removed {len(removed_citations)} invalid citation(s):")
@@ -3419,7 +3816,8 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # The v9 R6 safety-net dedupe is conservative (fires 0-6 times per smoke)
     # and disabling it has no production justification.
     full_text, redundancy_drops = _drop_cross_section_redundancy(
-        full_text, min_token_overlap=4,
+        full_text, min_token_overlap=4, display_lookup=display_lookup,
+        allowed_docs=allowed_docs,
     )
     if redundancy_drops:
         print(f"[Writer] Dropped {len(redundancy_drops)} redundant sentence(s) at final assembly:")
@@ -3489,14 +3887,43 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # net that drops the worst case (zero citations) when the model still
     # produces filler / bridging / methodology paragraphs. Conservative: only
     # drops a paragraph when no citation surface of any kind is present.
-    full_text, zero_cite_dropped, _zc_kept_closing = _drop_zero_citation_paragraphs(full_text)
+    # v15.7: strip coverage-fallback patch sentences when they are no longer
+    # load-bearing for paragraph coverage. v15.6 run 04 shipped the first
+    # line of the review as a verbatim 'A further source records ...' patch.
+    # Sentinel-tagged at fallback time; dropped here unless paragraph would
+    # become uncited otherwise.
+    full_text, n_patches_dropped, n_patches_kept = _strip_coverage_patches_when_safe(
+        full_text, allowed_docs, allowed_pairs, display_lookup=display_lookup,
+    )
+    if metrics:
+        metrics.set("writer_coverage_patches_dropped", n_patches_dropped)
+        metrics.set("writer_coverage_patches_shipped", n_patches_kept)
+    if n_patches_dropped or n_patches_kept:
+        print(
+            f"[Writer] Coverage patches: dropped={n_patches_dropped} "
+            f"shipped={n_patches_kept}"
+        )
+
+    # v15.7: pass keep_closing=True at final assembly. Without it, a closing
+    # paragraph whose only cited sentence was upstream-stripped would be
+    # silently deleted along with the rest of the structurally important
+    # synthesis paragraph. The per-chunk variant already uses keep_closing;
+    # this aligns final assembly with the same contract.
+    full_text, zero_cite_dropped, zc_kept_closing = _drop_zero_citation_paragraphs(
+        full_text, keep_closing=True
+    )
     if zero_cite_dropped and metrics:
         metrics.inc("writer_zero_cite_paragraphs_dropped", len(zero_cite_dropped))
         metrics.set("writer_zero_cite_paragraphs", zero_cite_dropped[:5])
+    if zc_kept_closing and metrics:
+        metrics.inc("writer_zero_cite_closing_kept")
+        metrics.set("writer_zero_cite_closing_kept_snippet", zc_kept_closing)
     if zero_cite_dropped:
         print(f"[Writer] Dropped {len(zero_cite_dropped)} zero-citation paragraph(s):")
         for snippet in zero_cite_dropped[:3]:
             print(f"         - {snippet}")
+    if zc_kept_closing:
+        print(f"[Writer] Kept weak closing (no recognised cite): {zc_kept_closing}")
 
     cited_docs = _collect_cited_docs(full_text, allowed_docs, author_year_to_docid)
     # v13: all_dump_citations was previously a side-channel from
@@ -3515,13 +3942,73 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     with open(runs_path("review_cited_docs.json"), "w", encoding="utf-8") as f:
         json.dump(cited_docids, f, indent=2)
 
+    # v15.7: quality_manifest.json — surfaces every observable quality
+    # signal the writer produced, plus snippets where applicable, so an
+    # operator (or the 9-battery harness) can grade a review without
+    # re-running the audit pipeline. NOT a runtime gate — the precheck
+    # decision stays one-shot at Stage 0 — but a transparent record of
+    # what the writer detected and self-healed.
+    quality_manifest = {
+        "schema_version": "v15.7",
+        "word_count": total_words,
+        "distinct_docs_cited": len(cited_docids),
+        "chunks_written": len(chunks),
+        # Attribution gate (renderer-as-gate; coverage retry on mismatch)
+        "attribution_mismatches": total_attribution_mismatches,
+        "attribution_retries": total_attribution_retries,
+        "attribution_mismatch_snippets": attribution_mismatch_snippets[:20],
+        # Evidence-id integrity
+        "unknown_evidence_ids": total_unknown_eids,
+        "unknown_evidence_id_snippets": unknown_eid_snippets[:10],
+        # Surface coherence (display-form leaks should now be 0 with the
+        # ALLOWED CITATIONS prompt fix; tracked here to detect regressions)
+        "invalid_citations_removed": total_removed_citations,
+        "double_paren_collapsed": total_double_paren_collapsed,
+        # Drop validators
+        "zero_cite_paragraphs_dropped": len(zero_cite_dropped),
+        "zero_cite_closing_kept": 1 if zc_kept_closing else 0,
+        "redundancy_drops": len(redundancy_drops),
+        "style_sentences_removed": total_style_removed,
+        # Coverage fallback
+        "coverage_fallbacks": total_coverage_fallbacks,
+        "coverage_patches_dropped_at_final": n_patches_dropped,
+        "coverage_patches_shipped_to_user": n_patches_kept,
+        # Quote verification
+        "quote_verify": {
+            "checked": quote_verify_stats.get("checked_quotes", 0),
+            "verified_real": quote_verify_stats.get("verified_real", 0),
+            "fabricated_stripped": quote_verify_stats.get("fabricated_stripped", 0),
+            "strand_guard_kept": quote_verify_stats.get("strand_guard_kept", 0),
+        },
+        # Outline (carried up from Stage 0/1/2 for one-stop quality view)
+        "outline": {
+            "topic_shape": (outline_plan or {}).get("topic_shape", ""),
+            "topic_cause": (outline_plan or {}).get("topic_cause", ""),
+            "topic_outcome": (outline_plan or {}).get("topic_outcome", ""),
+            "clusters_count": len((outline_plan or {}).get("clusters", [])),
+            "unassigned_share": (outline_plan or {}).get("unassigned_share"),
+            "relation_distribution": (outline_plan or {}).get("relation_distribution", {}),
+        },
+    }
+    with open(runs_path("quality_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(quality_manifest, f, indent=2)
+    print(
+        f"[Writer] quality_manifest.json written "
+        f"(attribution_mismatches={total_attribution_mismatches}, "
+        f"unknown_eids={total_unknown_eids}, "
+        f"display_leaks≈{total_removed_citations}, "
+        f"coverage_patches_shipped={n_patches_kept})"
+    )
+
     print(f"[Writer] review_composed.md written ({total_words} words).")
     print(
         f"[Writer] stats: chunks={len(chunks)} distinct_docs={len(cited_docids)} "
         f"removed={total_removed_citations} style_removed={total_style_removed} "
         f"coverage_fallbacks={total_coverage_fallbacks} evidence_id_renders={total_evidence_id_renders} "
         f"double_paren_collapsed={total_double_paren_collapsed} author_led_openings={total_author_led_openings} "
-        f"redundancy_drops={len(redundancy_drops)} bracket_id_rewrites={total_bracket_id_rewrites}"
+        f"redundancy_drops={len(redundancy_drops)} bracket_id_rewrites={total_bracket_id_rewrites} "
+        f"unknown_eids={total_unknown_eids} attribution_mismatches={total_attribution_mismatches} "
+        f"attribution_retries={total_attribution_retries}"
     )
     if metrics:
         metrics.set("writer_stats", {
@@ -3536,6 +4023,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "author_led_openings": total_author_led_openings,
             "redundancy_drops": len(redundancy_drops),
             "bracket_id_rewrites": total_bracket_id_rewrites,
+            "unknown_eids": total_unknown_eids,
+            "attribution_mismatches": total_attribution_mismatches,
+            "attribution_retries": total_attribution_retries,
             "section_claims": section_claims,
             "section_coverage": section_coverage,
         })
@@ -3545,6 +4035,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         metrics.inc("writer_evidence_id_renders", total_evidence_id_renders)
         metrics.inc("writer_double_paren_collapsed", total_double_paren_collapsed)
         metrics.inc("writer_author_led_openings", total_author_led_openings)
+        # v15.7: always emit attribution counters (even at 0) so the 9-battery
+        # can distinguish "fired with zero hits" from "never fired".
+        metrics.set("writer_unknown_evidence_id", total_unknown_eids)
+        metrics.set("writer_attribution_mismatches", total_attribution_mismatches)
+        metrics.set("writer_attribution_retries_total", total_attribution_retries)
+        if unknown_eid_snippets:
+            metrics.set("writer_unknown_evidence_id_snippets", unknown_eid_snippets[:10])
+        if attribution_mismatch_snippets:
+            metrics.set(
+                "writer_attribution_mismatch_snippets",
+                attribution_mismatch_snippets[:20],
+            )
         if total_bracket_id_rewrites:
             metrics.inc("writer_bracket_id_rewrites", total_bracket_id_rewrites)
 
@@ -3843,9 +4345,10 @@ def compose_from_ledger_single_pass(ledger_path=None, metrics=None):
     # ----- Postprocess pipeline (mirrors compose_from_ledger, same order) -----
     full_text = _strip_wrapping(raw)
 
-    full_text, evidence_renders = _render_evidence_id_citations(
+    full_text, _single_render_stats = _render_evidence_id_citations(
         full_text, evidence_id_map,
     )
+    evidence_renders = _single_render_stats["replacements"]
 
     # v14 FIX-BRACKET: rewrite [Doc_Year] bracketed canonical doc_ids before
     # display->canonical so the resulting display label gets normalised by

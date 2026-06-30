@@ -68,7 +68,7 @@ _KEEP_ALIVE = "30m"
 #       inclusive-clustering force-fit everything into clusters and
 #       unassigned_share never reached the refusal threshold
 _PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.5-cluster-streams-qualitative"
+_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.7-cluster-streams-soft-target"
 _POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.3-conduit-also-fires-on-adjacent"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
@@ -438,6 +438,14 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
         "Group these papers into clusters that separate the distinct "
         "streams of literature in this corpus. Each cluster is one "
         "stream: papers developing a related line of argument.",
+        "",
+        "Aim for 3-6 clusters. This is a soft target, not a quota: prefer "
+        "fewer, broader streams when papers cohere; only split further "
+        "when a single label would obscure a real intellectual disagreement. "
+        "Each cluster should typically hold 3+ papers; 1-2 paper clusters "
+        "are acceptable only when a paper truly stands alone in the corpus. "
+        "Over-splitting (10+ clusters from ~20 papers) produces redundant "
+        "sections that say the same thing under different labels.",
         "",
         "Use `unassigned_doc_ids` for papers that address a genuinely "
         "different question. Every doc_id appears EXACTLY ONCE. Do NOT "
@@ -1235,6 +1243,15 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
       - Full outline plan on success.
       - None if Stage 0 or Stage 1 fails irrecoverably (LLM error).
     """
+    # v15.7: initialise grounding-postcheck counters at 0 so the 9-battery
+    # can distinguish "never fired" from "fired with zero hits". They were
+    # previously absent from run_metrics.json when the postchecks took the
+    # zero-hit branch.
+    if metrics:
+        metrics.set("outline_posture_grounding_downgrades", 0)
+        metrics.set("outline_posture_grounding_promotions", 0)
+        metrics.set("outline_posture_conduit_promotions", 0)
+
     # Stage 0: corpus-fit + shape detection.
     pre = precheck(topic, doc_summaries, metrics=metrics)
     if not pre:

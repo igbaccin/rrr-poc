@@ -172,15 +172,28 @@ def _build_display_lookup(allowed_doc_ids):
     return lookup
 
 
-def parse_citations(text: str):
-    """Iterate citations in either the legacy or the v10 display surface.
+def parse_citations(text: str, display_lookup: dict = None):
+    """Iterate citations across all three production surfaces, with optional
+    doc_id resolution for display forms.
 
-    Yields {doc_id_or_label, year (optional), page, start, end, raw, surface}.
-    Validators downstream do their own canonical lookup against the corpus.
+    Yields {doc_id, label, year, page, start, end, raw, surface}.
+
+    v15.7: iterates DISPLAY_PAREN_CITE_RE in addition to CITE_RE and
+    DISPLAY_CITE_RE. When display_lookup is provided (via
+    _build_display_lookup(allowed_docs)), the display-form yields
+    populate doc_id by looking up (label_lowercase, year). When no
+    lookup is provided OR the (label, year) is unresolvable (collision
+    or unknown author), doc_id is None and the caller must handle it.
+
+    Validators that need (doc_id, page) tuples across all surfaces
+    (coverage audit, redundancy drop, invalid-cite removal) should pass
+    the display_lookup so display surfaces resolve consistently.
     """
     for match in CITE_RE.finditer(text or ""):
         yield {
             "doc_id": match.group(1),
+            "label": None,
+            "year": None,
             "page": int(match.group(2)),
             "start": match.start(),
             "end": match.end(),
@@ -188,15 +201,36 @@ def parse_citations(text: str):
             "surface": "canonical",
         }
     for match in DISPLAY_CITE_RE.finditer(text or ""):
+        label = match.group(1).strip()
+        year = match.group(2)
+        did = None
+        if display_lookup:
+            did = display_lookup.get((label.lower(), year))
         yield {
-            "doc_id": None,  # caller resolves via _build_display_lookup
-            "label": match.group(1).strip(),
-            "year": match.group(2),
+            "doc_id": did,
+            "label": label,
+            "year": year,
             "page": int(match.group(3)),
             "start": match.start(),
             "end": match.end(),
             "raw": match.group(0),
-            "surface": "display",
+            "surface": "display_narrative",
+        }
+    for match in DISPLAY_PAREN_CITE_RE.finditer(text or ""):
+        label = match.group(1).strip()
+        year = match.group(2)
+        did = None
+        if display_lookup:
+            did = display_lookup.get((label.lower(), year))
+        yield {
+            "doc_id": did,
+            "label": label,
+            "year": year,
+            "page": int(match.group(3)),
+            "start": match.start(),
+            "end": match.end(),
+            "raw": match.group(0),
+            "surface": "display_paren",
         }
 
 
