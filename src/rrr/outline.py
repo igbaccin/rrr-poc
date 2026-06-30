@@ -67,9 +67,9 @@ _KEEP_ALIVE = "30m"
 #     - off-topic corpora wrote 1.4k-word hallucinated reviews because
 #       inclusive-clustering force-fit everything into clusters and
 #       unassigned_share never reached the refusal threshold
-_PRECHECK_PROMPT_VERSION = "2026-06-30-v15.1.0-precheck"
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.1.0-cluster-shape-input"
-_POSTURE_PROMPT_VERSION = "2026-06-30-v15a-posture"
+_PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
+_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.2.0-cluster-outcome-anchored"
+_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.0-posture-anchored"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
 # v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
@@ -270,14 +270,40 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "answer when the mismatch is OBVIOUS from the titles — when no "
         "reasonable scholar would expect these papers to address this "
         "question. Do not refuse on weak fit, only on no honest fit.\n\n"
+        "## PART 3 — CAUSAL SLOTS (skip if topic_shape != causal)\n"
+        "If you picked topic_shape=\"causal\", also identify the topic's "
+        "EXPLANATORY structure as two pinned slots that every downstream "
+        "stage will reference verbatim:\n\n"
+        "  - topic_cause: a SHORT noun phrase (<=80 chars) for the variable "
+        "the topic claims is doing the EXPLAINING — the explanans.\n"
+        "  - topic_outcome: a SHORT noun phrase (<=80 chars) for the "
+        "phenomenon the topic claims is being EXPLAINED — the explanandum.\n\n"
+        "These slots are the most important fields you produce. Every "
+        "downstream classification of an individual paper's relation to the "
+        "topic is anchored on these two strings. Be CONCRETE and use the "
+        "topic's own wording where possible.\n\n"
+        "Examples (cross-domain, on purpose):\n"
+        "  Topic \"Sleep deprivation impairs immune function.\" -> "
+        "topic_cause=\"sleep deprivation\", topic_outcome=\"impaired immune "
+        "function\".\n"
+        "  Topic \"Phonemic awareness in early childhood predicts later "
+        "reading skill.\" -> topic_cause=\"phonemic awareness in early "
+        "childhood\", topic_outcome=\"later reading skill\".\n"
+        "  Topic \"Mediterranean diet reduces cardiovascular disease risk.\" "
+        "-> topic_cause=\"mediterranean diet\", topic_outcome=\"reduced "
+        "cardiovascular disease risk\".\n\n"
+        "For comparative or descriptive topics leave both fields as empty "
+        "strings — they are not used.\n\n"
         "## OUTPUT\n"
-        "Return ONE JSON object with EXACTLY these four keys:\n"
+        "Return ONE JSON object with EXACTLY these six keys:\n"
         "  topic_shape: \"causal\" | \"comparative\" | \"descriptive\"\n"
         "  topic_shape_rationale: one sentence (<=200 chars) defending the "
         "shape choice, quoting the topic's phrasing.\n"
         "  corpus_fit: \"PROCEED\" | \"REFUSE\"\n"
         "  corpus_fit_rationale: one sentence (<=240 chars) — if REFUSE, name "
-        "the domain mismatch concretely.\n\n"
+        "the domain mismatch concretely.\n"
+        "  topic_cause: noun phrase (<=80 chars) or empty string\n"
+        "  topic_outcome: noun phrase (<=80 chars) or empty string\n\n"
         "Return ONLY the JSON object."
     )
 
@@ -291,11 +317,22 @@ def _validate_precheck(obj) -> Optional[dict]:
     fit = str(obj.get("corpus_fit", "")).strip().upper()
     if fit not in ("PROCEED", "REFUSE"):
         return None
+    # v15.2.0: causal topics MUST emit non-empty topic_cause + topic_outcome
+    # (the pinned explanans/explanandum that Stage 1 outcome-anchors on and
+    # Stage 2 pins as fixed reference points). Comparative/descriptive shapes
+    # leave them empty until v15.3.0 extends per-shape slot extraction.
+    topic_cause = str(obj.get("topic_cause", "") or "").strip()[:120]
+    topic_outcome = str(obj.get("topic_outcome", "") or "").strip()[:120]
+    if shape == "causal" and fit == "PROCEED":
+        if not topic_cause or not topic_outcome:
+            return None
     return {
         "topic_shape": shape,
         "topic_shape_rationale": str(obj.get("topic_shape_rationale", "") or "").strip()[:300],
         "corpus_fit": fit,
         "corpus_fit_rationale": str(obj.get("corpus_fit_rationale", "") or "").strip()[:400],
+        "topic_cause": topic_cause,
+        "topic_outcome": topic_outcome,
     }
 
 
@@ -369,12 +406,46 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[di
 # Stage 1 — CLUSTER
 
 def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
-                          topic_shape: str = "causal") -> str:
+                          topic_shape: str = "causal",
+                          topic_outcome: str = "") -> str:
+    has_outcome = bool(topic_outcome) and topic_shape == "causal"
+    outcome_block = (
+        f"TOPIC OUTCOME (the phenomenon being explained): {topic_outcome}\n"
+        if has_outcome else ""
+    )
+    # v15.2.0: clustering is now OUTCOME-anchored for causal topics. The
+    # explanandum (outcome) is the disambiguator that prevents Stage 1 from
+    # homogenising clusters of "papers that argue institutions" into a single
+    # bland "institutional development" cluster, which is what produced the
+    # 3/9 GD collapse in v15.0.2. Stage 1 deliberately DOES NOT see the
+    # topic's cause — that would push it back toward stance bucketing.
+    outcome_rule = (
+        "  - For this CAUSAL topic, the OUTCOME above (the explanandum) is "
+        "the disambiguator. Read each paper's claim as an ANSWER to the "
+        "question \"What explains the outcome?\". Group papers whose ANSWERS "
+        "name the same cause (in the paper's own language). Two papers that "
+        "name the same outcome but offer DIFFERENT explanatory causes belong "
+        "in DIFFERENT clusters, not the same one — even if their causes "
+        "could be linked in some longer story.\n"
+        if has_outcome else ""
+    )
+    # `shared_cause` is the new v15.2.0 output field — the cluster's
+    # distinctive causal answer to the outcome question. Used downstream by
+    # Stage 2 to pin the cluster's cause when judging its relation to
+    # topic_cause. Falls back to shared_thread when empty.
+    cause_field_doc = (
+        "    - shared_cause: 5-12 word noun phrase naming the cluster's "
+        "distinctive cause / explanatory mechanism (drawn from the papers' "
+        "own claim language). Required for causal topics; empty string for "
+        "other shapes.\n"
+        if has_outcome else ""
+    )
     lines = [
         "You are organising a corpus of academic papers for a literature review.",
         "",
         f"TOPIC: {topic}",
         f"TOPIC SHAPE (already detected in Stage 0): {topic_shape}",
+        outcome_block.rstrip("\n") if outcome_block else "",
         "",
         "Below are the central claims of every paper that survived initial "
         "retrieval. Your task is to group the papers into CLUSTERS by what "
@@ -382,27 +453,28 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
         "upstream; focus only on the clustering.",
         "",
         "CLUSTERING RULES:",
-        "  - Aim for 3 to 6 clusters that TOGETHER cover the BULK of the "
-        "corpus. At least 80% of papers should land in some cluster. Most "
-        "academic literatures have substantial overlap; default to FITTING "
-        "papers into the nearest cluster, not to excluding them.",
+        outcome_rule.rstrip("\n") if outcome_rule else
         "  - Group papers that argue SIMILAR things — same causal mechanism, "
-        "same comparison verdict, same descriptive account. Do NOT cluster by "
-        "their relationship to the topic (yet — that comes later).",
-        "  - Threads can be BROAD. A broad thread that captures 6 papers (e.g. "
-        "\"institutional persistence and long-run growth\") is BETTER than a "
-        "narrow thread that captures 2 (e.g. \"colonial-era property rights "
-        "in 19th-century West Africa\"). When in doubt, widen the thread.",
-        "  - Each cluster gets a SHORT shared_thread label (5-10 words) that "
-        "names what the cluster's papers have in common.",
+        "same comparison verdict, same descriptive account.",
+        "  - Aim for 3 to 6 clusters that TOGETHER cover the BULK of the "
+        "corpus. At least 80% of papers should land in some cluster.",
+        "  - Threads should be SPECIFIC enough to name the cluster's "
+        "distinctive cause or claim, not so broad that two competing causes "
+        "fall into one cluster. \"Settler mortality shapes extractive "
+        "institutions\" is a good thread; \"institutional development\" is "
+        "too broad and will lump rival causal stories together.",
+        "  - Each cluster gets a SHORT shared_thread label (5-10 words).",
         "  - Use `unassigned_doc_ids` ONLY for papers that genuinely address "
         "a completely different question — a different intellectual domain, "
-        "a different subject matter, or a different unit of analysis. A "
-        "paper that is RELEVANT but harder to place than others belongs in "
-        "the nearest cluster. Do NOT use unassigned as an \"uncertain\" "
-        "bucket.",
+        "subject matter, or unit of analysis. Do NOT use unassigned as an "
+        "\"uncertain\" bucket. Relevant-but-harder-to-place papers go to "
+        "their nearest cluster.",
         "  - Every doc_id must appear EXACTLY ONCE (either inside one cluster "
         "or in unassigned_doc_ids).",
+        "  - DO NOT pick relations or stances. Stage 2 (a later call) decides "
+        "each cluster's relationship to the topic; your output here must "
+        "stay free of labels like 'supports', 'critiques', 'rival', "
+        "'upstream' — group only by what the papers ARGUE.",
         "",
         "PAPERS:",
     ]
@@ -413,10 +485,12 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
     lines += [
         "",
         "Return ONE JSON object with EXACTLY these keys:",
-        "  clusters: array of {cluster_id, doc_ids, shared_thread}",
+        "  clusters: array of {cluster_id, doc_ids, shared_thread, shared_cause}",
         "    - cluster_id: a short tag like \"C1\", \"C2\", ...",
         "    - doc_ids: array of doc_id strings from the list above",
-        "    - shared_thread: 5-10 word noun phrase",
+        "    - shared_thread: 5-10 word noun phrase summarising the cluster",
+        cause_field_doc.rstrip("\n") if cause_field_doc else
+        "    - shared_cause: empty string (only used for causal topics)",
         "  unassigned_doc_ids: array of doc_id strings",
         "",
         "Return ONLY the JSON object. No commentary.",
@@ -439,6 +513,7 @@ def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optiona
             continue
         cid = str(c.get("cluster_id", "") or f"C{i+1}").strip() or f"C{i+1}"
         thread = str(c.get("shared_thread", "") or "").strip()[:160]
+        cause = str(c.get("shared_cause", "") or "").strip()[:160]
         raw_ids = c.get("doc_ids") or []
         if not isinstance(raw_ids, list):
             continue
@@ -453,6 +528,11 @@ def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optiona
                 "cluster_id": cid,
                 "doc_ids": doc_ids,
                 "shared_thread": thread,
+                # v15.2.0: shared_cause is the cluster's distinctive
+                # explanatory variable for causal topics; empty for other
+                # shapes. Stage 2 uses this to pin the cluster's cause when
+                # judging its relation to topic_cause.
+                "shared_cause": cause,
             })
 
     raw_unassigned = obj.get("unassigned_doc_ids") or []
@@ -482,6 +562,7 @@ def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optiona
 
 def cluster_papers(topic: str, doc_summaries: List[dict],
                    topic_shape: str = "causal",
+                   topic_outcome: str = "",
                    metrics=None) -> Optional[dict]:
     """Stage 1. One LLM call. Returns ClusterPlan dict or None on failure.
 
@@ -508,7 +589,7 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
     if metrics:
         metrics.cache_event("outline_cluster", "misses")
 
-    prompt = _build_cluster_prompt(topic, doc_claims, topic_shape=topic_shape)
+    prompt = _build_cluster_prompt(topic, doc_claims, topic_shape=topic_shape, topic_outcome=topic_outcome)
     raw = ""
     try:
         import ollama
@@ -577,29 +658,66 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
 
 def _scaffold_for_shape(topic_shape: str) -> str:
     if topic_shape == "causal":
+        # v15.2.0: scaffold rebuilt to anchor on the EXPLANANDUM (the shared
+        # outcome both causes purport to explain) and to put the rival test
+        # FIRST. The v15.0.x scaffold gave upstream a positive mechanical
+        # test ("flows INTO") but only a negative description for rival
+        # ("REPLACES and does NOT operate through"), and added an asymmetric
+        # "Key trap" warning that pushed every cluster away from rival. The
+        # v15.0.2 GD smoke confirmed that bias: North_1989 was upstream 9/9
+        # on a topic where it is the canonical rival, and AJR_2002 collapsed
+        # to upstream in 3/9 runs. Rival is now Test R, applied first.
         return (
             "Before choosing `relation`, write `reasoning_trace` answering "
-            "these THREE questions in order:\n"
-            "  (i) What CAUSAL VARIABLE does the topic name as the cause? "
-            "(Quote the topic phrasing.)\n"
-            "  (ii) What CAUSAL VARIABLE do this cluster's papers name as the "
-            "cause? (Quote the language from at least one paper's claim.)\n"
-            "  (iii) Is the cluster's causal variable: (A) the topic's variable "
-            "under a different label or a more specific instance — "
-            "`same_as_topic_cause`; (B) something UPSTREAM that flows INTO the "
-            "topic's variable as a trigger — `upstream_of_topic_cause`; "
-            "(C) something the topic's variable itself produces — "
-            "`downstream_of_topic_cause`; (D) a RIVAL cause that REPLACES the "
-            "topic's variable and does NOT operate through it — "
-            "`rival_to_topic_cause`; (E) a SCOPE CONDITION (the topic's claim "
-            "holds in some settings but not others) — `scope_condition`; "
-            "(F) unrelated subject matter — `adjacent`.\n\n"
-            "Key trap: a paper that uses \"X, contra Y\" phrasing is NOT "
-            "necessarily a rival. If X re-expresses the topic's cause, or X "
-            "flows INTO the topic's cause, the relation is "
-            "`same_as_topic_cause` or `upstream_of_topic_cause` — not "
-            "`rival_to_topic_cause`. Decide on causal STRUCTURE, not surface "
-            "rhetoric."
+            "the following tests IN ORDER. Take the FIRST test whose "
+            "condition the cluster satisfies — do not keep testing once you "
+            "have an answer.\n\n"
+            "FOUNDATION — write FIRST, before any test:\n"
+            "  Quote (verbatim, in the cluster's own words) the CAUSE the "
+            "cluster names. This is `cluster_cause_quote`. Then quote "
+            "(verbatim, in the cluster's own words) the OUTCOME the cluster "
+            "explains. This is `cluster_outcome_quote`. If the cluster says "
+            "almost nothing about either, the relation is `adjacent` and you "
+            "may skip the remaining tests.\n\n"
+            "TEST R — RIVAL (apply first, by design):\n"
+            "  Do the cluster's CAUSE and the topic's CAUSE both purport to "
+            "EXPLAIN the SAME OUTCOME (the topic's outcome)? Two causes are "
+            "RIVAL when both are offered as the answer to the same "
+            "WHY-question and accepting one as the fundamental explanation "
+            "would mean rejecting the other as fundamental. If yes -> "
+            "`rival_to_topic_cause`. Rival is the default whenever two "
+            "DIFFERENT causes both explain the same outcome at the same "
+            "level (both fundamental, both proximate, both mechanism-level). "
+            "Two causes can be rival even when one paper does not "
+            "explicitly attack the other — what matters is that they offer "
+            "COMPETING ANSWERS to the same WHY-question.\n\n"
+            "TEST S — SAME-AS (re-expression, not rivalry):\n"
+            "  Is the cluster's cause the topic's cause under a DIFFERENT "
+            "LABEL or a more SPECIFIC INSTANCE of the same variable? (e.g. "
+            "\"extractive institutions\" is an instance of \"institutions\"). "
+            "If yes -> `same_as_topic_cause`.\n\n"
+            "TEST U — UPSTREAM (only when a mechanism is quotable):\n"
+            "  Does the cluster's cause flow INTO the topic's cause via a "
+            "MECHANISM the cluster's own claims actually NAME? You must be "
+            "able to write the chain `cluster_cause -> topic_cause -> "
+            "topic_outcome` using language from the cluster_cause_quote and "
+            "cluster_outcome_quote. If the chain requires words the cluster "
+            "does not use, this test FAILS and you should consider Test R "
+            "(rival) instead — a cause whose link to the topic cause is "
+            "speculative on your part rather than asserted by the cluster "
+            "is NOT upstream. If chain is quotable -> "
+            "`upstream_of_topic_cause`.\n\n"
+            "TEST D — DOWNSTREAM:\n"
+            "  Is the cluster's cause itself a CONSEQUENCE of the topic's "
+            "cause (the cluster studies what happens AFTER the topic's "
+            "cause acts)? -> `downstream_of_topic_cause`.\n\n"
+            "TEST C — SCOPE CONDITION:\n"
+            "  Does the cluster accept the topic's claim but identify WHEN "
+            "OR WHERE it holds vs fails (period limits, regional limits, "
+            "measurement limits)? -> `scope_condition`.\n\n"
+            "ADJACENT — fallback only:\n"
+            "  If none of the tests above apply — the cluster talks about a "
+            "different outcome or a different subject — -> `adjacent`."
         )
     if topic_shape == "comparative":
         return (
@@ -639,12 +757,30 @@ def _allowed_relations_block(topic_shape: str) -> str:
 
 
 def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
-                          cluster_evidence: Dict[str, List[str]]) -> str:
+                          cluster_evidence: Dict[str, List[str]],
+                          topic_cause: str = "",
+                          topic_outcome: str = "") -> str:
+    # v15.2.0: pin TOPIC CAUSE and TOPIC OUTCOME at the prompt header for
+    # causal topics. These are the explanans/explanandum extracted in
+    # Stage 0 — every cluster's relation judgment must anchor on these
+    # fixed strings, not re-derive them.
+    pin_lines = []
+    if topic_shape == "causal" and topic_cause:
+        pin_lines.append(f"TOPIC CAUSE (explanans, pinned): {topic_cause}")
+    if topic_shape == "causal" and topic_outcome:
+        pin_lines.append(f"TOPIC OUTCOME (explanandum, pinned): {topic_outcome}")
+    cluster_cause = (cluster.get("shared_cause") or "").strip()
+    cluster_cause_line = (
+        f"CLUSTER'S DISTINCTIVE CAUSE (from Stage 1): {cluster_cause}"
+        if cluster_cause else ""
+    )
     lines = [
         f"TOPIC: {topic}",
-        f"TOPIC SHAPE (from Stage 1): {topic_shape}",
+        f"TOPIC SHAPE (from Stage 0): {topic_shape}",
+        *pin_lines,
         "",
         f"CLUSTER LABEL (from Stage 1): {cluster.get('shared_thread','')}",
+        cluster_cause_line,
         "",
         "PAPERS IN THIS CLUSTER:",
     ]
@@ -703,6 +839,8 @@ def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dic
 
 def posture_cluster(topic: str, topic_shape: str, cluster: dict,
                     cluster_evidence: Dict[str, List[str]],
+                    topic_cause: str = "",
+                    topic_outcome: str = "",
                     metrics=None) -> Optional[dict]:
     """Stage 2. One LLM call per cluster.
 
@@ -720,7 +858,8 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
     if metrics:
         metrics.cache_event("outline_posture", "misses")
 
-    prompt = _build_posture_prompt(topic, topic_shape, cluster, cluster_evidence)
+    prompt = _build_posture_prompt(topic, topic_shape, cluster, cluster_evidence,
+                                   topic_cause=topic_cause, topic_outcome=topic_outcome)
     valid_doc_ids = set(doc_ids)
     raw = ""
     try:
@@ -776,12 +915,91 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
         if posture is None:
             return None
 
+    # v15.2.0: deterministic mechanism-grounding post-check. When the
+    # model picks `upstream_of_topic_cause` for a causal topic, verify the
+    # reasoning_trace actually shares enough content words with the
+    # cluster's claims to defend the "flows INTO" chain. If the model is
+    # template-filling rather than reading the cluster, downgrade to
+    # `adjacent` (the safe option — admits uncertainty rather than create
+    # false rivals). Only applies to causal topics where we have a
+    # cluster_cause string to ground against.
+    cluster_cause = (cluster.get("shared_cause") or "").strip()
+    cluster_thread = (cluster.get("shared_thread") or "").strip()
+    grounding_source = cluster_cause or cluster_thread
+    if (topic_shape == "causal"
+            and posture.get("relation") == "upstream_of_topic_cause"
+            and grounding_source):
+        reasoning = posture.get("reasoning_trace", "") or ""
+        if _mechanism_grounding_fails(reasoning, grounding_source):
+            posture["relation"] = "adjacent"
+            posture["mechanism_grounding"] = "downgraded_upstream_to_adjacent"
+            if metrics:
+                metrics.inc("outline_posture_grounding_downgrades")
+
     posture["model"] = _MODEL
     posture["prompt_version"] = _POSTURE_PROMPT_VERSION
     _save_cache("posture", sig, posture)
     if metrics:
         metrics.cache_event("outline_posture", "writes")
     return posture
+
+
+# ---------------------------------------------------------------------------
+# v15.2.0: mechanism-grounding sanity check (deterministic, no LLM).
+# When the model picks `upstream_of_topic_cause`, its reasoning_trace
+# must share at least 2 content-word stems with the cluster's
+# shared_cause/shared_thread. Otherwise it's template-filling and gets
+# downgraded to `adjacent` (safe — don't create false rivals).
+
+_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "by", "with",
+    "and", "or", "but", "as", "is", "are", "was", "were", "be", "been",
+    "being", "this", "that", "these", "those", "it", "its", "they", "their",
+    "them", "we", "us", "our", "i", "me", "my", "you", "your", "he", "she",
+    "his", "her", "from", "into", "onto", "upon", "out", "over", "under",
+    "between", "through", "via", "than", "then", "thus", "hence", "also",
+    "not", "no", "yes", "if", "when", "where", "while", "because", "so",
+    "more", "less", "most", "least", "some", "any", "all", "each", "every",
+    "such", "same", "different", "other", "another", "one", "two", "first",
+    "second", "do", "does", "did", "have", "has", "had", "having",
+    "cause", "causes", "caused", "causing",
+    "effect", "effects", "explain", "explains", "explained",
+    "topic", "cluster", "paper", "papers", "literature", "stream",
+    "argument", "claim", "claims", "argues", "argue",
+})
+
+
+def _stem(word: str) -> str:
+    """Cheap suffix-stripper. Good enough to map plurals/tenses to the
+    same key (institutions -> institut, slavery -> slaver, growing ->
+    grow, mortality -> mortal). No NLP dependency."""
+    w = word.lower()
+    for suf in ("ational", "tional", "ization", "ising", "izing",
+                "ation", "ition", "ments", "ness", "able", "ible",
+                "ity", "ies", "ied", "ing", "ed", "es", "s", "y"):
+        if len(w) > len(suf) + 3 and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
+
+
+def _content_stems(text: str) -> set:
+    if not text:
+        return set()
+    toks = re.findall(r"[A-Za-z][A-Za-z\-]+", text.lower())
+    return {_stem(t) for t in toks if t not in _STOPWORDS and len(t) > 3}
+
+
+def _mechanism_grounding_fails(reasoning: str, grounding_source: str) -> bool:
+    """Return True when the model's reasoning_trace shares fewer than 2
+    content-word stems with the cluster's shared_cause / shared_thread.
+    A True return means the upstream claim is not grounded in the
+    cluster's own language and should be downgraded to adjacent."""
+    r_stems = _content_stems(reasoning)
+    g_stems = _content_stems(grounding_source)
+    if not g_stems:
+        return False  # nothing to ground against; let the LLM call stand
+    overlap = r_stems & g_stems
+    return len(overlap) < 2
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1125,8 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
         return None
 
     topic_shape = pre["topic_shape"]
+    topic_cause = pre.get("topic_cause", "") or ""
+    topic_outcome = pre.get("topic_outcome", "") or ""
     if pre["corpus_fit"] == "REFUSE":
         return {
             "refused": True,
@@ -915,6 +1135,8 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
             "topic": topic,
             "topic_shape": topic_shape,
             "topic_shape_rationale": pre.get("topic_shape_rationale", ""),
+            "topic_cause": topic_cause,
+            "topic_outcome": topic_outcome,
             "admitted_total": len({d.get("doc_id") for d in doc_summaries if d.get("doc_id")}),
             "clusters": [],
             "unassigned_doc_ids": [d.get("doc_id") for d in doc_summaries if d.get("doc_id")],
@@ -925,7 +1147,10 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
             "precheck_prompt_version": _PRECHECK_PROMPT_VERSION,
         }
 
-    plan = cluster_papers(topic, doc_summaries, topic_shape=topic_shape, metrics=metrics)
+    plan = cluster_papers(topic, doc_summaries,
+                          topic_shape=topic_shape,
+                          topic_outcome=topic_outcome,
+                          metrics=metrics)
     if not plan:
         return None
     summaries_by_doc = {
@@ -955,7 +1180,10 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
         cluster_for_call["claims_by_doc"] = claims_by_doc
         evidence_by_doc = {did: _evidence_of(did) for did in c["doc_ids"]}
         posture = posture_cluster(topic, topic_shape, cluster_for_call,
-                                  evidence_by_doc, metrics=metrics)
+                                  evidence_by_doc,
+                                  topic_cause=topic_cause,
+                                  topic_outcome=topic_outcome,
+                                  metrics=metrics)
         if posture is None:
             # Conservative fallback: tag the cluster as `adjacent` with a
             # generic elaboration so the rest of the pipeline does not crash.
@@ -1001,6 +1229,9 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
     return {
         "topic": topic,
         "topic_shape": topic_shape,
+        "topic_cause": topic_cause,
+        "topic_outcome": topic_outcome,
+        "topic_shape_rationale": pre.get("topic_shape_rationale", ""),
         "clusters": enriched_clusters,
         "unassigned_doc_ids": plan.get("unassigned_doc_ids") or [],
         "ordered_cluster_ids": ordered_ids,
@@ -1008,6 +1239,7 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
         "unassigned_share": round(n_unassigned / total_admitted, 3) if total_admitted else 0.0,
         "relation_distribution": relation_counts,
         "model": _MODEL,
+        "precheck_prompt_version": _PRECHECK_PROMPT_VERSION,
         "cluster_prompt_version": _CLUSTER_PROMPT_VERSION,
         "posture_prompt_version": _POSTURE_PROMPT_VERSION,
         "order_prompt_version": _ORDER_PROMPT_VERSION,
