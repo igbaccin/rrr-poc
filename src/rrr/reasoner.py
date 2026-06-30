@@ -1754,16 +1754,30 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
           f"unassigned_share={outline_plan.get('unassigned_share')} "
           f"relations={outline_plan.get('relation_distribution')}")
 
+    # Persist the outline plan to disk REGARDLESS of refusal so future
+    # debugging has the cluster/relation/unassigned breakdown. The full
+    # ledger writes later; this is a small standalone dump.
+    try:
+        with open(runs_path("outline_plan.json"), "w", encoding="utf-8") as _f:
+            json.dump(outline_plan, _f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
     # v15: corpus-fit refusal — fires when too many admitted papers could not
     # be clustered into any stream. This is the structural analogue of
     # v14.4's tangential-fraction refusal but driven by the outline's own
     # unassigned bucket, which is a much sharper signal than per-paper
     # stance because Stage 1 sees the whole corpus at once. Threshold knob:
-    # RRR_UNASSIGNED_REFUSAL_THRESHOLD (default 0.5). Disable with >=1.0.
+    # RRR_UNASSIGNED_REFUSAL_THRESHOLD. v15.0.1 default raised from 0.5 to
+    # 0.7 — the v15.0 INST smoke had unassigned_share=0.58 on a clearly
+    # on-topic corpus because Stage 1's prompt was too eager to dump
+    # borderline papers; the v15b inclusive-clustering prompt + a more
+    # permissive threshold gives the pipeline more room to proceed on
+    # legitimately-on-topic corpora. Disable with >=1.0.
     try:
-        unassigned_threshold = float(os.environ.get("RRR_UNASSIGNED_REFUSAL_THRESHOLD", "0.5"))
+        unassigned_threshold = float(os.environ.get("RRR_UNASSIGNED_REFUSAL_THRESHOLD", "0.7"))
     except ValueError:
-        unassigned_threshold = 0.5
+        unassigned_threshold = 0.7
     if unassigned_threshold <= 0.0 or unassigned_threshold > 1.0:
         unassigned_threshold = 1.01  # effectively disabled
     unassigned_share = float(outline_plan.get("unassigned_share") or 0.0)

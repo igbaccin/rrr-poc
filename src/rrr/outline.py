@@ -57,7 +57,12 @@ _MODEL = os.environ.get(
 _KEEP_ALIVE = "30m"
 
 # Bump on prompt changes to invalidate downstream caches.
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15a-cluster"
+# v15.0.1: cluster prompt rewritten to encourage INCLUSIVE clustering
+# (v15.0 smoke run-1 had unassigned_share=0.58 because the v15a prompt
+# gave the model too much permission to dump borderline papers into
+# unassigned). Threshold default also raised from 0.5 to 0.7 in
+# reasoner.py to match.
+_CLUSTER_PROMPT_VERSION = "2026-06-30-v15b-cluster-inclusive"
 _POSTURE_PROMPT_VERSION = "2026-06-30-v15a-posture"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
@@ -191,15 +196,25 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]]) -> str:
         "pattern is observed, what features X has — no single causal claim.",
         "",
         "CLUSTERING RULES:",
-        "  - Aim for 3 to 6 clusters across the corpus.",
+        "  - Aim for 3 to 6 clusters that TOGETHER cover the BULK of the "
+        "corpus. At least 80% of papers should land in some cluster. Most "
+        "academic literatures have substantial overlap; default to FITTING "
+        "papers into the nearest cluster, not to excluding them.",
         "  - Group papers that argue SIMILAR things — same causal mechanism, "
         "same comparison verdict, same descriptive account. Do NOT cluster by "
         "their relationship to the topic (yet — that comes later).",
+        "  - Threads can be BROAD. A broad thread that captures 6 papers (e.g. "
+        "\"institutional persistence and long-run growth\") is BETTER than a "
+        "narrow thread that captures 2 (e.g. \"colonial-era property rights "
+        "in 19th-century West Africa\"). When in doubt, widen the thread.",
         "  - Each cluster gets a SHORT shared_thread label (5-10 words) that "
         "names what the cluster's papers have in common.",
-        "  - A paper that genuinely does not share a thread with any other "
-        "paper goes to `unassigned_doc_ids` rather than being forced into a "
-        "weak fit.",
+        "  - Use `unassigned_doc_ids` ONLY for papers that genuinely address "
+        "a completely different question — a different intellectual domain, "
+        "a different subject matter, or a different unit of analysis. A "
+        "paper that is RELEVANT but harder to place than others belongs in "
+        "the nearest cluster. Do NOT use unassigned as an \"uncertain\" "
+        "bucket.",
         "  - Every doc_id must appear EXACTLY ONCE (either inside one cluster "
         "or in unassigned_doc_ids).",
         "",
