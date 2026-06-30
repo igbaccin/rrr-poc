@@ -325,14 +325,22 @@ _EID_LOOKBACK_CHARS = 80
 
 
 def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
-    """v15.5: context-aware evidence-ID renderer. For each [E####] marker:
-      - if the author surname(s) appear in the preceding ~80 chars of
-        prose, render as just '(Year, p.N)' so the author is not repeated
-      - otherwise render as the parenthetical '(Author Year, p.N)'
+    """v15.6: context-aware evidence-ID renderer. For each [E####] marker:
+      - if the author label is IMMEDIATELY before the marker (the
+        immediate prior text ends with the surname label), render as
+        just '(Year, p.N)' so the result forms 'Author (Year, p.N)' —
+        which DISPLAY_CITE_RE recognises as a citation.
+      - otherwise render as the parenthetical '(Author Year, p.N)' —
+        which DISPLAY_PAREN_CITE_RE recognises.
 
-    This replaces the v15.x narrative-vs-parenthetical postproc chain.
-    The writer never decides citation surface; the renderer does it
-    deterministically based on what the prose already says.
+    v15.5 used a substring-anywhere-in-last-60-chars check, which fired
+    on 'Mokyr argues that institutions follow from technology [E0001]'
+    and rendered the marker as a bare '(1989, p.5)' embedded in lowercase
+    prose. That bare-year form matches NEITHER DISPLAY_CITE_RE nor
+    DISPLAY_PAREN_CITE_RE nor CITE_RE, so paragraphs whose only cites
+    were bare-year were dropped by _drop_zero_citation_paragraphs at
+    final assembly. The stricter adjacency check below guarantees every
+    rendered citation is visible to at least one downstream regex.
     """
     if not text:
         return text or "", 0
@@ -353,14 +361,33 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
         ym = re.match(r"^.*?\((\d{4}[a-z]?)\)\s*$", full_label)
         year = ym.group(1) if ym else ""
 
+        # v15.6: stricter adjacency — author label must END the immediate
+        # prefix (no intervening prose). Case-insensitive because the
+        # model may capitalise particle prefixes (Van/van).
         prefix = text[max(0, match.start() - _EID_LOOKBACK_CHARS):match.start()]
-        author_in_prose = bool(surnames) and surnames.lower() in prefix[-60:].lower()
+        immediate = prefix.rstrip()
+        if surnames:
+            escaped = re.escape(surnames)
+            adjacency_re = re.compile(rf"(?<![A-Za-z0-9_]){escaped}$", re.IGNORECASE)
+            # Also accept if immediate is exactly the label (start of string).
+            author_immediately_before = (
+                immediate.lower().endswith(surnames.lower())
+                and (
+                    immediate.lower() == surnames.lower()
+                    or bool(adjacency_re.search(immediate))
+                )
+            )
+        else:
+            author_immediately_before = False
 
-        if author_in_prose and year:
-            # Author already named in prose: just (Year, p.N).
+        if author_immediately_before and year:
+            # Author label is right before the marker: emit bare
+            # (Year, p.N). Surrounding prose forms 'Author (Year, p.N)'
+            # which DISPLAY_CITE_RE matches.
             rendered = f"({year}, p.{page})"
         elif surnames and year:
-            # Author not in prose: parenthetical form (Author Year, p.N).
+            # Author not immediately adjacent: emit (Author Year, p.N).
+            # DISPLAY_PAREN_CITE_RE matches.
             rendered = f"({surnames} {year}, p.{page})"
         else:
             # Fall back to canonical narrative renderer.
@@ -2878,10 +2905,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         )
         total_bracket_id_rewrites += bracket_rewrites
 
-        # v15.5: _chunk_display_to_canonical + _collapse_double_parens
-        # no longer needed — writer no longer emits display or
-        # double-parens. Calls retired; functions remain in module as
-        # dead code for now (also copied to legacy_citation_postproc.py).
+        # v15.6: re-enable display->canonical conversion at the START of
+        # per-chunk postprocess. v15.5 retired the call on the assumption
+        # the writer no longer emits display form; transitively it does,
+        # via _render_evidence_id_citations. Without canonical conversion,
+        # _strict_cited_doc_ids (used by the coverage audit) cannot resolve
+        # display-form labels to doc_ids (parse_citations yields doc_id=None
+        # for DISPLAY_CITE_RE and skips DISPLAY_PAREN_CITE_RE entirely), so
+        # every section's audit reported 0 cited docs, the coverage fallback
+        # fired on every section, and the final assembly only kept the
+        # fallback's canonical "A further source records..." sentences — the
+        # LLM prose was then dropped by _drop_zero_citation_paragraphs.
+        chunk = _chunk_display_to_canonical(chunk)
         # v8 (R5): observe author-led-opening violations and count them.
         total_author_led_openings += _count_author_led_openings(chunk)
 
