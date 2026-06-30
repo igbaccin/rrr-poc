@@ -1710,19 +1710,58 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     with metrics.stage("outline"):
         outline_plan = build_outline(topic, doc_summaries, metrics=metrics)
     if outline_plan is None:
-        print("[Layered-T2] refusal=outline_failed (Stage 1 returned no clusters)")
+        print("[Layered-T2] refusal=outline_failed (Stage 0 or Stage 1 returned nothing)")
         write_run("T2_LAYERED_GLOBAL", topic,
                   {"docs_seen": len(all_doc_ids), "docs_represented": kept},
                   {"refusal": True, "reason": "outline_failed",
-                   "explanation": "Outline Stage 1 (clustering) failed to "
-                                  "produce a valid plan. Inspect "
-                                  "metrics.llm_calls for the failure mode."})
+                   "explanation": "Outline Stage 0 (precheck) or Stage 1 "
+                                  "(clustering) failed to produce a valid "
+                                  "plan. Inspect metrics.llm_calls."})
         metrics.set("refusal", True)
         metrics.set("refusal_reason", "outline_failed")
         write_run_manifest(
             "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
             extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
                    "refusal": "outline_failed"},
+        )
+        metrics.save()
+        return
+
+    # v15.1.0: Stage 0 corpus-fit refusal. The precheck call has explicit
+    # authority to decline a (topic, corpus) pair that has no honest
+    # scholarly path between them. This refusal fires BEFORE clustering and
+    # is independent of unassigned_share (which the inclusive-clustering
+    # prompt was structurally unable to drive above zero).
+    if outline_plan.get("refused"):
+        refusal_reason = outline_plan.get("refusal_reason", "corpus_off_topic")
+        refusal_explanation = (
+            outline_plan.get("refusal_explanation", "")
+            or "Stage 0 precheck determined the topic and corpus come from "
+               "different intellectual domains with no honest scholarly path "
+               "between them."
+        )
+        print(f"[Layered-T2] refusal={refusal_reason} (Stage 0 precheck)")
+        print(f"[Layered-T2] reason: {refusal_explanation}")
+        # Persist the precheck plan for debugging.
+        try:
+            with open(runs_path("outline_plan.json"), "w", encoding="utf-8") as _f:
+                json.dump(outline_plan, _f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+        write_run("T2_LAYERED_GLOBAL", topic,
+                  {"docs_seen": len(all_doc_ids), "docs_represented": kept,
+                   "topic_shape": outline_plan.get("topic_shape")},
+                  {"refusal": True, "reason": refusal_reason,
+                   "explanation": refusal_explanation})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", refusal_reason)
+        metrics.set("outline_topic_shape", outline_plan.get("topic_shape"))
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
+                   "refusal": refusal_reason,
+                   "outline_topic_shape": outline_plan.get("topic_shape"),
+                   "outline_topic_shape_rationale": outline_plan.get("topic_shape_rationale", "")},
         )
         metrics.save()
         return

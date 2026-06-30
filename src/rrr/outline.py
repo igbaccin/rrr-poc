@@ -57,15 +57,24 @@ _MODEL = os.environ.get(
 _KEEP_ALIVE = "30m"
 
 # Bump on prompt changes to invalidate downstream caches.
-# v15.0.1: cluster prompt rewritten to encourage INCLUSIVE clustering
-# (v15.0 smoke run-1 had unassigned_share=0.58 because the v15a prompt
-# gave the model too much permission to dump borderline papers into
-# unassigned). Threshold default also raised from 0.5 to 0.7 in
-# reasoner.py to match.
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15b-cluster-inclusive"
+# v15.0.1: cluster prompt rewritten to encourage INCLUSIVE clustering.
+# v15.1.0: shape detection + corpus-fit refusal moved OUT of Stage 1 into
+#   a new Stage 0 (precheck). Stage 1 now consumes topic_shape as input
+#   rather than re-detecting it, freeing it to specialise the clustering
+#   prompt by shape AND removing the v15.0.2 failure modes:
+#     - descriptive topics were misdetected as causal 3/3 (the menu was
+#       inside the cluster prompt, where it lost attention)
+#     - off-topic corpora wrote 1.4k-word hallucinated reviews because
+#       inclusive-clustering force-fit everything into clusters and
+#       unassigned_share never reached the refusal threshold
+_PRECHECK_PROMPT_VERSION = "2026-06-30-v15.1.0-precheck"
+_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.1.0-cluster-shape-input"
 _POSTURE_PROMPT_VERSION = "2026-06-30-v15a-posture"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
+# v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
+# context can be small. Cheap call.
+_OPTIONS_PRECHECK = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 400}
 # Ample num_predict on Stage 1 because the JSON may contain ~50 doc_ids
 # distributed across 3-6 clusters.
 _OPTIONS_CLUSTER = {"temperature": 0.0, "num_ctx": 12288, "num_predict": 1800}
@@ -175,25 +184,202 @@ def _save_cache(stage: str, sig: str, obj) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stage 0 — PRECHECK (corpus-fit refusal + topic shape detection)
+#
+# v15.1.0: pulled out of Stage 1 where it was a side-feature buried under
+# clustering and routinely failed (descriptive 0/3, refusal 0/3 on the
+# v15.0.2 smoke). Now its own focused call.
+
+def _sig_precheck(topic: str, doc_titles: List[str]) -> str:
+    h = hashlib.sha256()
+    h.update(_PRECHECK_PROMPT_VERSION.encode())
+    h.update(b"\x00")
+    h.update((_MODEL or "").encode())
+    h.update(b"\x00")
+    h.update((topic or "").encode("utf-8"))
+    for t in sorted(doc_titles):
+        h.update(b"\x01")
+        h.update((t or "").encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
+    titles_block = "\n".join(f"  - {t}" for t in doc_titles)
+    # NOTE on examples: every illustrative example below is drawn from a
+    # domain DELIBERATELY unrelated to any topic this pipeline is
+    # commonly tested on. The point of the examples is to demonstrate the
+    # SHAPE PATTERN, not the subject matter. Adding examples whose subject
+    # overlaps the user's actual topic would nudge the model's classification
+    # in a non-agnostic way. Keep new examples cross-domain.
+    return (
+        "You are doing a PRE-FLIGHT check for a literature-review generator. "
+        "Two decisions, ONE JSON output.\n\n"
+        f"TOPIC: {topic}\n\n"
+        "CORPUS (one line per paper that survived initial retrieval):\n"
+        f"{titles_block}\n\n"
+        "## PART 1 — TOPIC SHAPE\n"
+        "What SHAPE is this topic? Pick exactly one. Examples below span "
+        "different academic domains on purpose — the SHAPE is determined by "
+        "what the topic ASKS, not by its subject matter.\n\n"
+        "  - causal: the topic asserts that some variable X CAUSES outcome Y, "
+        "or that X is the fundamental EXPLANATION for some phenomenon. "
+        "Hallmark: the topic names a cause and an effect.\n"
+        "      Examples: \"Sleep deprivation impairs immune function.\" "
+        "\"Catalyst surface area determines reaction rate.\" "
+        "\"Phonemic awareness in early childhood predicts later reading skill.\"\n\n"
+        "  - comparative: the topic asserts that A differs from / is better "
+        "than / is more X than B. Hallmark: two named entities being compared "
+        "on some dimension.\n"
+        "      Examples: \"Is Bayesian inference more sample-efficient than "
+        "frequentist inference?\" \"Did silent reading replace oral reading "
+        "in late medieval Europe?\"\n\n"
+        "  - descriptive: the topic asks what something IS, what PATTERN is "
+        "observed, what FEATURES X has, or what has been DOCUMENTED about X. "
+        "There is NO single causal claim and NO comparison; the topic asks "
+        "the literature to describe a state of affairs.\n"
+        "      Examples: \"What patterns of code-switching have been "
+        "documented in bilingual children?\" \"What are the morphological "
+        "features of slime molds?\" \"How is voter intention measured in "
+        "pre-election polls?\"\n\n"
+        "COMMON TRAP: do NOT default to causal whenever the topic's SUBJECT "
+        "matter has well-known causal stories attached. A topic that ASKS "
+        "about patterns, features, or measurements is descriptive even when "
+        "its subject is something normally studied causally. Read the topic "
+        "as a QUESTION: does it ask 'what causes X?' (causal), 'is A more X "
+        "than B?' (comparative), or 'what is/are X?' (descriptive).\n\n"
+        "## PART 2 — CORPUS FIT\n"
+        "Look at the paper TITLES above. Are these papers PLAUSIBLY useful "
+        "for a literature review on the topic? Be honest. Two outcomes:\n\n"
+        "  - PROCEED: a substantial number of papers (say 5+) could "
+        "reasonably contribute evidence to the topic, even if the rest are "
+        "tangential. The topic and the corpus share a subject matter, "
+        "methodology, or evidence base.\n\n"
+        "  - REFUSE: there is no honest scholarly path from the papers in "
+        "the corpus to the question the topic asks. This is the case when "
+        "the corpus and topic come from intellectual domains with no shared "
+        "subject matter, no shared methodology, and no shared evidence base "
+        "— the papers simply cannot inform the topic.\n\n"
+        "It is FAR BETTER to refuse than to invent connections between "
+        "unrelated literatures. A refusal here triggers a polite refusal "
+        "message to the user; a wrong PROCEED produces a HALLUCINATED "
+        "review built from papers that do not honestly bear on the topic. "
+        "Hallucination is the worst possible outcome.\n\n"
+        "Calibration: PROCEED is the right answer for the large majority of "
+        "(topic, corpus) pairs a user is likely to submit, because users "
+        "normally pair topics with relevant corpora. REFUSE is the right "
+        "answer when the mismatch is OBVIOUS from the titles — when no "
+        "reasonable scholar would expect these papers to address this "
+        "question. Do not refuse on weak fit, only on no honest fit.\n\n"
+        "## OUTPUT\n"
+        "Return ONE JSON object with EXACTLY these four keys:\n"
+        "  topic_shape: \"causal\" | \"comparative\" | \"descriptive\"\n"
+        "  topic_shape_rationale: one sentence (<=200 chars) defending the "
+        "shape choice, quoting the topic's phrasing.\n"
+        "  corpus_fit: \"PROCEED\" | \"REFUSE\"\n"
+        "  corpus_fit_rationale: one sentence (<=240 chars) — if REFUSE, name "
+        "the domain mismatch concretely.\n\n"
+        "Return ONLY the JSON object."
+    )
+
+
+def _validate_precheck(obj) -> Optional[dict]:
+    if not isinstance(obj, dict):
+        return None
+    shape = str(obj.get("topic_shape", "")).strip().lower()
+    if shape not in _TOPIC_SHAPES:
+        return None
+    fit = str(obj.get("corpus_fit", "")).strip().upper()
+    if fit not in ("PROCEED", "REFUSE"):
+        return None
+    return {
+        "topic_shape": shape,
+        "topic_shape_rationale": str(obj.get("topic_shape_rationale", "") or "").strip()[:300],
+        "corpus_fit": fit,
+        "corpus_fit_rationale": str(obj.get("corpus_fit_rationale", "") or "").strip()[:400],
+    }
+
+
+def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[dict]:
+    """Stage 0. One cheap LLM call over topic + paper titles. Returns
+    {topic_shape, corpus_fit, ...} or None on failure.
+
+    Decoupling shape detection and refusal from clustering avoids two
+    failure modes seen in the v15.0.2 smoke:
+      * shape detection burying inside Stage 1 -> 0/3 descriptive detected
+      * inclusive-clustering Stage 1 -> unassigned_share=0, refusal dead
+    """
+    titles = []
+    for d in doc_summaries:
+        did = (d.get("doc_id") or "").strip()
+        if not did:
+            continue
+        cite = (d.get("citation") or did).strip()
+        # Drop trailing whitespace/newlines and clip to keep prompt tight.
+        cite = " ".join(cite.split())[:240]
+        titles.append(cite)
+    if not titles:
+        return None
+
+    sig = _sig_precheck(topic, titles)
+    cached = _load_cache("precheck", sig)
+    if cached and isinstance(cached, dict) and cached.get("corpus_fit"):
+        if metrics:
+            metrics.cache_event("outline_precheck", "hits")
+        return cached
+    if metrics:
+        metrics.cache_event("outline_precheck", "misses")
+
+    prompt = _build_precheck_prompt(topic, titles)
+    raw = ""
+    try:
+        import ollama
+        start = time.perf_counter()
+        res = ollama.chat(
+            model=_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=_OPTIONS_PRECHECK,
+            keep_alive=_KEEP_ALIVE,
+            format="json",
+            stream=False,
+        )
+        raw = (res.get("message", {}).get("content") or "").strip()
+        if metrics:
+            metrics.record_llm("outline_precheck", _MODEL, options=_OPTIONS_PRECHECK,
+                               duration_s=time.perf_counter() - start,
+                               prompt_chars=len(prompt),
+                               response_chars=len(raw))
+    except Exception as e:
+        if metrics:
+            metrics.record_llm("outline_precheck", _MODEL, options=_OPTIONS_PRECHECK,
+                               success=False, error=e)
+        return None
+
+    result = _parse_and_validate(raw, _validate_precheck)
+    if result is None:
+        return None
+    result["model"] = _MODEL
+    result["prompt_version"] = _PRECHECK_PROMPT_VERSION
+    _save_cache("precheck", sig, result)
+    if metrics:
+        metrics.cache_event("outline_precheck", "writes")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Stage 1 — CLUSTER
 
-def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]]) -> str:
+def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
+                          topic_shape: str = "causal") -> str:
     lines = [
         "You are organising a corpus of academic papers for a literature review.",
         "",
         f"TOPIC: {topic}",
+        f"TOPIC SHAPE (already detected in Stage 0): {topic_shape}",
         "",
         "Below are the central claims of every paper that survived initial "
-        "retrieval. Your task is to (a) classify the TOPIC SHAPE and (b) group "
-        "the papers into clusters by what they ARGUE.",
-        "",
-        "TOPIC SHAPES (choose one):",
-        "  - causal: the topic asserts that some variable X causes outcome Y, "
-        "or that X is the fundamental explanation for some phenomenon.",
-        "  - comparative: the topic asserts that A differs from B, A is better "
-        "than B, A is more X than B, or otherwise compares two things.",
-        "  - descriptive: the topic asks what something is/looks like, what "
-        "pattern is observed, what features X has — no single causal claim.",
+        "retrieval. Your task is to group the papers into CLUSTERS by what "
+        "they ARGUE. Shape detection and corpus-fit have already happened "
+        "upstream; focus only on the clustering.",
         "",
         "CLUSTERING RULES:",
         "  - Aim for 3 to 6 clusters that TOGETHER cover the BULK of the "
@@ -227,7 +413,6 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]]) -> str:
     lines += [
         "",
         "Return ONE JSON object with EXACTLY these keys:",
-        "  topic_shape: one of causal|comparative|descriptive",
         "  clusters: array of {cluster_id, doc_ids, shared_thread}",
         "    - cluster_id: a short tag like \"C1\", \"C2\", ...",
         "    - doc_ids: array of doc_id strings from the list above",
@@ -239,11 +424,8 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _validate_cluster_plan(obj, valid_doc_ids: set) -> Optional[dict]:
+def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optional[dict]:
     if not isinstance(obj, dict):
-        return None
-    topic_shape = str(obj.get("topic_shape", "")).strip().lower()
-    if topic_shape not in _TOPIC_SHAPES:
         return None
 
     raw_clusters = obj.get("clusters") or []
@@ -299,6 +481,7 @@ def _validate_cluster_plan(obj, valid_doc_ids: set) -> Optional[dict]:
 
 
 def cluster_papers(topic: str, doc_summaries: List[dict],
+                   topic_shape: str = "causal",
                    metrics=None) -> Optional[dict]:
     """Stage 1. One LLM call. Returns ClusterPlan dict or None on failure.
 
@@ -325,7 +508,7 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
     if metrics:
         metrics.cache_event("outline_cluster", "misses")
 
-    prompt = _build_cluster_prompt(topic, doc_claims)
+    prompt = _build_cluster_prompt(topic, doc_claims, topic_shape=topic_shape)
     raw = ""
     try:
         import ollama
@@ -350,7 +533,7 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
                                success=False, error=e)
         return None
 
-    plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids))
+    plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids, topic_shape))
     if plan is None:
         # One retry with an explicit reminder about the JSON contract.
         retry_prompt = prompt + "\n\nReminder: return ONLY the JSON object with the three keys topic_shape, clusters, unassigned_doc_ids."
@@ -376,7 +559,7 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
                 metrics.record_llm("outline_cluster_retry", _MODEL, options=_OPTIONS_CLUSTER,
                                    success=False, error=e)
             return None
-        plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids))
+        plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids, topic_shape))
         if plan is None:
             return None
 
@@ -706,15 +889,45 @@ def order_clusters(topic: str, cluster_summaries: List[dict],
 
 
 def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[dict]:
-    """Run Stage 1 + Stage 2 (per cluster) + Stage 3.
+    """Run Stage 0 (precheck) + Stage 1 + Stage 2 + Stage 3.
 
-    Returns the full outline plan or None if Stage 1 fails irrecoverably.
+    Returns:
+      - {"refused": True, "refusal_reason": ..., "topic_shape": ...} when
+        Stage 0 says corpus_fit=REFUSE. Caller should write a refusal
+        manifest and stop.
+      - Full outline plan on success.
+      - None if Stage 0 or Stage 1 fails irrecoverably (LLM error).
     """
-    plan = cluster_papers(topic, doc_summaries, metrics=metrics)
-    if not plan:
+    # Stage 0: corpus-fit + shape detection.
+    pre = precheck(topic, doc_summaries, metrics=metrics)
+    if not pre:
+        # Stage 0 LLM failure. Treat as a hard error rather than
+        # silently defaulting to causal+PROCEED — that's how the v15.0.2
+        # refusal failure happened.
         return None
 
-    topic_shape = plan["topic_shape"]
+    topic_shape = pre["topic_shape"]
+    if pre["corpus_fit"] == "REFUSE":
+        return {
+            "refused": True,
+            "refusal_reason": "corpus_off_topic",
+            "refusal_explanation": pre.get("corpus_fit_rationale", ""),
+            "topic": topic,
+            "topic_shape": topic_shape,
+            "topic_shape_rationale": pre.get("topic_shape_rationale", ""),
+            "admitted_total": len({d.get("doc_id") for d in doc_summaries if d.get("doc_id")}),
+            "clusters": [],
+            "unassigned_doc_ids": [d.get("doc_id") for d in doc_summaries if d.get("doc_id")],
+            "ordered_cluster_ids": [],
+            "relation_distribution": {},
+            "unassigned_share": 1.0,
+            "model": _MODEL,
+            "precheck_prompt_version": _PRECHECK_PROMPT_VERSION,
+        }
+
+    plan = cluster_papers(topic, doc_summaries, topic_shape=topic_shape, metrics=metrics)
+    if not plan:
+        return None
     summaries_by_doc = {
         d.get("doc_id"): d for d in doc_summaries if d.get("doc_id")
     }
