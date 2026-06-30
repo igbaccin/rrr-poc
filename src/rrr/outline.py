@@ -68,7 +68,7 @@ _KEEP_ALIVE = "30m"
 #       inclusive-clustering force-fit everything into clusters and
 #       unassigned_share never reached the refusal threshold
 _PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.3.0-cluster-inclusive-outcome-anchored"
+_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.5-cluster-streams-qualitative"
 _POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.3-conduit-also-fires-on-adjacent"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
@@ -408,93 +408,40 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[di
 def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
                           topic_shape: str = "causal",
                           topic_outcome: str = "") -> str:
+    # v15.5: prompt stripped to a single qualitative principle. The
+    # earlier versions accumulated quantitative pressures (3-6 cluster
+    # target, 0-15% unassigned ceiling, "specific enough" thread rules,
+    # "moderately broad" countervailing guidance) that conflicted and
+    # forced the model to either over-split (v15.3.0 -> 12 narrow
+    # clusters) or over-reject (v15.2.0 -> 0.5 unassigned share). The
+    # new prompt asks the model to identify the streams of literature it
+    # sees, and stops dictating count, coverage, or specificity.
     has_outcome = bool(topic_outcome) and topic_shape == "causal"
-    outcome_block = (
-        f"TOPIC OUTCOME (the phenomenon being explained): {topic_outcome}\n"
+    outcome_line = (
+        f"TOPIC OUTCOME: {topic_outcome}"
         if has_outcome else ""
     )
-    # v15.2.0: clustering is OUTCOME-anchored for causal topics. The
-    # explanandum (outcome) is the disambiguator that prevents Stage 1 from
-    # homogenising clusters into one bland "institutional development"
-    # mush, which produced the 3/9 GD collapse in v15.0.2. Stage 1
-    # deliberately DOES NOT see the topic's cause — that would push it
-    # back toward stance bucketing.
-    # v15.3.0: rebalanced — keeps outcome anchoring but explicitly says
-    # papers cluster by THEMATIC AFFINITY, not strict cause-identity.
-    # v15.2.x's "different causes -> different clusters + specific
-    # threads" combo was too strict and pushed unassigned_share to 0.5
-    # on both INST and GD (12/24 papers on the floor when v15.0.2 had
-    # only 1/24 unassigned on the same corpus).
-    outcome_rule = (
-        "  - For this CAUSAL topic, the OUTCOME above (the explanandum) "
-        "is the disambiguator. Read each paper's claim as an ANSWER to "
-        "\"What explains the outcome?\". Group papers whose answers are "
-        "THEMATICALLY RELATED — same general subject area, same kind of "
-        "mechanism, same body of evidence. Two papers can SHARE A "
-        "CLUSTER even if their specific causes differ, as long as their "
-        "claims contribute to the same overall conversation. Two papers "
-        "belong in DIFFERENT clusters only when they answer the "
-        "outcome-question from genuinely distinct intellectual traditions "
-        "(e.g. a paper about colonial mortality and a paper about "
-        "useful knowledge are different clusters; two papers about "
-        "different aspects of African colonial economic history "
-        "typically share a cluster).\n"
-        if has_outcome else ""
-    )
-    # `shared_cause` is the new v15.2.0 output field — the cluster's
-    # distinctive causal answer to the outcome question. Used downstream by
-    # Stage 2 to pin the cluster's cause when judging its relation to
-    # topic_cause. Falls back to shared_thread when empty.
     cause_field_doc = (
         "    - shared_cause: 5-12 word noun phrase naming the cluster's "
-        "distinctive cause / explanatory mechanism (drawn from the papers' "
-        "own claim language). Required for causal topics; empty string for "
-        "other shapes.\n"
+        "distinctive cause (in the papers' own language). Required for "
+        "causal topics; empty string for other shapes.\n"
         if has_outcome else ""
     )
-    lines = [
-        "You are organising a corpus of academic papers for a literature review.",
-        "",
+    header_lines = [
         f"TOPIC: {topic}",
-        f"TOPIC SHAPE (already detected in Stage 0): {topic_shape}",
-        outcome_block.rstrip("\n") if outcome_block else "",
+        f"TOPIC SHAPE: {topic_shape}",
+    ]
+    if outcome_line:
+        header_lines.append(outcome_line)
+    lines = header_lines + [
         "",
-        "Below are the central claims of every paper that survived initial "
-        "retrieval. Your task is to group the papers into CLUSTERS by what "
-        "they ARGUE. Shape detection and corpus-fit have already happened "
-        "upstream; focus only on the clustering.",
+        "Group these papers into clusters that separate the distinct "
+        "streams of literature in this corpus. Each cluster is one "
+        "stream: papers developing a related line of argument.",
         "",
-        "CLUSTERING RULES:",
-        outcome_rule.rstrip("\n") if outcome_rule else
-        "  - Group papers that argue SIMILAR things — same causal mechanism, "
-        "same comparison verdict, same descriptive account.",
-        "  - Aim for 3 to 6 clusters that TOGETHER cover ESSENTIALLY ALL "
-        "of the corpus. Expect 0-15% of papers in unassigned at most. If "
-        "you're putting more than 15% in unassigned, your clusters are "
-        "too narrow — widen them.",
-        "  - Threads can be MODERATELY BROAD. A 4-6-paper cluster labelled "
-        "\"colonial-era institutional foundations and African economic "
-        "outcomes\" is BETTER than three narrow 2-paper clusters that split "
-        "the same thematic territory. When two papers feel similar enough "
-        "that a reader would discuss them together in a single review "
-        "paragraph, they belong in the same cluster.",
-        "  - Each cluster gets a SHORT shared_thread label (5-10 words) "
-        "naming the conversation, and a `shared_cause` field (for causal "
-        "topics) naming the DISTINCTIVE explanatory mechanism the cluster "
-        "converges on — taken in the cluster's own language.",
-        "  - Use `unassigned_doc_ids` ONLY for papers that address a "
-        "GENUINELY DIFFERENT QUESTION — a different intellectual domain, "
-        "different subject matter, or different unit of analysis. Do NOT "
-        "use unassigned as an \"uncertain placement\" bucket; a paper "
-        "that's relevant but harder to place goes to its NEAREST cluster, "
-        "not unassigned. A paper that is somewhat tangential but still "
-        "broadly about the topic's subject matter goes in a cluster.",
-        "  - Every doc_id must appear EXACTLY ONCE (either inside one cluster "
-        "or in unassigned_doc_ids).",
-        "  - DO NOT pick relations or stances. Stage 2 (a later call) decides "
-        "each cluster's relationship to the topic; your output here must "
-        "stay free of labels like 'supports', 'critiques', 'rival', "
-        "'upstream' — group only by what the papers ARGUE.",
+        "Use `unassigned_doc_ids` for papers that address a genuinely "
+        "different question. Every doc_id appears EXACTLY ONCE. Do NOT "
+        "label relations or stances — Stage 2 handles those.",
         "",
         "PAPERS:",
     ]

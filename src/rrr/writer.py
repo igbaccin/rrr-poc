@@ -10,20 +10,20 @@ from rrr.render import (
     CITE_RE,
     DISPLAY_CITE_RE,
     DISPLAY_PAREN_CITE_RE,
-    collapse_nested_narrative_multicite,
-    # v15.4.0: B2 orphan outer paren + B3 redundant inline/paren merge.
-    fix_orphan_outer_paren_narrative,
-    merge_redundant_inline_paren_citations,
     parse_citations,
     render_citation,
     render_citation_canonical,
-    rewrite_canonical_to_display,
-    rewrite_misplaced_narrative_citations,
     _build_author_year_lookup,
     _build_display_lookup,
     _collect_cited_docs as _shared_collect_cited_docs,
     _doc_id_to_author_label,
 )
+# v15.5: citation surface postproc (rewrite_canonical_to_display,
+# rewrite_misplaced_narrative_citations, collapse_nested_narrative_multicite,
+# fix_orphan_outer_paren_narrative, merge_redundant_inline_paren_citations)
+# moved to rrr.legacy_citation_postproc. The writer now emits only [E####]
+# evidence-ID cites and the renderer below produces clean display form
+# directly — eliminating the surface variations those passes patched.
 
 # v11.2 lever 2: per-stage model selection. The writer needs prose quality;
 # the reasoner needs JSON-schema obedience. Splitting lets the writer stay on
@@ -180,45 +180,28 @@ _SYSTEM_CITATION_INSTRUCTION = (
     # first. Citation-format material moved here from _PROSE_DIRECTIVE
     # (evidence-ID syntax + multi-source preference) since both belong with
     # the format example, not with style guidance.
-    "CITATION FORMATS — two surfaces, picked by sentence role.\n"
-    "  NARRATIVE     (author is the subject)    Author (Year, p.N)\n"
-    "    e.g. 'North and Weingast (1989, p.2) argue that institutions...'\n"
-    "  PARENTHETICAL (author not the subject)   (Author Year, p.N)\n"
-    "    e.g. '...credible commitment underpins growth (North and Weingast 1989, p.2).'\n"
-    "    Multi-source: '...established across the literature "
-    "(North 1989, p.9; Acemoglu et al. 2001, p.27).'\n"
-    "  PICK ONE PER SENTENCE: if the author is NAMED IN THE SENTENCE (narrative "
-    "form), put the page next to the year — do NOT also trail the sentence with "
-    "a parenthetical that repeats the same surname+year. 'Sokoloff and Engerman "
-    "(2000, p.12) argue...' is correct; 'Sokoloff and Engerman (2000) argue... "
-    "(Sokoloff and Engerman 2000, p.12)' is REDUNDANT.\n\n"
-    "You MAY also cite via an evidence ID such as [E0001]; postprocess "
-    "renders it into a validated page citation. When multiple sources support "
-    "the same point, prefer the grouped form: 'shared finding ([E0001]; "
-    "[E0007]; [E0014]).'\n\n"
-    "NEVER emit:\n"
-    "  (North, 1989)              missing page\n"
-    "  North (1989) p.9           page outside parens\n"
-    "  (p.5)                      page-only, no author/year\n"
-    "  (Author Year)              literal placeholder — never copy the example label\n"
-    "  (Author 2007)              same trap with a real year substituted in\n"
-    "  (Author (Year, p.N))       DO NOT wrap the narrative form in an outer paren — "
-    "use the parenthetical form (Author Year, p.N) instead\n\n"
-    "BOUNDARY RULES (architecturally enforced; violations are sentence-stripped):\n"
-    "1. Cite only from the ALLOWED CITATIONS list. Copy author labels EXACTLY "
-    "and use only the page numbers shown for each author.\n"
-    "2. If a claim is not supported by the allowed evidence, state it WITHOUT "
-    "a citation. Do not invent citations.\n"
-    "3. QUOTED TEXT: DEFAULT TO PARAPHRASE. Reserve quotation marks (\" \") "
-    "for SHORT phrases (≤12 words) where you copy-pasted the exact wording "
-    "from the Evidence section. Multi-sentence quotes, ellipsis-truncated "
-    "quotes ('...' inside \" \"), and paraphrased-but-quoted material are "
-    "all fabrications and get stripped from the final review. When in "
-    "doubt, paraphrase WITHOUT quotation marks.\n\n"
-    "FORMAT RULES:\n"
-    "4. Every citation includes a page; one page per citation; pages stay "
-    "inside the parens (never 'pp.5-7' or 'pp.5, 7').\n"
-    "5. Never write page-only citations such as (p.5).\n"
+    # v15.5: ONE citation surface — the evidence-ID marker [E####]. The
+    # renderer produces the appropriate narrative or parenthetical form
+    # depending on whether the author is already named in the prose, so
+    # the writer never decides citation surface. This eliminates the
+    # whole class of citation-format bugs the older pipeline patched
+    # (placeholder leaks, orphan parens, redundant inline+trailing,
+    # nested parens, etc.).
+    "CITE only via evidence IDs: every citation is one [E####] marker. "
+    "Examples: 'North and Weingast [E0001] argue that...' OR 'credible "
+    "commitment underpins growth [E0001].' Multi-source: 'shared finding "
+    "[E0001] [E0007] [E0014].' DO NOT write '(Author Year, p.N)', "
+    "'Author (Year, p.N)', '(p.5)' or any other citation surface — the "
+    "renderer converts every [E####] to the right surface for you.\n\n"
+    "BOUNDARY RULES:\n"
+    "1. Use only [E####] IDs from the ALLOWED CITATIONS list.\n"
+    "2. If a claim is not supported by allowed evidence, state it WITHOUT "
+    "a citation. Do not invent evidence IDs.\n"
+    "3. QUOTED TEXT: paraphrase by default. Reserve quotation marks (\" \") "
+    "for SHORT phrases (≤12 words) you copy-paste verbatim from the "
+    "Evidence section. Multi-sentence quotes, ellipsis-truncated quotes, "
+    "and paraphrased-but-quoted material are fabrications and get "
+    "stripped.\n"
 )
 
 
@@ -326,20 +309,69 @@ def _build_evidence_id_map(docs):
     return evidence
 
 
-def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
-    replacements = 0
+def _author_surnames_only(label: str) -> str:
+    """Strip the trailing '(Year)' from an author label so we get just the
+    surname(s) — 'Acemoglu et al. (2001)' -> 'Acemoglu et al.'."""
+    if not label:
+        return ""
+    return re.sub(r"\s*\(\d{4}[a-z]?\)\s*$", "", label).strip()
 
-    def repl(match):
-        nonlocal replacements
+
+# v15.5: how many chars to look BACK from an [E####] marker to decide
+# whether the author surname is already named in the preceding prose.
+# Keeps the lookback short so we don't false-positive across sentence
+# boundaries.
+_EID_LOOKBACK_CHARS = 80
+
+
+def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
+    """v15.5: context-aware evidence-ID renderer. For each [E####] marker:
+      - if the author surname(s) appear in the preceding ~80 chars of
+        prose, render as just '(Year, p.N)' so the author is not repeated
+      - otherwise render as the parenthetical '(Author Year, p.N)'
+
+    This replaces the v15.x narrative-vs-parenthetical postproc chain.
+    The writer never decides citation surface; the renderer does it
+    deterministically based on what the prose already says.
+    """
+    if not text:
+        return text or "", 0
+    pattern = re.compile(r"\[([Ee]\d{4})\]")
+    out_parts: list = []
+    last_end = 0
+    replacements = 0
+    for match in pattern.finditer(text):
         eid = match.group(1).upper()
         ev = evidence_map.get(eid)
         if not ev:
-            return match.group(0)
-        replacements += 1
-        return render_citation(ev["doc_id"], ev["page"])
+            continue
+        doc_id = ev["doc_id"]
+        page = int(ev["page"])
+        full_label = _doc_id_to_author_label(doc_id)  # "Author et al. (Year)"
+        surnames = _author_surnames_only(full_label)   # "Author et al."
+        # Extract bare year from the label.
+        ym = re.match(r"^.*?\((\d{4}[a-z]?)\)\s*$", full_label)
+        year = ym.group(1) if ym else ""
 
-    rendered = re.sub(r"\[([Ee]\d{4})\]", lambda m: repl(m), text or "")
-    return rendered, replacements
+        prefix = text[max(0, match.start() - _EID_LOOKBACK_CHARS):match.start()]
+        author_in_prose = bool(surnames) and surnames.lower() in prefix[-60:].lower()
+
+        if author_in_prose and year:
+            # Author already named in prose: just (Year, p.N).
+            rendered = f"({year}, p.{page})"
+        elif surnames and year:
+            # Author not in prose: parenthetical form (Author Year, p.N).
+            rendered = f"({surnames} {year}, p.{page})"
+        else:
+            # Fall back to canonical narrative renderer.
+            rendered = render_citation(doc_id, page)
+
+        out_parts.append(text[last_end:match.start()])
+        out_parts.append(rendered)
+        last_end = match.end()
+        replacements += 1
+    out_parts.append(text[last_end:])
+    return "".join(out_parts), replacements
 
 
 # v14 FIX-BRACKET: catch [Doc_Year] / [Doc&Doc_Year] form the model invents when
@@ -2829,27 +2861,29 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         nonlocal total_bracket_id_rewrites
 
         chunk = _strip_wrapping(chunk)
+        # v15.5: the writer now produces ONLY [E####] evidence-ID markers.
+        # The context-aware renderer below converts each marker to either
+        # the narrative '(Year, p.N)' (when the author is already named in
+        # prose) or the parenthetical '(Author Year, p.N)' (otherwise).
+        # This eliminates the display->canonical->display surface-cycling
+        # the older pipeline needed.
         chunk, evidence_renders = _render_evidence_id_citations(chunk, evidence_id_map)
         total_evidence_id_renders += evidence_renders
 
         # v14 FIX-BRACKET: catch [Doc_Year] bracketed canonical doc_ids the
         # model invents when it confuses bracket-evidence-id syntax with the
-        # canonical doc_id. Runs AFTER [E####] resolves to a display cite, so
-        # only the residual bracketed-doc-id form reaches this pass.
+        # canonical doc_id.
         chunk, bracket_rewrites = _render_bracketed_doc_ids(
             chunk, allowed_docs, doc_to_evidence_ids,
         )
         total_bracket_id_rewrites += bracket_rewrites
 
-        # v10: rewrite Author (Year, p.N) -> (Doc_Year: p.N) so every existing
-        # validator below sees the canonical surface it understands.
-        chunk = _chunk_display_to_canonical(chunk)
-
-        # v8 (R5): collapse ((Doc: p.N)) before any other citation pass — those
-        # forms otherwise survive every downstream regex because CITE_RE matches
-        # single-paren only.
-        chunk, double_collapsed = _collapse_double_parens(chunk)
-        total_double_paren_collapsed += double_collapsed
+        # v15.5: _chunk_display_to_canonical + _collapse_double_parens
+        # no longer needed — writer no longer emits display or
+        # double-parens. Calls retired; functions remain in module as
+        # dead code for now (also copied to legacy_citation_postproc.py).
+        # v8 (R5): observe author-led-opening violations and count them.
+        total_author_led_openings += _count_author_led_openings(chunk)
 
         # v8 (R5): observe author-led-opening violations and count them.
         total_author_led_openings += _count_author_led_openings(chunk)
@@ -3378,91 +3412,20 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     full_text = re.sub(r'\n{3,}', '\n\n', full_text)
 
-    # v10: every surviving canonical-form citation '(Doc_Year: p.N)' is
-    # rewritten to the user-facing display form 'Author (Year, p.N)'.
-    # Validation is already complete at this point, so the rewrite is purely
-    # cosmetic; the corpus boundary check ran against the canonical pair.
-    full_text, canonical_to_display_count = rewrite_canonical_to_display(full_text)
-    if canonical_to_display_count and metrics:
-        metrics.inc("writer_canonical_to_display", canonical_to_display_count)
-
-    # v15.4.0 (Bug 2): fix the asymmetric "(Author (Year, p.N)<punct>" form
-    # where the writer wrapped a narrative cite in an outer paren but never
-    # closed it. Runs AFTER rewrite_canonical_to_display so the asymmetric
-    # display surface has been reconstructed; runs BEFORE
-    # rewrite_misplaced_narrative_citations so the inner narrative is gone
-    # before that pass tries to re-position narratives.
-    full_text, orphan_paren_fixes = fix_orphan_outer_paren_narrative(full_text)
-    if orphan_paren_fixes and metrics:
-        metrics.inc("writer_orphan_outer_paren_fixes", orphan_paren_fixes)
-    if orphan_paren_fixes:
-        print(f"[Writer] Orphan outer-paren narrative fixes: {orphan_paren_fixes}")
-
-    # v11-A: rewrite narrative citations 'Author (Year, p.N)' sitting at the
-    # end of a sentence whose subject is not the author to the parenthetical
-    # form '(Author Year, p.N)'. Closes the v10 known edge case where the
-    # writer produced 'X conducive to growth North and Weingast (1989, p.4).'
-    full_text, narrative_rewrites = rewrite_misplaced_narrative_citations(full_text)
-    if narrative_rewrites and metrics:
-        metrics.inc("writer_narrative_to_paren", narrative_rewrites)
-    if narrative_rewrites:
-        print(f"[Writer] Narrative->paren rewrites: {narrative_rewrites}")
-
-    # v13: fix mid-sentence narrative citations without preceding punctuation.
-    # The v12 smoke produced two of these (paras 1 and 3): "...extractive
-    # economic controls Akyeampong and Fofack (2014, p.20)" and "...divergent
-    # paths of development Sokoloff and Engerman (2000, p.8)". Insert a comma
-    # between the prior content word and the author label. Runs AFTER
-    # rewrite_misplaced_narrative_citations because that pass collapses
-    # narrative-form cites where the author IS the subject; only the genuine
-    # mid-sentence stragglers remain for this pass to fix.
-    full_text, mid_cite_fixes = _fix_mid_sentence_narrative_cites(full_text)
-    if mid_cite_fixes and metrics:
-        metrics.inc("writer_mid_sentence_cite_fixes", mid_cite_fixes)
-    if mid_cite_fixes:
-        print(f"[Writer] Mid-sentence narrative cite fixes: {mid_cite_fixes}")
-
-    # v13.1 FIX-A: strip stray commas inside author labels ("Sokoloff and,
-    # Engerman ...", "van, Zanden ..."). Runs BEFORE the nested-narrative
-    # collapse so the labels are clean when collapse builds its grouped form.
-    full_text, label_comma_fixes = _strip_malformed_author_label_commas(full_text)
-    if label_comma_fixes and metrics:
-        metrics.inc("writer_author_label_comma_fixes", label_comma_fixes)
-    if label_comma_fixes:
-        print(f"[Writer] Author-label comma fixes: {label_comma_fixes}")
-
-    # v11.1: collapse nested narrative cites inside an outer paren wrapper —
-    # '(Author (Year, p.N); Author (Year, p.N))' becomes
-    # '(Author Year, p.N; Author Year, p.N)'. The v11 smoke produced 5 of
-    # these and they read as visually broken; semantically already correct.
-    full_text, nested_collapses = collapse_nested_narrative_multicite(full_text)
-    if nested_collapses and metrics:
-        metrics.inc("writer_nested_paren_collapsed", nested_collapses)
-    if nested_collapses:
-        print(f"[Writer] Nested-narrative paren collapses: {nested_collapses}")
-
-    # v13.1 FIX-D: collapse same-(author, year) pseudo-plural multi-cites
-    # inside one parenthetical (e.g. "(Bryant 2006, p.11; Bryant 2006, p.3)"
-    # -> "(Bryant 2006, pp.3, 11)"). Runs AFTER the nested-narrative collapse
-    # so the parenthetical is already flat. Conservative: skips any paren
-    # with residual nested structure.
-    full_text, same_author_collapses = _collapse_same_author_year_paren_cites(full_text)
-    if same_author_collapses and metrics:
-        metrics.inc("writer_same_author_collapses", same_author_collapses)
-    if same_author_collapses:
-        print(f"[Writer] Same-(author, year) paren collapses: {same_author_collapses}")
-
-    # v15.4.0 (Bug 3): merge redundant in-text + trailing parenthetical pairs.
-    # Pattern: "Sokoloff and Engerman (2000) provide a perspective ... (Sokoloff
-    # and Engerman 2000, p.12)." -> "Sokoloff and Engerman (2000, p.12) provide
-    # a perspective ...". Per-sentence scan; conservative label matching.
-    # Runs AFTER same_author_collapses so any trailing multi-page parens are
-    # already flat.
-    full_text, redundant_inline_merges = merge_redundant_inline_paren_citations(full_text)
-    if redundant_inline_merges and metrics:
-        metrics.inc("writer_redundant_inline_merge", redundant_inline_merges)
-    if redundant_inline_merges:
-        print(f"[Writer] Redundant in-text + paren cite merges: {redundant_inline_merges}")
+    # v15.5: deprecated citation-surface postproc chain removed from the
+    # main pipeline. The writer now emits ONLY [E####] markers (rendered
+    # context-aware in postprocess_chunk), so the assorted passes below
+    # had nothing to fix. Functions preserved in
+    # rrr.legacy_citation_postproc for cross-model fallback testing:
+    #   - rewrite_canonical_to_display
+    #   - rewrite_misplaced_narrative_citations
+    #   - collapse_nested_narrative_multicite
+    #   - fix_orphan_outer_paren_narrative
+    #   - merge_redundant_inline_paren_citations
+    #   - _strip_author_year_placeholder
+    #   - _fix_mid_sentence_narrative_cites
+    #   - _strip_malformed_author_label_commas
+    #   - _collapse_same_author_year_paren_cites
 
     # v10: detect-then-LLM-rewrite style enforcement (one batched call). Runs
     # AFTER validation so the rewriter sees the final citation surface and is
@@ -3480,15 +3443,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         print(f"[Writer] Style: stripped {style_stats['trailing_stripped']} "
               "trailing-significance phrase(s); no other violations.")
 
-    # v13.1 FIX-B: strip literal "(Author, Year)" / "(Author Year)" / "(Author,
-    # Year, p.N)" placeholders copied verbatim from the system prompt's
-    # exemplar. Runs BEFORE _drop_zero_citation_paragraphs so a paragraph
-    # whose only "cite" was a placeholder is correctly identified as zero-cite.
-    full_text, placeholder_stripped = _strip_author_year_placeholder(full_text)
-    if placeholder_stripped and metrics:
-        metrics.inc("writer_placeholder_citation_stripped", placeholder_stripped)
-    if placeholder_stripped:
-        print(f"[Writer] Author/Year placeholder cites stripped: {placeholder_stripped}")
+    # v15.5: placeholder strip retired — the writer no longer copies the
+    # "(Author, Year)" exemplar because the prompt no longer SHOWS that
+    # exemplar (replaced with "[E####]" usage examples).
 
     # v13: hard rule-9 enforcement at final assembly. The v12 prose audit found
     # three zero-citation paragraphs (paras 4, 9, 12 — the closing) that the
