@@ -68,7 +68,7 @@ _KEEP_ALIVE = "30m"
 #       inclusive-clustering force-fit everything into clusters and
 #       unassigned_share never reached the refusal threshold
 _PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.2.0-cluster-outcome-anchored"
+_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.3.0-cluster-inclusive-outcome-anchored"
 _POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.3-conduit-also-fires-on-adjacent"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
@@ -413,20 +413,32 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
         f"TOPIC OUTCOME (the phenomenon being explained): {topic_outcome}\n"
         if has_outcome else ""
     )
-    # v15.2.0: clustering is now OUTCOME-anchored for causal topics. The
+    # v15.2.0: clustering is OUTCOME-anchored for causal topics. The
     # explanandum (outcome) is the disambiguator that prevents Stage 1 from
-    # homogenising clusters of "papers that argue institutions" into a single
-    # bland "institutional development" cluster, which is what produced the
-    # 3/9 GD collapse in v15.0.2. Stage 1 deliberately DOES NOT see the
-    # topic's cause — that would push it back toward stance bucketing.
+    # homogenising clusters into one bland "institutional development"
+    # mush, which produced the 3/9 GD collapse in v15.0.2. Stage 1
+    # deliberately DOES NOT see the topic's cause — that would push it
+    # back toward stance bucketing.
+    # v15.3.0: rebalanced — keeps outcome anchoring but explicitly says
+    # papers cluster by THEMATIC AFFINITY, not strict cause-identity.
+    # v15.2.x's "different causes -> different clusters + specific
+    # threads" combo was too strict and pushed unassigned_share to 0.5
+    # on both INST and GD (12/24 papers on the floor when v15.0.2 had
+    # only 1/24 unassigned on the same corpus).
     outcome_rule = (
-        "  - For this CAUSAL topic, the OUTCOME above (the explanandum) is "
-        "the disambiguator. Read each paper's claim as an ANSWER to the "
-        "question \"What explains the outcome?\". Group papers whose ANSWERS "
-        "name the same cause (in the paper's own language). Two papers that "
-        "name the same outcome but offer DIFFERENT explanatory causes belong "
-        "in DIFFERENT clusters, not the same one — even if their causes "
-        "could be linked in some longer story.\n"
+        "  - For this CAUSAL topic, the OUTCOME above (the explanandum) "
+        "is the disambiguator. Read each paper's claim as an ANSWER to "
+        "\"What explains the outcome?\". Group papers whose answers are "
+        "THEMATICALLY RELATED — same general subject area, same kind of "
+        "mechanism, same body of evidence. Two papers can SHARE A "
+        "CLUSTER even if their specific causes differ, as long as their "
+        "claims contribute to the same overall conversation. Two papers "
+        "belong in DIFFERENT clusters only when they answer the "
+        "outcome-question from genuinely distinct intellectual traditions "
+        "(e.g. a paper about colonial mortality and a paper about "
+        "useful knowledge are different clusters; two papers about "
+        "different aspects of African colonial economic history "
+        "typically share a cluster).\n"
         if has_outcome else ""
     )
     # `shared_cause` is the new v15.2.0 output field — the cluster's
@@ -456,19 +468,27 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
         outcome_rule.rstrip("\n") if outcome_rule else
         "  - Group papers that argue SIMILAR things — same causal mechanism, "
         "same comparison verdict, same descriptive account.",
-        "  - Aim for 3 to 6 clusters that TOGETHER cover the BULK of the "
-        "corpus. At least 80% of papers should land in some cluster.",
-        "  - Threads should be SPECIFIC enough to name the cluster's "
-        "distinctive cause or claim, not so broad that two competing causes "
-        "fall into one cluster. \"Settler mortality shapes extractive "
-        "institutions\" is a good thread; \"institutional development\" is "
-        "too broad and will lump rival causal stories together.",
-        "  - Each cluster gets a SHORT shared_thread label (5-10 words).",
-        "  - Use `unassigned_doc_ids` ONLY for papers that genuinely address "
-        "a completely different question — a different intellectual domain, "
-        "subject matter, or unit of analysis. Do NOT use unassigned as an "
-        "\"uncertain\" bucket. Relevant-but-harder-to-place papers go to "
-        "their nearest cluster.",
+        "  - Aim for 3 to 6 clusters that TOGETHER cover ESSENTIALLY ALL "
+        "of the corpus. Expect 0-15% of papers in unassigned at most. If "
+        "you're putting more than 15% in unassigned, your clusters are "
+        "too narrow — widen them.",
+        "  - Threads can be MODERATELY BROAD. A 4-6-paper cluster labelled "
+        "\"colonial-era institutional foundations and African economic "
+        "outcomes\" is BETTER than three narrow 2-paper clusters that split "
+        "the same thematic territory. When two papers feel similar enough "
+        "that a reader would discuss them together in a single review "
+        "paragraph, they belong in the same cluster.",
+        "  - Each cluster gets a SHORT shared_thread label (5-10 words) "
+        "naming the conversation, and a `shared_cause` field (for causal "
+        "topics) naming the DISTINCTIVE explanatory mechanism the cluster "
+        "converges on — taken in the cluster's own language.",
+        "  - Use `unassigned_doc_ids` ONLY for papers that address a "
+        "GENUINELY DIFFERENT QUESTION — a different intellectual domain, "
+        "different subject matter, or different unit of analysis. Do NOT "
+        "use unassigned as an \"uncertain placement\" bucket; a paper "
+        "that's relevant but harder to place goes to its NEAREST cluster, "
+        "not unassigned. A paper that is somewhat tangential but still "
+        "broadly about the topic's subject matter goes in a cluster.",
         "  - Every doc_id must appear EXACTLY ONCE (either inside one cluster "
         "or in unassigned_doc_ids).",
         "  - DO NOT pick relations or stances. Stage 2 (a later call) decides "
