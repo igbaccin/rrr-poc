@@ -319,3 +319,137 @@ def collapse_nested_narrative_multicite(text: str) -> tuple:
     return new_text, rewrites
 
 
+# v15.4.0 (Bug 2): "(Author (Year, p.N)<punct>" where the outer "(" never
+# closes before the next sentence-ending punctuation. Every existing
+# nested-narrative collapser requires the OUTER ")" to be present, so this
+# asymmetric form flows through untouched. Observed in v15.2.3 INST review
+# on Broadberry & Gardner and twice on Frankema & van Waijenburg.
+# We rewrite to the parenthetical form "(Author Year, p.N)<punct>" — the
+# outer "(" signalled parenthetical intent, so we honour it.
+_ORPHAN_OUTER_PAREN_NARRATIVE_RE = re.compile(
+    r"\((" + _DISPLAY_LABEL + r")\s+\((\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
+    r"(?=\s*[.!?;,])"  # immediately followed by sentence-ending punct
+)
+
+
+def fix_orphan_outer_paren_narrative(text: str) -> tuple:
+    """Rewrite '(Author (Year, p.N)<punct>' to '(Author Year, p.N)<punct>'.
+    Conservative: only fires when no closing outer paren precedes the punct,
+    so multi-cite continuations like '(see also Author (Year, p.N); Smith
+    Year, p.N)' (which have '; ' after the inner ')') are skipped.
+    Returns (text, count)."""
+    if not text:
+        return text, 0
+    count = 0
+
+    def repl(m):
+        nonlocal count
+        count += 1
+        return f"({m.group(1).strip()} {m.group(2)}, p.{m.group(3)})"
+
+    new_text = _ORPHAN_OUTER_PAREN_NARRATIVE_RE.sub(repl, text)
+    return new_text, count
+
+
+# v15.4.0 (Bug 3): redundant in-text + trailing parenthetical for the SAME
+# (surname, year). Pattern observed in v15.2.3 INST/GD reviews:
+#   "Sokoloff and Engerman (2000) provide a perspective ... (Sokoloff and
+#    Engerman 2000, p.12)."
+# Two clean surfaces, but the author is named twice. User's preferred
+# form: "Sokoloff and Engerman (2000, p.12) provide a perspective ...".
+# Logic: per sentence, scan for an in-text "Author (Year[, p.X])" near the
+# start AND a trailing DISPLAY_PAREN_CITE_RE for the same (label, year)
+# near the end. If both pages present: merge as "Author (Year, pp.X, Y)".
+# If only trailing has page: hoist that page into the in-text narrative
+# cite and drop the trailing parenthetical.
+_INTEXT_NARRATIVE_FULL_RE = re.compile(
+    r"(" + _DISPLAY_LABEL + r")\s+\((\d{4}[a-z]?)(?:(?:,\s*|\s+)p\.\s*(\d+))?\)"
+)
+
+
+def _norm_author_label(s: str) -> str:
+    """Case-fold + '&' <-> 'and' normalisation for label equality."""
+    if not s:
+        return ""
+    s = re.sub(r"\s+&\s+", " and ", s)
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def merge_redundant_inline_paren_citations(text: str) -> tuple:
+    """v15.4.0 (Bug 3): merge a sentence that names the author in-text AND
+    repeats the surname+year in a trailing parenthetical for the same
+    (label, year). Returns (text, count).
+
+    Per-sentence scan only — does not look across sentence boundaries.
+    Conservative label matching (case-folded + '&'/'and' normalised exact
+    match). If multiple in-text or trailing matches conflict, leave
+    untouched.
+    """
+    if not text:
+        return text, 0
+    # Split on sentence-ending punct followed by whitespace + capital letter
+    # (paragraph-aware via newlines). Keep punct attached to each sentence.
+    parts = re.split(r"(?<=[.!?])(\s+)(?=[A-Z(\[])", text)
+    out_parts: list = []
+    count = 0
+    # parts alternates [sentence, sep, sentence, sep, ...]
+    for i, segment in enumerate(parts):
+        # only process sentences (even indices); separators pass through
+        if i % 2 == 1:
+            out_parts.append(segment)
+            continue
+        sentence = segment
+        # find in-text narrative cite (first one in the sentence)
+        intext = _INTEXT_NARRATIVE_FULL_RE.search(sentence)
+        if not intext:
+            out_parts.append(sentence)
+            continue
+        in_label_norm = _norm_author_label(intext.group(1))
+        in_year = intext.group(2)
+        in_page = intext.group(3)  # may be None
+        # find a trailing parenthetical cite for same (label, year) AFTER
+        # the in-text one
+        tail_search_start = intext.end()
+        tail = None
+        for m in DISPLAY_PAREN_CITE_RE.finditer(sentence, tail_search_start):
+            if (_norm_author_label(m.group(1)) == in_label_norm
+                    and m.group(2) == in_year):
+                tail = m
+                break
+        if tail is None:
+            out_parts.append(sentence)
+            continue
+        try:
+            tail_page = int(tail.group(3))
+        except (TypeError, ValueError):
+            out_parts.append(sentence)
+            continue
+        # Merge: hoist the tail page into the in-text narrative cite.
+        if in_page is None:
+            new_intext = f"{intext.group(1).strip()} ({in_year}, p.{tail_page})"
+        else:
+            try:
+                in_page_int = int(in_page)
+            except ValueError:
+                out_parts.append(sentence)
+                continue
+            if in_page_int == tail_page:
+                new_intext = intext.group(0)  # same page — just drop the tail
+            else:
+                pages = sorted({in_page_int, tail_page})
+                new_intext = (
+                    f"{intext.group(1).strip()} ({in_year}, "
+                    f"pp.{', '.join(str(p) for p in pages)})"
+                )
+        # Splice: replace the in-text match with the new one and remove the
+        # trailing parenthetical (with the optional leading space before it).
+        rebuilt = sentence[:intext.start()] + new_intext + sentence[intext.end():tail.start()]
+        # If there's a space immediately before the tail, drop it.
+        if rebuilt.endswith(" "):
+            rebuilt = rebuilt[:-1]
+        rebuilt += sentence[tail.end():]
+        out_parts.append(rebuilt)
+        count += 1
+    return "".join(out_parts), count
+
+

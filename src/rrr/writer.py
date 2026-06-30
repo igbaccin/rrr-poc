@@ -11,6 +11,9 @@ from rrr.render import (
     DISPLAY_CITE_RE,
     DISPLAY_PAREN_CITE_RE,
     collapse_nested_narrative_multicite,
+    # v15.4.0: B2 orphan outer paren + B3 redundant inline/paren merge.
+    fix_orphan_outer_paren_narrative,
+    merge_redundant_inline_paren_citations,
     parse_citations,
     render_citation,
     render_citation_canonical,
@@ -41,7 +44,12 @@ _DEFAULT_CHAT_OPTIONS = {
     "top_p": 0.9,
 }
 
-_TAIL_CHARS = 250
+# v15.4.0 (Bug 4 half-fix): bump the previous-chunk tail from 250 to 600
+# chars so the next writer call sees enough prior prose to recognise an
+# author who was just introduced. The cross-paragraph "Ogilvie introduced
+# twice" echo in the v15.2.3 INST review traced to this slice being too
+# narrow to include the previous paragraph's citation surnames.
+_TAIL_CHARS = 600
 
 # v13: _PAGE_ONLY_RE / _AUTHOR_NAME_RE / _DOC_WITHOUT_PAGE_RE / _AUTHOR_YEAR_*
 # / _MULTIPAGE_CITE_RE removed. These regexes fed only the loose-pattern arm
@@ -178,15 +186,24 @@ _SYSTEM_CITATION_INSTRUCTION = (
     "  PARENTHETICAL (author not the subject)   (Author Year, p.N)\n"
     "    e.g. '...credible commitment underpins growth (North and Weingast 1989, p.2).'\n"
     "    Multi-source: '...established across the literature "
-    "(North 1989, p.9; Acemoglu et al. 2001, p.27).'\n\n"
+    "(North 1989, p.9; Acemoglu et al. 2001, p.27).'\n"
+    "  PICK ONE PER SENTENCE: if the author is NAMED IN THE SENTENCE (narrative "
+    "form), put the page next to the year — do NOT also trail the sentence with "
+    "a parenthetical that repeats the same surname+year. 'Sokoloff and Engerman "
+    "(2000, p.12) argue...' is correct; 'Sokoloff and Engerman (2000) argue... "
+    "(Sokoloff and Engerman 2000, p.12)' is REDUNDANT.\n\n"
     "You MAY also cite via an evidence ID such as [E0001]; postprocess "
     "renders it into a validated page citation. When multiple sources support "
     "the same point, prefer the grouped form: 'shared finding ([E0001]; "
     "[E0007]; [E0014]).'\n\n"
     "NEVER emit:\n"
-    "  (North, 1989)      missing page\n"
-    "  North (1989) p.9   page outside parens\n"
-    "  (p.5)              page-only, no author/year\n\n"
+    "  (North, 1989)              missing page\n"
+    "  North (1989) p.9           page outside parens\n"
+    "  (p.5)                      page-only, no author/year\n"
+    "  (Author Year)              literal placeholder — never copy the example label\n"
+    "  (Author 2007)              same trap with a real year substituted in\n"
+    "  (Author (Year, p.N))       DO NOT wrap the narrative form in an outer paren — "
+    "use the parenthetical form (Author Year, p.N) instead\n\n"
     "BOUNDARY RULES (architecturally enforced; violations are sentence-stripped):\n"
     "1. Cite only from the ALLOWED CITATIONS list. Copy author labels EXACTLY "
     "and use only the page numbers shown for each author.\n"
@@ -578,7 +595,14 @@ _AUTHOR_YEAR_PLACEHOLDER_RE = re.compile(
     # v14.2 widening: comma between Year and p. is now optional, so the no-comma
     # form (Author Year p.N) — observed in the v14.1 smoke run 1 para 4 — is also
     # stripped. The previous regex required either ",\s*p.\d+" or ",\s*p.N".
-    r"\s?\(Author(?:,)?\s+Year(?:(?:,\s*|\s+)p\.\s*(?:\d+|N))?\)"
+    # v15.4.0 widening: also catch the case where the model substitutes a real
+    # 4-digit year but leaves the literal English word "Author" as the surname
+    # placeholder — e.g. "(Author 2007)" instead of "(Ogilvie 2007)". Observed
+    # in the v15.2.3 INST review on Ogilvie_2007. The previous regex required
+    # the literal "Year" token; this version accepts either "Year" or a real
+    # year. No legitimate paper in the test corpora has surname "Author".
+    r"\s?\(Author(?:,)?\s+(?:Year|\d{4}[a-z]?)"
+    r"(?:(?:,\s*|\s+)p\.\s*(?:\d+|N))?\)"
 )
 
 
@@ -1496,24 +1520,75 @@ def _format_cluster_synthesis_block(synth, doc_to_evidence_ids) -> str:
     return "\n".join(lines)
 
 
+# v15.4.0 (Bug 4 half-fix): extract author surnames the writer has ALREADY
+# named in prior chunk prose, so the next chunk's prompt can explicitly
+# forbid re-introducing them with a fresh "X argues..." sentence.
+# Pulls surnames from both display narrative cites "Surname (Year" and
+# canonical "(Doc_Year: p.N)" tokens (via _doc_id_to_author_label).
+_DISPLAY_NAMED_AUTHOR_RE = re.compile(
+    r"\b((?:(?:van|von|de|del|der)\s+)?[A-Z][A-Za-z\-]+"
+    r"(?:\s+and\s+(?:(?:van|von|de|del|der)\s+)?[A-Z][A-Za-z\-]+"
+    r"|\s+et\s+al\.)?)\s+\(\d{4}[a-z]?(?:,|\s)"
+)
+
+
+def _extract_named_surnames(chunk: str) -> list:
+    """Return the list of unique author labels named in prose (narrative
+    cites and canonical cites resolved to author labels). Order-preserving.
+    """
+    if not chunk:
+        return []
+    seen = []
+    for m in _DISPLAY_NAMED_AUTHOR_RE.finditer(chunk):
+        label = m.group(1).strip()
+        # heuristic guard: drop ones that are clearly sentence-initial
+        # English words ("The (2020)" etc.). Common short labels are fine.
+        if label.lower() in {"the", "this", "that", "these", "those", "many", "some",
+                             "such", "their", "they", "his", "her", "our", "your"}:
+            continue
+        if label not in seen:
+            seen.append(label)
+    for m in CITE_RE.finditer(chunk):
+        did = m.group(1)
+        label = _doc_id_to_author_label(did)
+        # strip the trailing "(Year)" if present in the label
+        label = re.sub(r"\s*\(\d{4}[a-z]?\)\s*$", "", label).strip()
+        if label and label not in seen:
+            seen.append(label)
+    return seen
+
+
 def _format_claims_so_far(section_claims) -> str:
     """v11.2 lever 3: render the running record of prior sections into a prompt
     block so the next writer call knows what claims have already been made.
     Returns empty string when there are no prior sections (the opening, the
     first stance section, or the parallel writer path where every section
-    starts simultaneously)."""
+    starts simultaneously).
+    v15.4.0 (Bug 4 half-fix): also surface 'Already named in prose: ...' so
+    the next chunk's prompt knows which authors have been introduced
+    narratively and should not be re-introduced with a fresh 'X argues...'.
+    """
     if not section_claims:
         return ""
     lines = [
         "CLAIMS ALREADY MADE IN PRIOR SECTIONS (do NOT repeat these openers or "
-        "the same mechanism phrasing; build on them or contrast them):"
+        "the same mechanism phrasing, and do NOT re-introduce an author already "
+        "named in prose below with a fresh \"X argues / X shows...\" sentence — "
+        "cite them parenthetically instead):"
     ]
+    all_named: list = []
     for i, c in enumerate(section_claims, 1):
         mechs = "; ".join((c.get("mechanisms") or [])[:2]) or "(no mechanism recorded)"
         docs = ", ".join(str(d) for d in (c.get("docs") or [])[:4])
         stance = (c.get("stance") or "").upper()
         cluster = c.get("cluster") or ""
         lines.append(f"  Section {i} [{stance}/{cluster}]: {mechs} (citing {docs})")
+        for n in (c.get("surnames_named") or []):
+            if n not in all_named:
+                all_named.append(n)
+    if all_named:
+        lines.append(f"  Already named in prose (cite parenthetically, do not "
+                     f"re-introduce): {', '.join(all_named[:20])}")
     return "\n".join(lines)
 
 
@@ -2928,6 +3003,10 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "docs": [d.get("doc_id") for d in job["docs"]],
             "mechanisms": top_mechs[:4],
             "word_count": word_count,
+            # v15.4.0 (Bug 4 half-fix): extract author surnames the chunk
+            # named in prose, so the next section's claims_so_far block can
+            # forbid re-introducing them.
+            "surnames_named": _extract_named_surnames(chunk),
         })
         chunks.append(chunk)
 
@@ -3307,6 +3386,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     if canonical_to_display_count and metrics:
         metrics.inc("writer_canonical_to_display", canonical_to_display_count)
 
+    # v15.4.0 (Bug 2): fix the asymmetric "(Author (Year, p.N)<punct>" form
+    # where the writer wrapped a narrative cite in an outer paren but never
+    # closed it. Runs AFTER rewrite_canonical_to_display so the asymmetric
+    # display surface has been reconstructed; runs BEFORE
+    # rewrite_misplaced_narrative_citations so the inner narrative is gone
+    # before that pass tries to re-position narratives.
+    full_text, orphan_paren_fixes = fix_orphan_outer_paren_narrative(full_text)
+    if orphan_paren_fixes and metrics:
+        metrics.inc("writer_orphan_outer_paren_fixes", orphan_paren_fixes)
+    if orphan_paren_fixes:
+        print(f"[Writer] Orphan outer-paren narrative fixes: {orphan_paren_fixes}")
+
     # v11-A: rewrite narrative citations 'Author (Year, p.N)' sitting at the
     # end of a sentence whose subject is not the author to the parenthetical
     # form '(Author Year, p.N)'. Closes the v10 known edge case where the
@@ -3360,6 +3451,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         metrics.inc("writer_same_author_collapses", same_author_collapses)
     if same_author_collapses:
         print(f"[Writer] Same-(author, year) paren collapses: {same_author_collapses}")
+
+    # v15.4.0 (Bug 3): merge redundant in-text + trailing parenthetical pairs.
+    # Pattern: "Sokoloff and Engerman (2000) provide a perspective ... (Sokoloff
+    # and Engerman 2000, p.12)." -> "Sokoloff and Engerman (2000, p.12) provide
+    # a perspective ...". Per-sentence scan; conservative label matching.
+    # Runs AFTER same_author_collapses so any trailing multi-page parens are
+    # already flat.
+    full_text, redundant_inline_merges = merge_redundant_inline_paren_citations(full_text)
+    if redundant_inline_merges and metrics:
+        metrics.inc("writer_redundant_inline_merge", redundant_inline_merges)
+    if redundant_inline_merges:
+        print(f"[Writer] Redundant in-text + paren cite merges: {redundant_inline_merges}")
 
     # v10: detect-then-LLM-rewrite style enforcement (one batched call). Runs
     # AFTER validation so the rewriter sees the final citation surface and is
