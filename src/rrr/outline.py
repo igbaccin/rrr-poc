@@ -69,7 +69,7 @@ _KEEP_ALIVE = "30m"
 #       unassigned_share never reached the refusal threshold
 _PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
 _CLUSTER_PROMPT_VERSION = "2026-06-30-v15.2.0-cluster-outcome-anchored"
-_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.2-posture-quotes-soften-and-propagate"
+_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.3-conduit-also-fires-on-adjacent"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
 # v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
@@ -1002,24 +1002,31 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
             if metrics:
                 metrics.inc("outline_posture_grounding_downgrades")
 
-    # v15.2.1: SYMMETRIC post-check. When the model picks
-    # `rival_to_topic_cause` for a causal topic, check whether the
-    # cluster's own shared_cause text names the topic_cause as a
-    # DOWNSTREAM NOUN (after a conduit verb like "led to" / "produced" /
-    # "established"). If yes, the cluster is making an upstream claim and
-    # the rival label is a TEST-R-template-fire (see v15.2.0 AJR-on-INST
-    # failure: shared_cause="...led to the establishment of extractive
-    # institutions" was labelled rival even though "institutions" is the
-    # topic cause, named as conduit). Promote rival -> upstream and let
-    # the upstream-grounding check above gate it. Topic-agnostic: works
-    # on any (topic_cause, shared_cause) pair via _names_topic_cause_as_conduit.
+    # v15.2.1 + v15.2.3: SYMMETRIC post-check. Promote a non-upstream
+    # relation to upstream when the cluster's own quote names the
+    # topic_cause as a DOWNSTREAM NOUN after a conduit verb. v15.2.1
+    # caught the rival case; v15.2.3 widens to ALSO catch `adjacent`
+    # because the v15.2.2 INST smoke showed mistral-small landing AJR in
+    # adjacent (not rival) when its TEST C-THROUGH read failed on
+    # literal-string mismatch ("extractive institutions" != "institutions"
+    # to the model), so the rival-only post-check never fired. The
+    # deterministic stem-overlap check correctly sees institutions in
+    # extractive institutions.
+    #
+    # Grounding source: prefer the VERBATIM cluster_cause_quote the model
+    # produced in Stage 2 over the Stage-1 shared_cause label, because
+    # the quote is what the model actually based its decision on. Fall
+    # back to shared_cause when the quote is empty (e.g. adjacent
+    # responses that skipped the quote field).
+    quote_for_conduit = (posture.get("cluster_cause_quote") or "").strip() or grounding_source
     if (topic_shape == "causal"
-            and posture.get("relation") == "rival_to_topic_cause"
+            and posture.get("relation") in ("rival_to_topic_cause", "adjacent")
             and topic_cause
-            and grounding_source):
-        if _names_topic_cause_as_conduit(grounding_source, topic_cause):
+            and quote_for_conduit):
+        if _names_topic_cause_as_conduit(quote_for_conduit, topic_cause):
+            original = posture["relation"]
             posture["relation"] = "upstream_of_topic_cause"
-            posture["mechanism_grounding"] = "promoted_rival_to_upstream_via_conduit_check"
+            posture["mechanism_grounding"] = f"promoted_{original}_to_upstream_via_conduit_check"
             if metrics:
                 metrics.inc("outline_posture_grounding_promotions")
 
@@ -1108,6 +1115,17 @@ _CONDUIT_VERBS = (
     "determined", "determines", "determining",
     "gave rise to", "gives rise to", "giving rise to",
     "drives", "drove", "driving", "drive",
+    # v15.2.3: added "explain" family. The Sokoloff & Engerman cluster on
+    # INST has shared_cause "distributional conflicts provide a better
+    # explanation than efficiency for the core economic institutions" —
+    # syntactically the topic-cause noun appears AFTER `explanation` even
+    # though "explanation for" is not contiguous. Bare `explanation`
+    # plus the stem-overlap check is enough — if topic_cause is mentioned
+    # downstream of the word `explanation` in any phrasing, the cluster
+    # is naming it as the explanandum. Topic-agnostic.
+    "account for", "accounts for",
+    "explain", "explains", "explaining",
+    "explanation", "explanations",
 )
 
 
