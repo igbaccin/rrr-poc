@@ -69,7 +69,7 @@ _KEEP_ALIVE = "30m"
 #       unassigned_share never reached the refusal threshold
 _PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
 _CLUSTER_PROMPT_VERSION = "2026-06-30-v15.2.0-cluster-outcome-anchored"
-_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.1-posture-quotes-required-test-c-first"
+_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.2-posture-quotes-soften-and-propagate"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
 # v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
@@ -881,9 +881,16 @@ def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dic
     # fields to be present (>=20 chars as a cheap "is this a real quote"
     # check). If empty, the posture call short-circuited; better to retry
     # than to ship a relation decision with no evidentiary anchor.
+    # v15.2.2: lowered the quote-length minimum from 20 -> 10 chars.
+    # The v15.2.1 smoke showed adjacent ballooning to 8/12 clusters on
+    # causal topics because the model was producing short quotes that
+    # failed the 20-char gate, then the validator rejected, retry hit the
+    # same gate, and posture defaulted to adjacent. 10 chars still
+    # excludes empty/single-word fields but admits realistic quote
+    # phrases like "led to growth" or "shaped institutions".
     if (topic_shape == "causal"
             and relation != "adjacent"
-            and (len(cluster_cause_quote) < 20 or len(cluster_outcome_quote) < 20)):
+            and (len(cluster_cause_quote) < 10 or len(cluster_outcome_quote) < 10)):
         return None
     return {
         "relation": relation,
@@ -1333,6 +1340,15 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
             "lead_doc_id": posture.get("lead_doc_id", ""),
             "internal_disagreement": posture.get("internal_disagreement", ""),
             "posture_failed": posture.get("posture_failed", False),
+            # v15.2.2: carry the v15.2.1 quote fields + mechanism_grounding
+            # signal into the ledger so the smoke harness can actually
+            # SEE what Stage 2 produced. The v15.2.1 smoke had 0/6
+            # quotes "populated" only because this propagation was
+            # missing — the validator HAD extracted them, but they died
+            # at this boundary.
+            "cluster_cause_quote": posture.get("cluster_cause_quote", ""),
+            "cluster_outcome_quote": posture.get("cluster_outcome_quote", ""),
+            "mechanism_grounding": posture.get("mechanism_grounding", ""),
         })
 
     # Stage 3.
