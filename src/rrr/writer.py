@@ -131,6 +131,18 @@ _DOUBLE_PAREN_DISPLAY_RE = re.compile(
 _DOUBLE_PAREN_DISPLAY_GROUP_RE = re.compile(
     r"\(((?:\([^()]+?\)[\s;,]*){2,})\)"
 )
+# v15.7.1: asymmetric outer-paren residue — the model writes '((cite).' (open
+# wrap, single close, sentence terminator after). The symmetric collapser
+# above misses these because it requires '))'. The v15.7 smoke showed two of
+# these shipped in GD 04 ('((Broadberry and Gupta 2006, p.17).',
+# '((North 1989, p.6) (Ogilvie 2007, p.2).'). Match '((' + non-paren content
+# + ')' NOT followed by ')' — strip the leading '(' (capture the content +
+# close as one group). When a SECOND cite follows ('((cite1) (cite2).'), the
+# outer-wrap was over the FIRST cite only; the regex catches the leading
+# half and the second cite stays as-is.
+_ASYM_OUTER_PAREN_RE = re.compile(
+    r"\(\(([^()]+\))(?!\))"
+)
 
 # v10: detect-then-LLM-rewrite style enforcement. We deliberately do NOT
 # substitute forbidden words mechanically because the right replacement is
@@ -594,10 +606,18 @@ def _collapse_double_parens(text: str) -> tuple:
         cites = re.findall(r"\([^()]+?\)", inner)
         return "; ".join(cites)
 
+    def repl_asym(m):
+        # v15.7.1: '((cite).' with the OUTER paren unclosed. Strip ONE of
+        # the leading '(' (the unmatched one) and keep the well-formed inner.
+        nonlocal count
+        count += 1
+        return "(" + m.group(1)
+
     text, _ = (_DOUBLE_PAREN_CITE_RE.subn(repl_inner_only, text))
     text, _ = (_NESTED_PAGE_SUFFIX_RE.subn(repl_nested_suffix, text))
     text, _ = (_DOUBLE_PAREN_DISPLAY_RE.subn(repl_inner_only, text))
     text, _ = (_DOUBLE_PAREN_DISPLAY_GROUP_RE.subn(repl_group, text))
+    text, _ = (_ASYM_OUTER_PAREN_RE.subn(repl_asym, text))
     return text, count
 
 
