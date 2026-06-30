@@ -69,7 +69,7 @@ _KEEP_ALIVE = "30m"
 #       unassigned_share never reached the refusal threshold
 _PRECHECK_PROMPT_VERSION = "2026-06-30-v15.2.0-precheck-pinned-cause"
 _CLUSTER_PROMPT_VERSION = "2026-06-30-v15.2.0-cluster-outcome-anchored"
-_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.0-posture-anchored"
+_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.1-posture-quotes-required-test-c-first"
 _ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
 
 # v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
@@ -667,57 +667,86 @@ def _scaffold_for_shape(topic_shape: str) -> str:
         # v15.0.2 GD smoke confirmed that bias: North_1989 was upstream 9/9
         # on a topic where it is the canonical rival, and AJR_2002 collapsed
         # to upstream in 3/9 runs. Rival is now Test R, applied first.
+        # v15.2.1: scaffold reordered to make TEST U reachable. v15.2.0 put
+        # TEST R first AND demanded TEST U cite cluster_cause_quote /
+        # cluster_outcome_quote fields that the output schema never asked
+        # for. Net effect: TEST U was mechanically unreachable, every
+        # cluster fell through to TEST R, and clusters whose own
+        # shared_cause string named the topic cause as a downstream noun
+        # ("...led to extractive institutions" where topic_cause is
+        # "institutions") were mislabelled rival. v15.2.1 fix:
+        #   - The two quote fields are now REQUIRED output keys (enforced
+        #     by _build_posture_prompt + _validate_posture).
+        #   - New TEST C-THROUGH fires FIRST and asks "does the cluster's
+        #     own cause quote name the topic cause as a downstream noun?"
+        #     If yes, we are in the upstream/same-as zone and TEST R is
+        #     off the table.
+        #   - TEST R is preserved but only fires after TEST C-THROUGH /
+        #     TEST S / TEST U have all failed — keeps the AJR-on-GD win
+        #     intact (AJR's GD cluster names "institutions" as the
+        #     conduit, not "Europe unique factor endowments", so
+        #     TEST C-THROUGH does not fire and the cluster falls through
+        #     to rival correctly).
         return (
-            "Before choosing `relation`, write `reasoning_trace` answering "
-            "the following tests IN ORDER. Take the FIRST test whose "
-            "condition the cluster satisfies — do not keep testing once you "
-            "have an answer.\n\n"
-            "FOUNDATION — write FIRST, before any test:\n"
-            "  Quote (verbatim, in the cluster's own words) the CAUSE the "
-            "cluster names. This is `cluster_cause_quote`. Then quote "
-            "(verbatim, in the cluster's own words) the OUTCOME the cluster "
-            "explains. This is `cluster_outcome_quote`. If the cluster says "
-            "almost nothing about either, the relation is `adjacent` and you "
-            "may skip the remaining tests.\n\n"
-            "TEST R — RIVAL (apply first, by design):\n"
-            "  Do the cluster's CAUSE and the topic's CAUSE both purport to "
-            "EXPLAIN the SAME OUTCOME (the topic's outcome)? Two causes are "
-            "RIVAL when both are offered as the answer to the same "
-            "WHY-question and accepting one as the fundamental explanation "
-            "would mean rejecting the other as fundamental. If yes -> "
-            "`rival_to_topic_cause`. Rival is the default whenever two "
-            "DIFFERENT causes both explain the same outcome at the same "
-            "level (both fundamental, both proximate, both mechanism-level). "
-            "Two causes can be rival even when one paper does not "
-            "explicitly attack the other — what matters is that they offer "
-            "COMPETING ANSWERS to the same WHY-question.\n\n"
+            "Before choosing `relation`, populate the two QUOTE fields and "
+            "then walk the tests IN ORDER. Take the FIRST test whose "
+            "condition the cluster satisfies — do not keep testing once "
+            "you have an answer.\n\n"
+            "FOUNDATION — populate BOTH fields or relation is `adjacent`:\n"
+            "  cluster_cause_quote: a VERBATIM substring (>=4 words) from "
+            "the cluster's own claims or shared_cause naming the CAUSE the "
+            "cluster proposes. Do not paraphrase. If you cannot find such "
+            "a substring, the cluster is `adjacent` and you may stop.\n"
+            "  cluster_outcome_quote: a VERBATIM substring (>=4 words) "
+            "from the cluster's claims naming the OUTCOME the cluster "
+            "explains. If you cannot find such a substring, the cluster "
+            "is `adjacent` and you may stop.\n\n"
+            "TEST C-THROUGH — CHAIN-THROUGH-TOPIC-CAUSE (apply FIRST):\n"
+            "  Read your cluster_cause_quote. Does it name the topic's "
+            "CAUSE (as quoted verbatim in TOPIC CAUSE above) as a "
+            "DOWNSTREAM NOUN — i.e. as the thing the cluster's cause "
+            "produces, establishes, shapes, leads to, causes, generates, "
+            "or affects? Surface markers: cluster_cause_quote contains "
+            "the topic-cause word(s) AFTER a verb like `led to`, "
+            "`established`, `shaped`, `produced`, `caused`, `generated`, "
+            "`affected`, `determined`, `gave rise to`. If yes, the "
+            "cluster is arguing THROUGH the topic's cause — proceed to "
+            "TEST S then TEST U; DO NOT consider rival at this point.\n\n"
             "TEST S — SAME-AS (re-expression, not rivalry):\n"
             "  Is the cluster's cause the topic's cause under a DIFFERENT "
-            "LABEL or a more SPECIFIC INSTANCE of the same variable? (e.g. "
-            "\"extractive institutions\" is an instance of \"institutions\"). "
-            "If yes -> `same_as_topic_cause`.\n\n"
-            "TEST U — UPSTREAM (only when a mechanism is quotable):\n"
-            "  Does the cluster's cause flow INTO the topic's cause via a "
-            "MECHANISM the cluster's own claims actually NAME? You must be "
-            "able to write the chain `cluster_cause -> topic_cause -> "
-            "topic_outcome` using language from the cluster_cause_quote and "
-            "cluster_outcome_quote. If the chain requires words the cluster "
-            "does not use, this test FAILS and you should consider Test R "
-            "(rival) instead — a cause whose link to the topic cause is "
-            "speculative on your part rather than asserted by the cluster "
-            "is NOT upstream. If chain is quotable -> "
-            "`upstream_of_topic_cause`.\n\n"
+            "LABEL or a more SPECIFIC INSTANCE of the same variable? "
+            "(e.g. \"extractive institutions\" is an instance of "
+            "\"institutions\"). If yes -> `same_as_topic_cause`.\n\n"
+            "TEST U — UPSTREAM (cite the chain from your quotes):\n"
+            "  Using cluster_cause_quote and cluster_outcome_quote, write "
+            "the chain `cluster_cause -> topic_cause -> topic_outcome` in "
+            "ONE sentence, with the bridge verb taken VERBATIM from "
+            "cluster_cause_quote. If you can write that sentence without "
+            "inventing words the cluster does not use -> "
+            "`upstream_of_topic_cause`. If you cannot, this test FAILS; "
+            "continue.\n\n"
+            "TEST R — RIVAL (only after TEST C-THROUGH, S, U have failed):\n"
+            "  Do the cluster's CAUSE and the topic's CAUSE both purport "
+            "to EXPLAIN the SAME OUTCOME, with NEITHER cause acting "
+            "THROUGH the other? Two causes are RIVAL when both are "
+            "offered as competing answers to the same WHY-question at the "
+            "same level (both fundamental, both proximate) AND the "
+            "cluster's cause-quote does NOT name the topic's cause as a "
+            "downstream conduit. If both conditions hold -> "
+            "`rival_to_topic_cause`. If the cluster's cause acts through "
+            "the topic's cause, you should have stopped at TEST "
+            "C-THROUGH/S/U — do not pick rival here.\n\n"
             "TEST D — DOWNSTREAM:\n"
             "  Is the cluster's cause itself a CONSEQUENCE of the topic's "
             "cause (the cluster studies what happens AFTER the topic's "
             "cause acts)? -> `downstream_of_topic_cause`.\n\n"
-            "TEST C — SCOPE CONDITION:\n"
+            "TEST SC — SCOPE CONDITION:\n"
             "  Does the cluster accept the topic's claim but identify WHEN "
             "OR WHERE it holds vs fails (period limits, regional limits, "
             "measurement limits)? -> `scope_condition`.\n\n"
             "ADJACENT — fallback only:\n"
-            "  If none of the tests above apply — the cluster talks about a "
-            "different outcome or a different subject — -> `adjacent`."
+            "  If none of the tests above apply — the cluster talks about "
+            "a different outcome or a different subject — -> `adjacent`."
         )
     if topic_shape == "comparative":
         return (
@@ -796,8 +825,23 @@ def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
         _scaffold_for_shape(topic_shape),
         "",
         "OUTPUT — return ONE JSON object with EXACTLY these keys:",
-        "  reasoning_trace: a few sentences answering (i)-(iii) above with the "
-        "required quotes.",
+        # v15.2.1: cluster_cause_quote / cluster_outcome_quote are NOW
+        # required output keys for causal topics. v15.2.0 mentioned them in
+        # the scaffold but never asked for them in the schema, so they
+        # arrived as NULL on every cluster and TEST U was mechanically
+        # unreachable. Required for causal topics; for comparative /
+        # descriptive shapes they remain empty strings.
+        "  cluster_cause_quote: VERBATIM substring (>=4 words) from the "
+        "cluster's claims naming the cluster's cause. Required for "
+        "causal topics; empty string allowed only when relation = "
+        "`adjacent` (the cluster genuinely names no cause). For "
+        "comparative / descriptive topics this field is empty.",
+        "  cluster_outcome_quote: VERBATIM substring (>=4 words) from "
+        "the cluster's claims naming the cluster's outcome. Same "
+        "requirement as cluster_cause_quote.",
+        "  reasoning_trace: a few sentences walking the test order. "
+        "Reference your cluster_cause_quote when applying TEST C-THROUGH "
+        "and TEST U.",
         f"  relation: one of [{_allowed_relations_block(topic_shape)}]",
         "  elaboration: a 1-2 sentence free-text posture (<=240 chars) in the "
         "literature's own terms — the writer renders this verbatim into the "
@@ -828,12 +872,27 @@ def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dic
     if lead and lead not in valid_doc_ids:
         lead = ""
     internal = str(obj.get("internal_disagreement", "") or "").strip()[:240]
+    # v15.2.1: cluster_cause_quote + cluster_outcome_quote captured here
+    # so they actually land in the ledger (v15.2.0 mentioned them in the
+    # scaffold but never extracted them, so TEST U was unreachable).
+    cluster_cause_quote = str(obj.get("cluster_cause_quote", "") or "").strip()[:400]
+    cluster_outcome_quote = str(obj.get("cluster_outcome_quote", "") or "").strip()[:400]
+    # For causal topics with a non-adjacent relation, require both quote
+    # fields to be present (>=20 chars as a cheap "is this a real quote"
+    # check). If empty, the posture call short-circuited; better to retry
+    # than to ship a relation decision with no evidentiary anchor.
+    if (topic_shape == "causal"
+            and relation != "adjacent"
+            and (len(cluster_cause_quote) < 20 or len(cluster_outcome_quote) < 20)):
+        return None
     return {
         "relation": relation,
         "elaboration": elaboration,
         "reasoning_trace": reasoning,
         "lead_doc_id": lead,
         "internal_disagreement": internal,
+        "cluster_cause_quote": cluster_cause_quote,
+        "cluster_outcome_quote": cluster_outcome_quote,
     }
 
 
@@ -936,6 +995,27 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
             if metrics:
                 metrics.inc("outline_posture_grounding_downgrades")
 
+    # v15.2.1: SYMMETRIC post-check. When the model picks
+    # `rival_to_topic_cause` for a causal topic, check whether the
+    # cluster's own shared_cause text names the topic_cause as a
+    # DOWNSTREAM NOUN (after a conduit verb like "led to" / "produced" /
+    # "established"). If yes, the cluster is making an upstream claim and
+    # the rival label is a TEST-R-template-fire (see v15.2.0 AJR-on-INST
+    # failure: shared_cause="...led to the establishment of extractive
+    # institutions" was labelled rival even though "institutions" is the
+    # topic cause, named as conduit). Promote rival -> upstream and let
+    # the upstream-grounding check above gate it. Topic-agnostic: works
+    # on any (topic_cause, shared_cause) pair via _names_topic_cause_as_conduit.
+    if (topic_shape == "causal"
+            and posture.get("relation") == "rival_to_topic_cause"
+            and topic_cause
+            and grounding_source):
+        if _names_topic_cause_as_conduit(grounding_source, topic_cause):
+            posture["relation"] = "upstream_of_topic_cause"
+            posture["mechanism_grounding"] = "promoted_rival_to_upstream_via_conduit_check"
+            if metrics:
+                metrics.inc("outline_posture_grounding_promotions")
+
     posture["model"] = _MODEL
     posture["prompt_version"] = _POSTURE_PROMPT_VERSION
     _save_cache("posture", sig, posture)
@@ -1000,6 +1080,53 @@ def _mechanism_grounding_fails(reasoning: str, grounding_source: str) -> bool:
         return False  # nothing to ground against; let the LLM call stand
     overlap = r_stems & g_stems
     return len(overlap) < 2
+
+
+# v15.2.1: conduit verbs that, when a cluster's shared_cause text contains
+# `<conduit_verb> ... <topic_cause_stem>`, signal the cluster is naming
+# the topic cause as a DOWNSTREAM result of its own cause — i.e. the
+# cluster is making an upstream argument. Detected post-Stage-2 to catch
+# rival-template-fires where the cluster's own text names the through-
+# chain explicitly (e.g. shared_cause="...led to the establishment of
+# extractive institutions" with topic_cause="institutions"). The verb
+# list is intentionally narrow and topic-agnostic.
+_CONDUIT_VERBS = (
+    "led to", "leads to", "leading to",
+    "produced", "produces", "producing", "produce",
+    "established", "establishes", "establishing",
+    "shaped", "shapes", "shaping",
+    "caused", "causes", "causing", "cause",
+    "generated", "generates", "generating", "generate",
+    "affected", "affects", "affecting",
+    "determined", "determines", "determining",
+    "gave rise to", "gives rise to", "giving rise to",
+    "drives", "drove", "driving", "drive",
+)
+
+
+def _names_topic_cause_as_conduit(grounding_source: str, topic_cause: str) -> bool:
+    """Return True when `grounding_source` (the cluster's shared_cause or
+    shared_thread) contains the topic_cause as a downstream noun after a
+    conduit verb. Used to PROMOTE rival_to_topic_cause -> upstream_of_topic_cause
+    when the cluster's own summary names the topic cause as the conduit
+    of its own argument."""
+    if not grounding_source or not topic_cause:
+        return False
+    text = grounding_source.lower()
+    topic_stems = _content_stems(topic_cause)
+    if not topic_stems:
+        return False
+    # Find any conduit verb in the cluster summary, then check whether
+    # the text AFTER the verb contains any topic_cause stem.
+    for verb in _CONDUIT_VERBS:
+        idx = text.find(verb)
+        while idx != -1:
+            after = text[idx + len(verb):]
+            after_stems = _content_stems(after)
+            if topic_stems & after_stems:
+                return True
+            idx = text.find(verb, idx + 1)
+    return False
 
 
 # ---------------------------------------------------------------------------
