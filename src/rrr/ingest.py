@@ -423,12 +423,31 @@ def validate_extraction(authors: list, year: str, text: str) -> tuple:
 # doc_id generation
 # ---------------------------------------------------------------------------
 
+_LATIN_PARTICLES = {"van", "von", "de", "del", "der", "la", "le", "du", "di", "da"}
+
+
 def _clean_surname_token(s: str) -> str:
-    """Strip non-letters, drop 'et al' markers, preserve camelCase particles."""
+    """Strip non-letters, drop 'et al' markers, lowercase-known-particles.
+
+    v15.8.1: bib may pass 'Van Zanden' (capital V because BibTeX preserved
+    case); the RRR doc_id convention uses lowercase particles: 'vanZanden'.
+    We split on whitespace, lowercase any token in _LATIN_PARTICLES, then
+    concatenate. 'Van Zanden' → 'vanZanden'; 'de La Croix' → 'delaCroix'.
+    """
     if not s:
         return ""
     s = re.sub(r"\bet\s+al\.?", "", s, flags=re.IGNORECASE)
-    return re.sub(r"[^A-Za-z]", "", s).strip()
+    parts = re.split(r"\s+", s.strip())
+    out = []
+    for part in parts:
+        clean = re.sub(r"[^A-Za-z]", "", part)
+        if not clean:
+            continue
+        if clean.lower() in _LATIN_PARTICLES:
+            out.append(clean.lower())
+        else:
+            out.append(clean)
+    return "".join(out)
 
 
 def generate_doc_id(surnames: list, year: str, existing: set = None) -> str:
