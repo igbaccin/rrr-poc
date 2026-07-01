@@ -1,5 +1,37 @@
-import argparse, pandas as pd
+import argparse, re, sys
+import pandas as pd
 from rrr.reasoner import layered_t2
+
+
+# v15.10: deterministic sanity gate before any LLM call. Rejects topics that
+# are obviously not scholarly questions — keyboard slams, all-punctuation
+# strings, single-word fragments. Kills the descriptive+PROCEED loophole for
+# word-salad topics that reach Stage 0 with real English tokens and no
+# coherent meaning. The gate is intentionally lenient: real scholarly topics
+# with unusual phrasings must not be rejected. If in doubt, let it through
+# and rely on Stage 0.
+_MIN_TOPIC_CHARS = 12
+_MIN_ALPHA_TOKENS = 2  # at least two >=3-char alphabetic tokens
+_ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def _reject_gibberish_topic(topic: str) -> str | None:
+    """Return a rejection reason if the topic is obviously not scholarly,
+    else None. Applied at CLI entry before any pipeline setup or LLM call.
+    """
+    if topic is None:
+        return "topic is None"
+    stripped = topic.strip()
+    if not stripped:
+        return "topic is empty"
+    if len(stripped) < _MIN_TOPIC_CHARS:
+        return (f"topic has {len(stripped)} chars (<{_MIN_TOPIC_CHARS}); "
+                "not a scholarly research question")
+    alpha_tokens = _ALPHA_TOKEN_RE.findall(stripped)
+    if len(alpha_tokens) < _MIN_ALPHA_TOKENS:
+        return (f"topic has {len(alpha_tokens)} alphabetic token(s) of length "
+                f">=3 (<{_MIN_ALPHA_TOKENS}); not a scholarly research question")
+    return None
 
 
 def load_refs(meta_path):
@@ -67,6 +99,12 @@ def main():
                     help="T2: rewrite in-text citations as clickable markdown links "
                          "to the source PDF page. Sets RRR_LINKIFY=1.")
     args = ap.parse_args()
+
+    reject = _reject_gibberish_topic(args.topic)
+    if reject:
+        sys.stderr.write(f"[RRR] refusing to run: {reject}\n")
+        sys.stderr.write(f"[RRR] topic was: {args.topic!r}\n")
+        raise SystemExit(2)
 
     if args.linkify:
         import os

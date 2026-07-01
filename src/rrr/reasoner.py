@@ -1580,6 +1580,119 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     metrics.set("topic_fit_selected_probe_coverage", topic_fit.get("selected_probe_coverage"))
     print(f"[Layered-T2] admitted={len(admitted_docs)} selected_for_llm={len(selected_docs)} budget={DOC_BUDGET}")
 
+    # v15.10 (#3+#4): early Stage 0 precheck BEFORE per_document_sweep. The
+    # sweep's ~5s/doc claim-extraction LLM call is by far the most expensive
+    # pre-writer stage on cold cache (~4 min for 50 docs). Stage 0 only reads
+    # doc_id + citation, both available from the metadata refs dict without
+    # needing claims. Running precheck here lets a genuine refusal skip the
+    # sweep entirely; PROCEED falls through and the late build_outline() call
+    # inside the outline stage hits the same-signature cache with zero LLM
+    # cost. Also splits the previously-conflated 'outline_failed' refusal
+    # reason into:
+    #   - no_admitted_docs      (BM25/admission produced 0 docs)
+    #   - stage0_llm_failed     (precheck LLM error or malformed JSON)
+    #   - corpus_off_topic      (precheck returned REFUSE)
+    # and leaves 'outline_failed' meaning only 'Stage 1 clustering returned
+    # nothing' for the late-fall-through case.
+    if not selected_docs:
+        print("[Layered-T2] refusal=no_admitted_docs (BM25 admitted zero docs)")
+        write_run("T2_LAYERED_GLOBAL", topic,
+                  {"docs_seen": len(all_doc_ids), "docs_represented": 0},
+                  {"refusal": True, "reason": "no_admitted_docs",
+                   "explanation": "BM25 retrieval + evidence admission "
+                                  "produced zero admitted documents. The "
+                                  "topic likely has no vocabulary overlap "
+                                  "with any corpus paper. See "
+                                  "runs/admission_rejections.json."})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", "no_admitted_docs")
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
+                   "refusal": "no_admitted_docs"},
+        )
+        metrics.save()
+        return
+
+    from rrr.outline import precheck as _early_precheck
+    early_doc_summaries = [
+        {"doc_id": d.get("doc_id"),
+         "citation": refs.get(d.get("doc_id"), d.get("doc_id"))}
+        for d in selected_docs if d.get("doc_id")
+    ]
+    print("[Layered-T2] early Stage 0 precheck (before per_document_sweep)...")
+    with metrics.stage("outline_early_precheck"):
+        early_pre = _early_precheck(topic, early_doc_summaries, metrics=metrics)
+    if early_pre is None:
+        print("[Layered-T2] refusal=stage0_llm_failed (Stage 0 precheck LLM "
+              "error, malformed JSON, or invalid enum)")
+        write_run("T2_LAYERED_GLOBAL", topic,
+                  {"docs_seen": len(all_doc_ids), "docs_represented": 0},
+                  {"refusal": True, "reason": "stage0_llm_failed",
+                   "explanation": "Stage 0 precheck did not return a valid "
+                                  "response. Causes: Ollama connection "
+                                  "error, malformed JSON, or an invalid "
+                                  "topic_shape/corpus_fit enum. Inspect "
+                                  "metrics.llm_calls."})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", "stage0_llm_failed")
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
+                   "refusal": "stage0_llm_failed"},
+        )
+        metrics.save()
+        return
+    if early_pre.get("corpus_fit") == "REFUSE":
+        refusal_explanation = early_pre.get("corpus_fit_rationale", "") or (
+            "Stage 0 precheck determined the topic and corpus come from "
+            "different intellectual domains with no honest scholarly path.")
+        print(f"[Layered-T2] refusal=corpus_off_topic (Stage 0 early precheck)")
+        print(f"[Layered-T2] reason: {refusal_explanation}")
+        # Persist a minimal outline_plan.json so debugging matches the late
+        # refusal path's artefacts.
+        _early_plan = {
+            "refused": True,
+            "refusal_reason": "corpus_off_topic",
+            "refusal_explanation": refusal_explanation,
+            "topic": topic,
+            "topic_shape": early_pre.get("topic_shape"),
+            "topic_shape_rationale": early_pre.get("topic_shape_rationale", ""),
+            "topic_cause": early_pre.get("topic_cause", ""),
+            "topic_outcome": early_pre.get("topic_outcome", ""),
+            "admitted_total": len(early_doc_summaries),
+            "clusters": [],
+            "unassigned_doc_ids": [d["doc_id"] for d in early_doc_summaries],
+            "ordered_cluster_ids": [],
+            "relation_distribution": {},
+            "unassigned_share": 1.0,
+            "precheck_source": "early",
+        }
+        try:
+            with open(runs_path("outline_plan.json"), "w", encoding="utf-8") as _f:
+                json.dump(_early_plan, _f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+        write_run("T2_LAYERED_GLOBAL", topic,
+                  {"docs_seen": len(all_doc_ids), "docs_represented": 0,
+                   "topic_shape": early_pre.get("topic_shape")},
+                  {"refusal": True, "reason": "corpus_off_topic",
+                   "explanation": refusal_explanation})
+        metrics.set("refusal", True)
+        metrics.set("refusal_reason", "corpus_off_topic")
+        metrics.set("outline_topic_shape", early_pre.get("topic_shape"))
+        write_run_manifest(
+            "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
+            extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
+                   "refusal": "corpus_off_topic",
+                   "outline_topic_shape": early_pre.get("topic_shape"),
+                   "outline_topic_shape_rationale": early_pre.get("topic_shape_rationale", "")},
+        )
+        metrics.save()
+        return
+    # PROCEED — fall through. The late build_outline precheck call hits the
+    # same-signature cache (sorted titles) with zero LLM cost.
+
     doc_summaries = []
     with metrics.stage("per_document_sweep"):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -1625,19 +1738,21 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     with metrics.stage("outline"):
         outline_plan = build_outline(topic, doc_summaries, metrics=metrics)
     if outline_plan is None:
-        print("[Layered-T2] refusal=outline_failed (Stage 0 or Stage 1 returned nothing)")
+        # v15.10: early precheck already caught Stage 0 failures and empty
+        # doc_summaries, so 'outline_failed' now means Stage 1 clustering
+        # returned no valid plan. Renamed for observability.
+        print("[Layered-T2] refusal=stage1_clustering_failed (Stage 1 clustering LLM returned no valid plan)")
         write_run("T2_LAYERED_GLOBAL", topic,
                   {"docs_seen": len(all_doc_ids), "docs_represented": kept},
-                  {"refusal": True, "reason": "outline_failed",
-                   "explanation": "Outline Stage 0 (precheck) or Stage 1 "
-                                  "(clustering) failed to produce a valid "
-                                  "plan. Inspect metrics.llm_calls."})
+                  {"refusal": True, "reason": "stage1_clustering_failed",
+                   "explanation": "Stage 1 clustering LLM returned no valid "
+                                  "plan after retry. Inspect metrics.llm_calls."})
         metrics.set("refusal", True)
-        metrics.set("refusal_reason", "outline_failed")
+        metrics.set("refusal_reason", "stage1_clustering_failed")
         write_run_manifest(
             "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
             extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
-                   "refusal": "outline_failed"},
+                   "refusal": "stage1_clustering_failed"},
         )
         metrics.save()
         return
