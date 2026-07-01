@@ -1214,6 +1214,25 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
     metrics.set("restart_attempt", restart_attempt)
 
+    # v15.9 (#4): mint a per-invocation run_id so this call's artifacts land
+    # in runs/<utc>_<slug>/ rather than the flat runs/ folder — concurrent
+    # runs on the same corpus no longer collide.
+    #
+    # Env overrides for the smoke harness / battery:
+    #   RRR_RUN_ID=<slug>  → use this exact slug (harness knows where to look)
+    #   RRR_RUN_ID=""      → force flat layout (pre-v15.9 behaviour)
+    #   unset              → mint one from timestamp + topic slug
+    from rrr.paths import mint_run_id, set_default_run_id
+    run_id_env = os.environ.get("RRR_RUN_ID")
+    if run_id_env is None:
+        run_id = mint_run_id(topic)
+    elif run_id_env == "":
+        run_id = None  # explicit opt-out: flat runs/ layout
+    else:
+        run_id = run_id_env
+    set_default_run_id(run_id)
+    metrics.set("run_id", run_id or "")
+
     # v8 (R12): fire-and-forget prewarm so the Ollama cold-load (~7s on first
     # call after model swap) overlaps with metadata loading + planning instead
     # of being charged to the planning stage. Background thread; no blocking.
