@@ -223,50 +223,98 @@ def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
     return entries
 
 
-def _fuzzy_title_match(title: str, text: str, threshold: float = 0.75) -> bool:
-    """Return True if >= threshold of title's 4+ char alphanumeric tokens
-    appear as substrings of the (lowercased) text."""
+def _fuzzy_title_match(title: str, text: str, threshold: float = 0.9) -> bool:
+    """STRICT title match: require BOTH signals to be present:
+      (a) >= threshold fraction of 5+ char title tokens appear as WHOLE WORDS
+          (\\b-anchored) in the lowercased text — no substring inflation.
+      (b) at least one 4-word verbatim chunk from the title appears as a
+          contiguous substring of the (lowercased, whitespace-collapsed) text.
+
+    The old version used 4+ char tokens with substring matching and threshold
+    0.75 — that produced false positives like matching every economics paper
+    to whichever bib entry had the most-common vocabulary. This one is
+    conservative on purpose; when it says True, it's an actual match.
+    """
     if not title or not text:
         return False
-    title_tokens = [t for t in re.findall(r"[a-z0-9]{4,}", title.lower())]
-    if len(title_tokens) < 3:
+    title_lower = re.sub(r"\s+", " ", title.lower())
+    text_lower = re.sub(r"\s+", " ", text.lower())
+    tokens = re.findall(r"[a-z0-9]{5,}", title_lower)
+    if len(tokens) < 3:
         return False
-    text_lower = text.lower()
-    hits = sum(1 for t in title_tokens if t in text_lower)
-    return (hits / len(title_tokens)) >= threshold
+    hits = sum(1 for t in tokens if re.search(rf"\b{re.escape(t)}\b", text_lower))
+    if (hits / len(tokens)) < threshold:
+        return False
+    # 4-word verbatim chunk
+    words = re.findall(r"[a-z0-9]+", title_lower)
+    for i in range(len(words) - 3):
+        chunk = " ".join(words[i:i + 4])
+        if chunk in text_lower:
+            return True
+    return False
 
 
 def match_bib_entry(pdf_path: Path, text: str, sidecar: list) -> Optional[dict]:
-    """Match a PDF to a bib entry by any of:
+    """Match a PDF to a bib entry with a strict cascade:
       1. Exact filename-stem == bib key
-      2. Filename stem contains bib key or vice versa (case-insensitive)
-      3. Fuzzy title match against first-3-pages text
-      4. First-author surname AND year both in text AND filename stem
+      2. Parse filename via Author_YYYY convention → find bib entry with same
+         first-author surname AND same year (this is the load-bearing path
+         for corpora that already follow Author_YYYY naming).
+      3. Strict fuzzy title: high threshold + verbatim 4-word chunk +
+         first-surname + year both present in text (guards against generic
+         economics vocabulary inflating the match).
     Returns the matching entry dict, or None.
     """
     stem = pdf_path.stem
     stem_lower = stem.lower()
 
-    # 1) key exact
+    # 1) exact key match
     for e in sidecar:
         if e["key"].lower() == stem_lower:
             return e
-    # 2) key contained (either direction)
-    for e in sidecar:
-        k = e["key"].lower()
-        if k and (k in stem_lower or stem_lower in k):
-            return e
-    # 3) fuzzy title
-    for e in sidecar:
-        if _fuzzy_title_match(e["title"], text):
-            return e
-    # 4) surname+year both in text AND stem
+
+    # 2) filename Author_YYYY → bib first-surname + year
+    fn = parse_filename_heuristic(pdf_path)
+    if fn:
+        fn_year = fn["year"]
+        # normalise filename name-part to lowercase, drop EtAl / & markers to
+        # match against bib first-surname
+        fn_name = fn["name"].lower()
+        fn_name_first = re.sub(r"etal.*|&.*", "", fn_name)  # 'acemogluetal' → 'acemoglu'
+        candidates = []
+        for e in sidecar:
+            surname = (e.get("first_surname") or "").lower()
+            year = (e.get("year") or "").strip()
+            if not surname or year != fn_year:
+                continue
+            # match if filename first-name starts with surname, OR surname
+            # contains the filename name (handles hyphenated / camelCase)
+            if fn_name_first.startswith(surname) or surname.startswith(fn_name_first):
+                candidates.append(e)
+        # If exactly one candidate, take it. If several, disambiguate via
+        # verbatim title chunk match against text.
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            for e in candidates:
+                if _fuzzy_title_match(e["title"], text, threshold=0.85):
+                    return e
+            # Ambiguous — return the first (keeps behaviour deterministic
+            # even if not ideal; the downstream doc_id collision logic will
+            # surface duplicates).
+            return candidates[0]
+
+    # 3) strict fuzzy title (surname + year in text AND title in text)
+    text_lower = text.lower()
     for e in sidecar:
         surname = (e.get("first_surname") or "").lower()
         year = (e.get("year") or "").strip()
-        if surname and year:
-            if surname in text.lower() and year in text and (surname in stem_lower or year in stem_lower):
-                return e
+        if not surname or not year:
+            continue
+        if surname not in text_lower or year not in text:
+            continue
+        if _fuzzy_title_match(e["title"], text, threshold=0.9):
+            return e
     return None
 
 
