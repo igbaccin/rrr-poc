@@ -1784,6 +1784,132 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         return
 
     import collections
+    def _render_claim_verdict(topic, doc_summaries, meta_n_total, outline_plan, refs_by_docid):
+        """v15.9 (T1 revival): render a claim-evaluator verdict.
+
+        Reuses everything the T2 pipeline produced up to Stage 2 posture,
+        but stops before the writer. Output: a markdown artifact grouping
+        papers by their relation to the claim, with per-paper claim +
+        top-quote so a reader can grade the corpus's aggregate stance
+        without paying for the ~6-min writer run.
+        """
+        clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
+        doc_by_id = {d.get("doc_id"): d for d in doc_summaries}
+        relations = outline_plan.get("relation_distribution", {}) or {}
+        topic_shape = outline_plan.get("topic_shape", "?")
+        topic_cause = outline_plan.get("topic_cause", "") or ""
+        topic_outcome = outline_plan.get("topic_outcome", "") or ""
+
+        # Group by relation, preserving ordered_cluster_ids order within each
+        by_relation = {}
+        for cid in outline_plan.get("ordered_cluster_ids", []) or list(clusters_by_id.keys()):
+            c = clusters_by_id.get(cid)
+            if not c:
+                continue
+            rel = c.get("relation", "adjacent")
+            by_relation.setdefault(rel, []).append(c)
+
+        # Ordering: supporting first, then rival, then upstream/downstream,
+        # then adjacent, then anything else. Makes the verdict readable
+        # top-to-bottom as "the claim is supported by X, contested by Y..."
+        rel_order = [
+            "same_as_topic_cause", "same_as_topic_outcome",
+            "supports", "supports_claim",
+            "rival_to_topic_cause", "rival",
+            "upstream_of_topic_cause", "upstream",
+            "downstream_of_topic_cause", "downstream",
+            "adjacent", "unassigned",
+        ]
+        rel_label = {
+            "same_as_topic_cause": "Support the claim",
+            "same_as_topic_outcome": "Support the claim (via same outcome)",
+            "supports": "Support the claim",
+            "supports_claim": "Support the claim",
+            "rival_to_topic_cause": "Propose a rival explanation",
+            "rival": "Propose a rival explanation",
+            "upstream_of_topic_cause": "Identify an upstream mechanism",
+            "upstream": "Identify an upstream mechanism",
+            "downstream_of_topic_cause": "Trace a downstream implication",
+            "downstream": "Trace a downstream implication",
+            "adjacent": "Adjacent (related but not addressing the claim directly)",
+        }
+        seen = set()
+        ordered_relations = [r for r in rel_order if r in by_relation and not seen.add(r)]
+        ordered_relations += [r for r in by_relation if r not in seen]
+
+        # Aggregate counts across DOCS (not clusters) for the headline verdict
+        docs_by_rel = {rel: 0 for rel in by_relation}
+        for cid, c in clusters_by_id.items():
+            docs_by_rel.setdefault(c.get("relation", "adjacent"), 0)
+            docs_by_rel[c["relation"]] = docs_by_rel.get(c["relation"], 0) + len(c.get("doc_ids", []))
+        total_admitted = len(doc_summaries)
+        n_support = sum(v for k, v in docs_by_rel.items() if k in ("same_as_topic_cause", "same_as_topic_outcome", "supports", "supports_claim"))
+        n_rival = sum(v for k, v in docs_by_rel.items() if k in ("rival_to_topic_cause", "rival"))
+        n_upstream = sum(v for k, v in docs_by_rel.items() if k in ("upstream_of_topic_cause", "upstream"))
+        n_downstream = sum(v for k, v in docs_by_rel.items() if k in ("downstream_of_topic_cause", "downstream"))
+        n_adjacent = sum(v for k, v in docs_by_rel.items() if k in ("adjacent",))
+
+        def _headline_verdict():
+            if total_admitted == 0:
+                return "No corpus evidence"
+            if n_support == 0 and n_rival == 0:
+                return f"Under-engaged — the corpus does not address the claim directly ({n_adjacent} adjacent papers)"
+            if n_rival >= 2 * max(1, n_support):
+                return f"Contested — rival explanations dominate ({n_rival} rival vs {n_support} supporting)"
+            if n_support >= 2 * max(1, n_rival):
+                return f"Well-supported — supporting evidence dominates ({n_support} supporting vs {n_rival} rival)"
+            return f"Mixed — {n_support} supporting, {n_rival} rival, {n_upstream} upstream, {n_downstream} downstream"
+
+        lines: list = []
+        lines.append(f"# Claim evaluation\n")
+        lines.append(f"**Claim:** {topic}\n")
+        lines.append(f"**Topic shape:** {topic_shape}"
+                     + (f" (explanans: {topic_cause}; explanandum: {topic_outcome})" if topic_shape == "causal" and topic_cause else "")
+                     + "\n")
+        lines.append(f"**Corpus:** {total_admitted} of {meta_n_total} papers admitted ({100 * total_admitted // max(1, meta_n_total)}%).\n")
+        lines.append(f"**Aggregate verdict:** {_headline_verdict()}.\n")
+        lines.append(f"**Breakdown:** support={n_support}, rival={n_rival}, upstream={n_upstream}, downstream={n_downstream}, adjacent={n_adjacent}.\n")
+        lines.append("---\n")
+
+        for rel in ordered_relations:
+            clusters = by_relation.get(rel, [])
+            if not clusters:
+                continue
+            n_docs = sum(len(c.get("doc_ids", [])) for c in clusters)
+            lines.append(f"## {rel_label.get(rel, rel.replace('_', ' ').title())} ({n_docs} papers across {len(clusters)} cluster{'s' if len(clusters) != 1 else ''})\n")
+            for c in clusters:
+                lines.append(f"### {c.get('shared_thread', c.get('cluster_id', 'cluster'))}")
+                elab = (c.get("elaboration") or "").strip()
+                if elab:
+                    lines.append(f"*{elab}*\n")
+                for did in c.get("doc_ids", []):
+                    d = doc_by_id.get(did) or {}
+                    cite = d.get("citation") or refs_by_docid.get(did) or did
+                    lines.append(f"- **{cite}**")
+                    claim = (d.get("claim") or "").strip()
+                    if claim:
+                        lines.append(f"    - Claim: {claim}")
+                    for q in (d.get("quotes") or [])[:1]:
+                        text = str(q.get("text", "") or "").strip()
+                        page = q.get("page")
+                        if text and page:
+                            snippet = text if len(text) < 220 else text[:220].rstrip() + "…"
+                            lines.append(f'    - Quote (p.{page}): "{snippet}"')
+                lines.append("")
+
+        unassigned_ids = outline_plan.get("unassigned_doc_ids", []) or []
+        if unassigned_ids:
+            lines.append(f"## Unassigned ({len(unassigned_ids)} papers)\n")
+            lines.append("Papers admitted by BM25 retrieval but not clustered into any stream by Stage 1. Typically they address a different question or use very different vocabulary.\n")
+            for did in unassigned_ids:
+                d = doc_by_id.get(did) or {}
+                cite = d.get("citation") or refs_by_docid.get(did) or did
+                lines.append(f"- {cite}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+
     def _render_review_narrative(topic, doc_summaries, meta_n_total, outline_plan):
         # v15: narrative summary is the outline plan rendered as markdown.
         # No stance buckets. Sections are streams ordered by Stage 3.
@@ -1940,6 +2066,40 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     if not getattr(args, "narrative_only", False):
         print("[Layered-T2] appendix: runs/T2_review.md")
 
+    # v15.9 (T1 revival): claim-eval mode. Stop after Stage 0/1/2 + ledger
+    # write. Emit runs/claim_verdict.md with per-cluster + aggregate.
+    # Reuses all upstream invariants (retrieval, admission, quote-verify)
+    # but skips the ~6-min writer + validation chain.
+    if getattr(args, "t1_only", False) or getattr(args, "claim_only", False):
+        try:
+            verdict_md = _render_claim_verdict(topic, doc_summaries, len(all_doc_ids), outline_plan, refs)
+            with open(runs_path("claim_verdict.md"), "w", encoding="utf-8") as f:
+                f.write(verdict_md)
+            print("\n" + "=" * 80)
+            print("CLAIM VERDICT")
+            print("=" * 80 + "\n")
+            print(verdict_md)
+            print("\n" + "=" * 80 + "\n")
+            print("[Layered-T1] claim_verdict.md written")
+            metrics.set("claim_verdict_written", True)
+            metrics.save()
+            write_run_manifest(
+                "T1_CLAIM_EVAL",
+                topic,
+                meta_path,
+                _MODEL,
+                plan=plan_obj,
+                extra={
+                    "admit_settings": admit_settings,
+                    "topic_fit": topic_fit,
+                    "outputs": ["claim_verdict.md", "review_ledger.json", "outline_plan.json"],
+                    "mode": "t1_claim_eval",
+                },
+            )
+            return
+        except Exception as e:
+            print(f"[Layered-T1] verdict render failed, falling through to T2: {e}")
+
     if True:  # v13: writer composition is unconditional (was RRR_WRITE_REVIEW gate)
         # v14: RRR_WRITER_MODE dispatches between the single-pass (default) and
         # chunked writer paths. The chunked path is preserved as a measurement
@@ -2037,6 +2197,22 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             with open(runs_path("review_references.txt"), "w", encoding="utf-8") as f:
                 for i, rline in enumerate(ref_lines, start=1):
                     f.write(f"{i}. {rline}\n")
+
+            # v15.9: append the reference list to review_composed.md so the
+            # single-file artifact is self-contained (the reader doesn't need
+            # to open a second file to see what was cited). The separate
+            # review_references.txt is preserved for backward compat with
+            # scripts that read it directly.
+            composed_md = runs_path("review_composed.md")
+            if composed_md.is_file():
+                try:
+                    with open(composed_md, "a", encoding="utf-8") as f:
+                        f.write("\n\n---\n\n## References\n\n")
+                        for i, rline in enumerate(ref_lines, start=1):
+                            f.write(f"{i}. {rline}\n")
+                    print(f"[Layered-T2] appended {len(ref_lines)} references to review_composed.md")
+                except Exception as ref_e:
+                    print(f"[Layered-T2] failed to append references to review_composed.md: {ref_e}")
 
         except Exception as e:
             print(f"[Layered-T2] writer failed: {e}")
