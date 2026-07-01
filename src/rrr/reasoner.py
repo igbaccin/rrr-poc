@@ -1832,6 +1832,29 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     ensure_dir(str(runs_path()))
 
+    # v15.9 (#6): propagate doc-level provenance into the ledger so the
+    # writer can build citations.json without re-reading metadata.csv.
+    _pdf_paths_by_docid = {}
+    if "pdf_path" in df.columns:
+        _pdf_paths_by_docid = {
+            str(r["doc_id"]): str(r["pdf_path"]).strip()
+            for _, r in df.iterrows()
+            if str(r.get("pdf_path", "")).strip()
+        }
+    _pdf_page_offsets = {}
+    if "pdf_page_offset" in df.columns:
+        for _, r in df.iterrows():
+            try:
+                _pdf_page_offsets[str(r["doc_id"])] = int(r["pdf_page_offset"] or 0)
+            except Exception:
+                pass
+    _dois_by_docid = {}
+    if "doi_or_url" in df.columns:
+        _dois_by_docid = {
+            str(r["doc_id"]): str(r["doi_or_url"]).strip()
+            for _, r in df.iterrows()
+            if str(r.get("doi_or_url", "")).strip()
+        }
     ledger_data = {
         "topic": topic,
         "plan": plan_obj,
@@ -1845,6 +1868,10 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
             "docs_selected_for_llm": len(selected_docs),
         },
         "docs": doc_summaries,
+        # v15.9 (#6): provenance data for citations.json
+        "pdf_paths_by_docid": _pdf_paths_by_docid,
+        "pdf_page_offsets": _pdf_page_offsets,
+        "dois_by_docid": _dois_by_docid,
         # v15: outline_plan is now the corpus-level structure the writer
         # consumes. It replaces the v11-C cluster_syntheses keyed by
         # "stance::cluster_label" — clusters are top-level, not nested under

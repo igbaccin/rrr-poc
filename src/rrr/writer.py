@@ -583,6 +583,103 @@ def _strip_wrapping(text: str) -> str:
     return t
 
 
+# ---------------------------------------------------------------------------
+# v15.9 (#6): citations.json provenance manifest + optional --linkify
+# ---------------------------------------------------------------------------
+
+def _emit_citations_manifest(
+    text: str,
+    allowed_docs: set,
+    display_lookup: dict,
+    pdf_paths_by_docid: dict,
+    pdf_page_offsets: dict,
+    dois_by_docid: dict,
+    linkify: bool = False,
+):
+    """Walk every citation in the final review text; build a machine-readable
+    manifest with (doc_id, page, pdf_path, pdf_page, doi_or_url) per hit.
+    Optionally rewrite the text so each cite becomes a markdown link to the
+    source PDF at the right page.
+
+    Returns (maybe_rewritten_text, manifest_dict). manifest_dict has:
+        {
+          "citations": [{
+             "index": int,          # order of appearance in the text
+             "cite_text": str,      # exact matched substring
+             "doc_id": str|None,
+             "page": int,
+             "pdf_path": str|None,
+             "pdf_page": int|None,  # page + pdf_page_offset
+             "doi_or_url": str|None,
+             "start": int,          # char offset in the PRE-linkify text
+             "end": int,
+             "surface": str         # 'canonical'|'display_narrative'|'display_paren'
+          }, ...],
+          "distinct_docs": int,
+          "linkify": bool
+        }
+    """
+    from rrr.render import parse_citations
+    citations = []
+    seen_docs = set()
+    for c in parse_citations(text, display_lookup=display_lookup):
+        doc_id = c.get("doc_id")
+        page = int(c.get("page") or 0) or None
+        if doc_id and doc_id in allowed_docs:
+            seen_docs.add(doc_id)
+        pdf_path = pdf_paths_by_docid.get(doc_id) if doc_id else None
+        offset = int(pdf_page_offsets.get(doc_id, 0) or 0) if doc_id else 0
+        pdf_page = (page + offset) if (page is not None) else None
+        doi = dois_by_docid.get(doc_id) if doc_id else None
+        citations.append({
+            "index": len(citations),
+            "cite_text": c["raw"],
+            "doc_id": doc_id,
+            "page": page,
+            "pdf_path": pdf_path,
+            "pdf_page": pdf_page,
+            "doi_or_url": doi or None,
+            "start": c["start"],
+            "end": c["end"],
+            "surface": c["surface"],
+        })
+
+    if not citations:
+        return text, {"citations": [], "distinct_docs": 0, "linkify": False}
+
+    out_text = text
+    if linkify:
+        # Rewrite from end to start so char offsets stay valid.
+        for cite in sorted(citations, key=lambda x: -x["start"]):
+            if not cite["pdf_path"] or not cite["pdf_page"]:
+                continue
+            raw = cite["cite_text"]
+            url = _pdf_page_url(cite["pdf_path"], cite["pdf_page"])
+            link = f"[{raw}]({url})"
+            out_text = out_text[:cite["start"]] + link + out_text[cite["end"]:]
+
+    return out_text, {
+        "citations": citations,
+        "distinct_docs": len(seen_docs),
+        "linkify": linkify,
+    }
+
+
+def _pdf_page_url(pdf_path: str, page: int) -> str:
+    """Build a file:// URL with #page=N. Works in Preview, Chrome, Edge,
+    Adobe, Zotero, and Obsidian."""
+    from urllib.parse import quote
+    p = str(pdf_path).replace("\\", "/")
+    # Absolute file URL: file:///abs/path.pdf on unix, file:///C:/... on win
+    if len(p) > 1 and p[1] == ":":  # Windows drive letter
+        url = "file:///" + quote(p, safe="/:")
+    elif p.startswith("/"):
+        url = "file://" + quote(p, safe="/")
+    else:
+        url = "file://" + quote(p, safe="/")
+    return f"{url}#page={int(page)}"
+
+
 def _merge_adjacent_paren_cites(text: str) -> tuple:
     """v15.7.2: merge whitespace-adjacent DISPLAY_PAREN cites into one
     semicolon-joined parenthetical.
@@ -3196,6 +3293,14 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     if not isinstance(docs, list) or not docs:
         raise SystemExit("Ledger empty or malformed (no docs).")
 
+    # v15.9 (#6): provenance data flowed in through the ledger from the
+    # reasoner (which read it from metadata.csv). Absent in older ledgers →
+    # citations.json still emits (with pdf_path=null) so downstream tools
+    # can detect the missing-provenance case.
+    pdf_paths_by_docid = data.get("pdf_paths_by_docid", {}) or {}
+    pdf_page_offsets = data.get("pdf_page_offsets", {}) or {}
+    dois_by_docid = data.get("dois_by_docid", {}) or {}
+
     allowed_pairs, allowed_docs, allowed_pages_by_doc = _build_allowed_citations(docs)
     if not allowed_pairs:
         raise SystemExit("No allowed citations found in ledger.")
@@ -4023,6 +4128,21 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         metrics.set("writer_adjacent_paren_merges", adjacent_paren_merges)
     if adjacent_paren_merges:
         print(f"[Writer] Merged {adjacent_paren_merges} adjacent paren-cite pair(s).")
+
+    # v15.9 (#6): build citations.json provenance manifest AND, if
+    # RRR_LINKIFY=1, rewrite in-text citations as markdown links pointing at
+    # the source PDF at the right page. Runs BEFORE the final write so the
+    # markdown that lands on disk is the linkified version when opted in.
+    full_text, citations_manifest = _emit_citations_manifest(
+        full_text, allowed_docs, display_lookup,
+        pdf_paths_by_docid, pdf_page_offsets, dois_by_docid,
+        linkify=(os.environ.get("RRR_LINKIFY", "0") == "1"),
+    )
+    if citations_manifest:
+        with open(runs_path("citations.json"), "w", encoding="utf-8") as f:
+            json.dump(citations_manifest, f, indent=2, ensure_ascii=False)
+        print(f"[Writer] citations.json written ({len(citations_manifest['citations'])} cites, "
+              f"{citations_manifest['distinct_docs']} distinct docs)")
 
     total_words = _count_words(full_text)
 
