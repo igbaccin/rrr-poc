@@ -1,0 +1,91 @@
+"""v15.12: central ollama.chat shim to disable hybrid-thinking models.
+
+qwen3 (our non-Latin routing tier) ships with "thinking" ON by default: the
+model emits a long `<think>…</think>` reasoning trace into a separate channel
+BEFORE the answer. With the small `num_predict` budgets the RRR stages use
+(300-700 tokens), the thinking trace consumes the entire budget and the
+actual `content` comes back EMPTY — which made every qwen3 stage fall to its
+failure path (planner → heuristic_fallback, precheck → stage0_llm_failed,
+writer → empty prose).
+
+Rather than thread a `think=False` kwarg through all ~30 ollama.chat call
+sites, we patch `ollama.chat` once. Every `import ollama` in the package
+resolves to the same cached module object, so patching `ollama.chat` here —
+imported once at reasoner entry — covers all call sites (planner, precheck,
+cluster, posture, order, stance, writer, prewarm, ingest).
+
+The patch is idempotent and version-tolerant: if the installed ollama client
+predates the `think=` kwarg it falls back to injecting a `/no_think` soft
+switch into the last user message (qwen3 recognises it in-band).
+"""
+from __future__ import annotations
+
+import os
+
+
+# Substrings that identify a hybrid-thinking model whose reasoning trace must
+# be suppressed for RRR's short-budget structured stages. Extendable via
+# RRR_THINKING_MODELS (comma-separated substrings) without a code change.
+_DEFAULT_MARKERS = ("qwen3", "deepseek-r1", "r1")
+
+
+def _markers() -> tuple:
+    extra = os.environ.get("RRR_THINKING_MODELS", "").strip()
+    if extra:
+        return tuple(m.strip().lower() for m in extra.split(",") if m.strip())
+    return _DEFAULT_MARKERS
+
+
+def _is_thinking_model(model: str) -> bool:
+    m = (model or "").lower()
+    return any(marker in m for marker in _markers())
+
+
+def _inject_no_think(messages):
+    """Append ' /no_think' to the last user message so qwen3 disables
+    thinking in-band (fallback for ollama clients without the think kwarg)."""
+    if not messages or not isinstance(messages, list):
+        return messages
+    out = [dict(m) if isinstance(m, dict) else m for m in messages]
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if isinstance(m, dict) and m.get("role") == "user":
+            content = m.get("content") or ""
+            if "/no_think" not in content:
+                m["content"] = content + " /no_think"
+            break
+    return out
+
+
+def install():
+    """Idempotently patch ollama.chat to disable thinking for thinking models.
+    Safe to call multiple times. Returns True if the patch is active, False
+    if ollama isn't importable (e.g. local dev without the package)."""
+    try:
+        import ollama
+    except Exception:
+        return False
+
+    if getattr(ollama.chat, "_rrr_thinking_shim", False):
+        return True
+
+    _original = ollama.chat
+
+    def _patched(*args, **kwargs):
+        model = kwargs.get("model") or (args[0] if args else "")
+        if _is_thinking_model(model) and "think" not in kwargs:
+            try:
+                return _original(*args, think=False, **kwargs)
+            except TypeError:
+                # Older ollama client: no think kwarg. Fall back to the
+                # in-band /no_think switch on the messages.
+                if "messages" in kwargs:
+                    kwargs = dict(kwargs)
+                    kwargs["messages"] = _inject_no_think(kwargs["messages"])
+                return _original(*args, **kwargs)
+        return _original(*args, **kwargs)
+
+    _patched._rrr_thinking_shim = True
+    _patched._rrr_original = _original
+    ollama.chat = _patched
+    return True

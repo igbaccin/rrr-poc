@@ -1,6 +1,11 @@
 from typing import List
 import os, subprocess, json, re, ast, hashlib, time
 from rrr.utils import ensure_dir
+# v15.12: patch ollama.chat to disable qwen3 thinking mode BEFORE any stage
+# runs. Every `import ollama` in the package resolves to the same module
+# object, so this one call covers all ~30 call sites.
+from rrr.llm import install as _install_llm_shim
+_install_llm_shim()
 # v15: classify_evidence_stance no longer called — discrete per-paper stance
 # replaced by corpus-level outline (build_outline) from rrr.outline.
 from rrr.outline import build_outline
