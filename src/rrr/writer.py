@@ -407,7 +407,13 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
     }
     if not text:
         return text or "", stats
-    pattern = re.compile(r"\[([Ee]\d{4})\]")
+    # v15.7.2: widened to 1-5 digits and normalised to 4-digit zero-padded
+    # form before lookup. The v15.7 smoke shipped '[E009]' (3-digit — model
+    # dropped a leading zero from E0009); previous regex \d{4} skipped it
+    # entirely so it wasn't rendered AND wasn't counted as unknown. Now:
+    # any [E<digits>] shape (1-5 digits) is caught, normalised via
+    # zfill(4), and either resolved or counted.
+    pattern = re.compile(r"\[([Ee]\d{1,5})\]")
     out_parts: list = []
     last_end = 0
     # v15.7: pre-build a known-surname set across the evidence_map so the
@@ -422,7 +428,14 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
         if _lbl:
             known_surnames.add(_lbl.lower())
     for match in pattern.finditer(text):
-        eid = match.group(1).upper()
+        raw_eid = match.group(1).upper()
+        # v15.7.2: normalise to canonical 'E####' 4-digit zero-padded form.
+        # Strip leading zeros first so '[E00009]' → '9' → '0009' → 'E0009'
+        # (matches whatever the reasoner minted). '[E0]' or '[E]' would
+        # normalise to 'E0000' and fail lookup (bumps unknown counter),
+        # which is the right behaviour for a marker with no numeric ID.
+        digits = raw_eid[1:].lstrip("0") or "0"
+        eid = "E" + digits.zfill(4)
         ev = evidence_map.get(eid)
         if not ev:
             stats["unknown_eids"] += 1
@@ -568,6 +581,54 @@ def _strip_wrapping(text: str) -> str:
         t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
     return t
+
+
+def _merge_adjacent_paren_cites(text: str) -> tuple:
+    """v15.7.2: merge whitespace-adjacent DISPLAY_PAREN cites into one
+    semicolon-joined parenthetical.
+        '(Ogilvie 2007, p.9) (North 1989, p.6)' →
+        '(Ogilvie 2007, p.9; North 1989, p.6)'
+    Chains of 3+ merge similarly. Only merges pairs separated by pure
+    whitespace (space/tab/newline) — never across prose. Narrative-form
+    cites ('Author (Year, p.N)') are NOT merged because 'Author' is
+    sentence prose. Runs as the very last postproc step so upstream
+    validators, _collect_cited_docs, and quality_manifest all see the
+    unmerged per-cite form; the merged form is user-facing only.
+
+    Returns (text, count) where count is the number of pairs merged.
+    """
+    if not text:
+        return text or "", 0
+    matches = list(DISPLAY_PAREN_CITE_RE.finditer(text))
+    if len(matches) < 2:
+        return text, 0
+    groups: list = []
+    current: list = [matches[0]]
+    ws_re = re.compile(r"\A\s+\Z")
+    for m in matches[1:]:
+        between = text[current[-1].end():m.start()]
+        if ws_re.match(between):
+            current.append(m)
+        else:
+            if len(current) > 1:
+                groups.append(current)
+            current = [m]
+    if len(current) > 1:
+        groups.append(current)
+    if not groups:
+        return text, 0
+    out: list = []
+    cursor = 0
+    merged_pairs = 0
+    for grp in groups:
+        out.append(text[cursor:grp[0].start()])
+        # Strip outer '(' ')' from each match; join with '; '.
+        inners = [m.group(0)[1:-1] for m in grp]
+        out.append("(" + "; ".join(inners) + ")")
+        cursor = grp[-1].end()
+        merged_pairs += len(grp) - 1
+    out.append(text[cursor:])
+    return "".join(out), merged_pairs
 
 
 def _collapse_double_parens(text: str) -> tuple:
@@ -930,10 +991,11 @@ def _drop_zero_citation_paragraphs(text: str, keep_closing: bool = False) -> tup
     # When the renderer can't map a marker (unknown eid), it leaves the
     # bare marker in place AND bumps writer_unknown_evidence_id. Without
     # this check, the surrounding prose would be silently dropped as
-    # zero-citation when the real failure is a single bad marker. The
-    # bare marker is greppable for debugging and shows up in the quality
-    # manifest.
-    _UNRENDERED_EID_RE = re.compile(r"\[[Ee]\d{4}\]")
+    # zero-citation when the real failure is a single bad marker.
+    # v15.7.2: also recognise 1-3 digit variants and non-numeric E-prefixed
+    # sentinels (e.g. '[E9]', '[Evidence]') so a hallucinated-marker
+    # paragraph isn't lost — the quality manifest surfaces them separately.
+    _UNRENDERED_EID_RE = re.compile(r"\[[Ee]\w*\]")
     for i, para in enumerate(paragraphs):
         has_canonical = bool(CITE_RE.search(para))
         has_display_narrative = bool(DISPLAY_CITE_RE.search(para))
@@ -3952,6 +4014,16 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # full_text — no side channel needed.
     cited_docids = sorted(cited_docs)
 
+    # v15.7.2: merge whitespace-adjacent paren cites into one semicolon-
+    # joined parenthetical. Runs AFTER _collect_cited_docs so ref-list
+    # counting is unaffected — the merged form is the user-facing surface
+    # only. '(A 2007, p.9) (B 1989, p.6)' → '(A 2007, p.9; B 1989, p.6)'.
+    full_text, adjacent_paren_merges = _merge_adjacent_paren_cites(full_text)
+    if metrics:
+        metrics.set("writer_adjacent_paren_merges", adjacent_paren_merges)
+    if adjacent_paren_merges:
+        print(f"[Writer] Merged {adjacent_paren_merges} adjacent paren-cite pair(s).")
+
     total_words = _count_words(full_text)
 
     ensure_dir(str(runs_path()))
@@ -3984,6 +4056,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # ALLOWED CITATIONS prompt fix; tracked here to detect regressions)
         "invalid_citations_removed": total_removed_citations,
         "double_paren_collapsed": total_double_paren_collapsed,
+        "adjacent_paren_merges": adjacent_paren_merges,
         # Drop validators
         "zero_cite_paragraphs_dropped": len(zero_cite_dropped),
         "zero_cite_closing_kept": 1 if zc_kept_closing else 0,
