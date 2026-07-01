@@ -32,6 +32,45 @@ import sys
 from typing import Optional
 
 
+# ---------------------------------------------------------------------------
+# Model tiers (local Ollama runtime). Overridable via RRR_MODEL_LATIN /
+# RRR_MODEL_NONLATIN; the constants below are the recommended defaults and
+# the vetted alternatives, so the routing code itself documents what to run.
+#
+#   Latin (European) tier — RRR_MODEL_LATIN, default:
+#       mistral-small:24b   dense 24B, ~15 GB q4, fits RTX 4090. Near-English
+#                           quality on FR/PT/ES/DE/IT prose + JSON compliance.
+#
+#   Non-Latin tier — RRR_MODEL_NONLATIN, default:
+#       qwen3:14b           dense 14B, ~9 GB q4, fits RTX 4090. PROVEN on the
+#                           ZH cross-language smoke (49 docs admitted,
+#                           ~90% Chinese review). The shipped default.
+#
+#   Non-Latin PREMIUM (dense, RTX 5090) — set RRR_MODEL_NONLATIN=qwen3:32b:
+#       qwen3:32b           dense 32B, ~20 GB q4. The quality upgrade for the
+#                           RTX 5090. Dense (not MoE), so it does NOT leak
+#                           reasoning into content the way the a3b MoE does —
+#                           clean JSON on RRR's tight-budget structured stages.
+#                           Already in scripts/pod_pull_models.sh.
+#
+#   NOT RECOMMENDED:
+#       qwen3:30b-a3b       30B MoE / 3B active. Verified (v15.13) to leak
+#                           chain-of-thought into the *content* channel even
+#                           with think=False, exhausting num_predict before
+#                           emitting JSON → planner/precheck fail → refusal.
+#                           Would need num_predict 2-3x across every structured
+#                           stage. Use the dense qwen3:14b (4090) or
+#                           qwen3:32b (5090) instead.
+#
+# All qwen3 variants are covered by the thinking-mode shim (rrr/llm.py,
+# "qwen3" substring). On RRR_RUNTIME=api this whole table is bypassed — one
+# frontier model handles every language (see api_backend.py).
+# ---------------------------------------------------------------------------
+MODEL_LATIN_DEFAULT = "mistral-small:24b"
+MODEL_NONLATIN_DEFAULT = "qwen3:14b"          # dense, RTX 4090, shipped default
+MODEL_NONLATIN_PREMIUM_DENSE = "qwen3:32b"    # dense, RTX 5090, quality tier
+
+
 # Latin-script European languages where mistral-small:24b handles
 # prompt-following, JSON compliance, and prose generation at near-English
 # quality. Everything else falls to the non-Latin router.
@@ -118,8 +157,8 @@ def select_model(topic_lang: str) -> str:
         except Exception:
             pass
 
-    latin = os.environ.get("RRR_MODEL_LATIN", "mistral-small:24b")
-    nonlatin = os.environ.get("RRR_MODEL_NONLATIN", "qwen3:14b")
+    latin = os.environ.get("RRR_MODEL_LATIN", MODEL_LATIN_DEFAULT)
+    nonlatin = os.environ.get("RRR_MODEL_NONLATIN", MODEL_NONLATIN_DEFAULT)
     preferred = latin if topic_lang in LATIN_LANGS else nonlatin
 
     available = _list_ollama_models()
