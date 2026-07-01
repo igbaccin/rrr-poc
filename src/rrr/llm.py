@@ -72,6 +72,17 @@ def install():
     _original = ollama.chat
 
     def _patched(*args, **kwargs):
+        # v15.13: frontier-API runtime. When RRR_RUNTIME=api, route every
+        # ollama.chat call to the Anthropic/OpenAI backend instead of a local
+        # model. Positional args map to ollama.chat's (model, messages).
+        if os.environ.get("RRR_RUNTIME", "").strip().lower() == "api":
+            from rrr.api_backend import api_chat
+            if args:
+                kwargs.setdefault("model", args[0] if len(args) > 0 else "")
+                if len(args) > 1:
+                    kwargs.setdefault("messages", args[1])
+            return api_chat(**kwargs)
+
         model = kwargs.get("model") or (args[0] if args else "")
         if _is_thinking_model(model) and "think" not in kwargs:
             try:

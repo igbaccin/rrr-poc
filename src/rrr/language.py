@@ -108,6 +108,16 @@ def select_model(topic_lang: str) -> str:
     RRR_MODEL / 'mistral' chain so the caller can still boot and produce
     a clear ollama error rather than a mysterious import-time failure.
     """
+    # v15.13: frontier-API runtime. A single API model handles every
+    # language, so language-based local routing is bypassed entirely — return
+    # the configured API model and let the api_backend shim serve every call.
+    if os.environ.get("RRR_RUNTIME", "").strip().lower() == "api":
+        try:
+            from rrr.api_backend import api_model_name
+            return api_model_name()
+        except Exception:
+            pass
+
     latin = os.environ.get("RRR_MODEL_LATIN", "mistral-small:24b")
     nonlatin = os.environ.get("RRR_MODEL_NONLATIN", "qwen3:14b")
     preferred = latin if topic_lang in LATIN_LANGS else nonlatin

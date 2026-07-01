@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rrr-poc"
+version = "15.13.0"
+description = "Retrieval Restricted Reasoning — a literature-review pipeline that reasons only over retrieved, page-anchored evidence."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE.txt" }
+authors = [{ name = "Igor Baccin", email = "igbaccin@gmail.com" }]
+keywords = ["retrieval", "rag", "literature-review", "economic-history", "llm"]
+
+# Runtime deps. The `ollama` client is required even in RRR_RUNTIME=api mode
+# (the api_backend shim patches ollama.chat), but the ollama *server* is not
+# needed there. langdetect powers multilingual routing; anthropic/openai are
+# optional extras pulled in by the `api` extra below.
+dependencies = [
+    "pymupdf>=1.28.0",
+    "rank_bm25>=0.2.2",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "tabulate>=0.9.0",
+    "tqdm>=4.66",
+    "rapidfuzz>=3.9.7",
+    "ollama>=0.1.0",
+    "pybtex>=0.24.0",
+    "langdetect>=1.0.9",
+]
+
+[project.optional-dependencies]
+# `pip install rrr-poc[api]` for the frontier-API desktop runtime.
+api = ["anthropic>=0.40.0", "openai>=1.40.0"]
+# `pip install rrr-poc[pod]` adds the RunPod remote-exec helper.
+pod = ["paramiko>=3.5.0"]
+# Everything.
+all = ["anthropic>=0.40.0", "openai>=1.40.0", "paramiko>=3.5.0"]
+
+[project.scripts]
+# One-command CLI: `rrr t2 --metadata metadata.csv --topic "..."`
+rrr = "rrr.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/igbaccin/rrr-poc"
+Repository = "https://github.com/igbaccin/rrr-poc"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["rrr*"]
