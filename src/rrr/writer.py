@@ -204,15 +204,35 @@ _ENFORCE_COVERAGE = True
 
 
 def _writer_system_prompt() -> str:
-    """v15.11: compose the writer's system message with an optional
-    language directive prepended so the model emits prose in the user's
-    language. Empty prefix for English (byte-identical to the pre-v15.11
-    system prompt)."""
-    from rrr.language import language_directive
-    directive = language_directive(os.environ.get("RRR_TOPIC_LANG", "en"))
-    if directive:
-        return f"{directive}\n\n{_SYSTEM_CITATION_INSTRUCTION}"
-    return _SYSTEM_CITATION_INSTRUCTION
+    """v15.12: the writer is the SINGLE output-language boundary. Internal
+    reasoning + evidence are in the corpus/pivot language; the writer reads
+    that material and produces the entire review in the topic language.
+
+    When topic_lang == corpus_lang (the common case, both English) the
+    prefix is empty and the system prompt is byte-identical to pre-v15.11.
+    When they differ, an explicit, forceful contract makes the model write
+    100% in the topic language while quoting/citing sources that are in the
+    corpus language — this fixes the v15.11 mixed FR/EN prose.
+    """
+    from rrr.language import language_name
+    topic_lang = os.environ.get("RRR_TOPIC_LANG", "en")
+    corpus_lang = os.environ.get("RRR_CORPUS_LANG", "en")
+    if topic_lang == corpus_lang:
+        return _SYSTEM_CITATION_INSTRUCTION
+    tl = language_name(topic_lang)
+    cl = language_name(corpus_lang)
+    contract = (
+        f"OUTPUT LANGUAGE — READ FIRST. Write the ENTIRE review in {tl}. "
+        f"The source evidence, quotes, cluster syntheses, and section notes "
+        f"below are in {cl}; you must READ them in {cl} but WRITE every "
+        f"sentence of your output in {tl}. Do NOT copy {cl} sentences "
+        f"verbatim into the review — translate the meaning and express it in "
+        f"{tl}. Do NOT switch languages mid-review; do NOT emit any {cl} "
+        f"paragraphs. The ONLY {cl} tokens allowed in your output are author "
+        f"surnames and publication years inside citation markers (e.g. "
+        f"[E0001]); everything else is {tl}."
+    )
+    return f"{contract}\n\n{_SYSTEM_CITATION_INSTRUCTION}"
 
 
 # v10: cite as 'Author (Year, p.N)'. Underscore-keyed canonical form retired.

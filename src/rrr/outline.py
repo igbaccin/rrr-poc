@@ -204,12 +204,19 @@ def _sig_precheck(topic: str, doc_titles: List[str]) -> str:
 
 
 def _language_prefix() -> str:
-    """v15.11: prepend a one-line language directive so mistral/qwen respond
-    in the user's language. Empty for English (majority path, keeps prompts
-    unchanged for byte-identical behaviour when RRR_TOPIC_LANG is unset).
+    """v15.12: internal outline stages (precheck, cluster, posture, order)
+    run in the CORPUS/pivot language, not the topic language. This is the
+    key fix for the v15.11 mixed-language bug: applying the topic-language
+    directive to format=json stages made mistral emit half-English/half-
+    French JSON values that then leaked into the writer. Internal reasoning
+    now stays in the corpus language (where the model + evidence are
+    strongest and JSON compliance is reliable); only the writer translates
+    to the topic language for the user-facing review.
+
+    Empty for an English corpus (byte-identical to pre-v15.11 prompts).
     """
     from rrr.language import language_directive
-    directive = language_directive(os.environ.get("RRR_TOPIC_LANG", "en"))
+    directive = language_directive(os.environ.get("RRR_CORPUS_LANG", "en"))
     return f"{directive}\n\n" if directive else ""
 
 

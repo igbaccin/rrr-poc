@@ -194,19 +194,28 @@ def language_directive(topic_lang: str) -> str:
     """
     if not topic_lang or topic_lang == "en":
         return ""
-    # ISO-639-1 → English-language name so the prompt is readable by any
-    # instruction-tuned model. Small, curated set covering the languages
-    # the routing table actually supports.
-    NAMES = {
-        "fr": "French", "es": "Spanish", "pt": "Portuguese",
-        "de": "German", "it": "Italian", "nl": "Dutch",
-        "sv": "Swedish", "no": "Norwegian", "da": "Danish",
-        "ro": "Romanian", "ca": "Catalan", "pl": "Polish",
-        "cs": "Czech", "sk": "Slovak", "hu": "Hungarian",
-        "fi": "Finnish",
-        "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
-        "th": "Thai", "ar": "Arabic", "he": "Hebrew",
-        "ru": "Russian", "uk": "Ukrainian", "hi": "Hindi",
-    }
-    lang_name = NAMES.get(topic_lang, topic_lang)
-    return f"Respond in {lang_name}."
+    return f"Respond in {language_name(topic_lang)}."
+
+
+# ISO-639-1 → English-language name so prompts are readable by any
+# instruction-tuned model. Curated set covering the languages the routing
+# table actually supports.
+LANGUAGE_NAMES = {
+    "en": "English",
+    "fr": "French", "es": "Spanish", "pt": "Portuguese",
+    "de": "German", "it": "Italian", "nl": "Dutch",
+    "sv": "Swedish", "no": "Norwegian", "da": "Danish",
+    "ro": "Romanian", "ca": "Catalan", "pl": "Polish",
+    "cs": "Czech", "sk": "Slovak", "hu": "Hungarian",
+    "fi": "Finnish", "af": "Afrikaans", "sl": "Slovenian",
+    "hr": "Croatian", "et": "Estonian", "lv": "Latvian", "lt": "Lithuanian",
+    "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
+    "th": "Thai", "ar": "Arabic", "he": "Hebrew",
+    "ru": "Russian", "uk": "Ukrainian", "hi": "Hindi",
+}
+
+
+def language_name(code: str) -> str:
+    """ISO-639-1 code → human-readable English language name. Falls back to
+    the raw code when unknown (so prompts remain intelligible)."""
+    return LANGUAGE_NAMES.get((code or "").strip().lower(), code or "the source language")

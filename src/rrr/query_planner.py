@@ -33,7 +33,7 @@ def _clean_list(values, limit, item_limit=80):
     return out
 
 
-def _ensure_probes(topic: str, obj: dict):
+def _ensure_probes(topic: str, obj: dict, insert_raw_topic: bool = True):
     probes = _clean_list(obj.get("probes", []), 8, item_limit=120)
     if not probes:
         must = obj.get("keywords_must", [])
@@ -42,7 +42,12 @@ def _ensure_probes(topic: str, obj: dict):
             probes.append(" ".join(must[:6]))
         if any_terms:
             probes.append(" ".join(any_terms[:8]))
-    if topic and topic.lower() not in probes:
+    # v15.12: only force the raw topic string in as probe[0] when it is in
+    # the corpus language. For a cross-language topic (e.g. a Chinese topic
+    # against an English corpus) the raw topic tokenises to zero BM25 tokens
+    # and would just waste a probe slot — the corpus-language probes emitted
+    # by the planner do the retrieval work instead.
+    if insert_raw_topic and topic and topic.lower() not in probes:
         probes.insert(0, topic.lower())
     obj["probes"] = probes[:8]
     return obj
@@ -66,27 +71,42 @@ def _heuristic_plan(topic: str):
         "probes": [topic.lower(), " ".join(must + any_terms[:4]).strip()]
     }
 
-def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None):
+def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None,
+                          corpus_lang: str = "en", topic_lang: str = "en"):
     """v9 (R7): second-stage planner call that asks for technical vocabulary
     the topic statement does not contain. Returns a list of short phrases, or
     [] on any failure (this stage is purely additive — a failure means we keep
     stage-1 probes only, not a degraded plan).
+
+    v15.12: terms of art are emitted in the CORPUS language so they match the
+    BM25 index, regardless of the topic's language.
     """
     start = time.perf_counter()
     try:
         import ollama
+        from rrr.language import language_name
 
         existing_terms = ", ".join(
             (plan_obj.get("keywords_must", []) or []) +
             (plan_obj.get("keywords_any", []) or [])
         )
+        cross_lang = bool(corpus_lang) and bool(topic_lang) and corpus_lang != topic_lang
+        corpus_lang_name = language_name(corpus_lang)
+        xlang_instr = (
+            f"The topic is in {language_name(topic_lang)} but the corpus is "
+            f"in {corpus_lang_name}. Emit all terms of art IN "
+            f"{corpus_lang_name.upper()}.\n"
+            if cross_lang else ""
+        )
         prompt = (
             "You are decomposing a scholarly research topic into the vocabulary "
             "that source pages would actually use.\n\n"
+            + xlang_instr +
             "Topic: " + topic + "\n"
             "Topic words already covered by stage 1: " + (existing_terms or "(none)") + "\n\n"
-            "List 4-8 TECHNICAL TERMS OF ART from the relevant academic subfield "
-            "that would appear in source pages but are NOT in the topic statement.\n"
+            f"List 4-8 TECHNICAL TERMS OF ART (in {corpus_lang_name}) from the "
+            "relevant academic subfield that would appear in source pages but "
+            "are NOT in the topic statement.\n"
             "Examples (for 'institutions are the fundamental cause of long-run "
             "economic growth'): property rights, contract enforcement, "
             "settler mortality, factor endowments, credible commitment, "
@@ -250,14 +270,38 @@ def _merge_probes_with_terms(probes, terms, cap=None):
     return out
 
 
-def plan(topic: str, metrics=None):
+def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "en"):
     model = os.environ.get("RRR_PLANNER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
     start = time.perf_counter()
+    # v15.12: cross-language retrieval. BM25 matches on corpus-language
+    # tokens, so when the topic language differs from the corpus language
+    # the planner must emit search terms IN THE CORPUS LANGUAGE (the model
+    # translates the topic's concepts). Without this, a French/Chinese topic
+    # produces French/Chinese probes that tokenise to nothing against an
+    # English index and every doc is rejected as no_retrieved_pages.
+    cross_lang = bool(corpus_lang) and bool(topic_lang) and corpus_lang != topic_lang
     try:
         import ollama
+        from rrr.language import language_name
+        corpus_lang_name = language_name(corpus_lang)
+
+        if cross_lang:
+            topic_lang_name = language_name(topic_lang)
+            xlang_instr = (
+                f"IMPORTANT: the topic is written in {topic_lang_name}, but "
+                f"the document corpus you will search is written in "
+                f"{corpus_lang_name}. Emit EVERY keyword, token, and probe "
+                f"IN {corpus_lang_name.upper()} — translate the topic's "
+                f"concepts into the scholarly vocabulary a {corpus_lang_name} "
+                f"paper would actually use. Do NOT emit {topic_lang_name} "
+                f"terms; they would not match the {corpus_lang_name} corpus.\n\n"
+            )
+        else:
+            xlang_instr = ""
 
         prompt = (
             "Extract search terms for a scholarly retrieval plan.\n"
+            + xlang_instr +
             "Topic: " + topic + "\n\n"
             "Return ONLY a JSON object with keys: keywords_must, keywords_any, exclude, probes.\n"
             "keywords_must, keywords_any, and exclude must be arrays of short lowercase tokens.\n"
@@ -281,18 +325,24 @@ def plan(topic: str, metrics=None):
         obj["keywords_must"] = _clean_list(obj["keywords_must"], 8, item_limit=60)
         obj["keywords_any"]  = _clean_list(obj["keywords_any"], 12, item_limit=60)
         obj["exclude"]       = _clean_list(obj["exclude"], 8, item_limit=60)
-        obj = _ensure_probes(topic, obj)
+        # Cross-language: do NOT insert the raw (topic-language) topic as a
+        # probe — it can't match the corpus-language index.
+        obj = _ensure_probes(topic, obj, insert_raw_topic=not cross_lang)
         duration_s = time.perf_counter() - start
         obj["planner_meta"] = {
             "mode": "llm",
             "model": model,
             "duration_s": round(duration_s, 4),
+            "corpus_lang": corpus_lang,
+            "topic_lang": topic_lang,
+            "cross_lang_retrieval": cross_lang,
         }
 
         # v9 (R7): second-stage technical-vocabulary call. Purely additive —
         # failure leaves stage-1 probes intact.
         # v13: RRR_PLANNER_TWO_STAGE retired (always on).
-        terms = _extract_terms_of_art(topic, obj, model, metrics=metrics)
+        terms = _extract_terms_of_art(topic, obj, model, metrics=metrics,
+                                      corpus_lang=corpus_lang, topic_lang=topic_lang)
         if terms:
             merged = _merge_probes_with_terms(obj["probes"], terms, cap=_PROBE_CAP)
             added = len(merged) - len(obj["probes"])

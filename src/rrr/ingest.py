@@ -53,6 +53,7 @@ class ExtractedMeta:
     doi_or_url: str = ""
     pdf_path: str = ""
     content_sha1: str = ""
+    lang: str = "en"                   # v15.12: ISO-639-1 detected from body text
     confidence: str = "low"            # high / medium / low / failed
     source: str = "none"               # bib_sidecar / filename_regex / doi_crossref / llm_extraction / llm+crossref / needs_ocr / none
     notes: str = ""
@@ -63,7 +64,28 @@ METADATA_CSV_COLUMNS = [
     "number", "pages", "doi_or_url", "pdf_path",
     # v15.8 productisation columns:
     "content_sha1", "first_author_surname", "confidence", "source", "notes",
+    # v15.12 multilingual: detected body-text language (ISO-639-1).
+    "lang",
 ]
+
+
+def detect_pdf_language(text: str, default: str = "en") -> str:
+    """v15.12: detect the body-text language of a PDF (ISO-639-1). Used by
+    the ingest cascade to populate metadata.csv[lang], which the reasoner
+    reads to pick the corpus/pivot language for cross-language retrieval.
+    Deterministic (seeded). Falls back to ``default`` on short text or when
+    langdetect is unavailable.
+    """
+    body = (text or "").strip()
+    if len(body) < 40:
+        return default
+    try:
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0
+        lang = detect(body[:4000])
+        return "zh" if lang.startswith("zh") else lang
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +563,12 @@ def cascade(pdf_path: Path,
         meta.confidence = "low"
         meta.source = "needs_ocr"
         meta.notes = f"page_text_only_{len(text.strip())}_chars"
+        meta.lang = detect_pdf_language(text)
         return meta
+
+    # v15.12: detect body-text language once, before any early-return path so
+    # every cascade outcome (bib_sidecar / crossref / llm / etc.) carries it.
+    meta.lang = detect_pdf_language(text)
 
     # Step 3: bib sidecar
     if sidecar_bib_entries:
@@ -714,4 +741,5 @@ def _write_metadata_csv(rows: list, path: Path) -> None:
                 "confidence": r.confidence,
                 "source": r.source,
                 "notes": r.notes,
+                "lang": r.lang,
             })

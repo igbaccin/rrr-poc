@@ -1300,25 +1300,37 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         _content_sha_by_docid = {}
     metrics.set("content_sha1_populated", len(_content_sha_by_docid))
 
-    # v15.11: corpus language distribution. Emits {"en": 20, "fr": 10, ...}
-    # for observability + a boolean cross_lang_mismatch flag when the topic
-    # language is missing from the corpus (indicates cross-language
-    # retrieval is going to under-return). Silent when the ingest cascade
-    # hasn't populated a lang column yet — the whole feature is additive.
+    # v15.11/v15.12: corpus language distribution + dominant corpus language.
+    # The dominant corpus language is the retrieval/pivot language: the
+    # planner emits BM25 probes in it (translating a cross-language topic),
+    # internal reasoning runs in it, and the writer translates the final
+    # review from it into the topic language. When metadata.csv has no lang
+    # column we assume the corpus is English (the historical default) so the
+    # feature is fully backward-compatible.
+    from collections import Counter
     if "lang" in df.columns:
-        from collections import Counter
         corpus_lang_dist = dict(Counter(
             str(r.get("lang", "") or "unknown").strip().lower()
             for _, r in df.iterrows()
         ))
-        metrics.set("corpus_lang_distribution", corpus_lang_dist)
-        topic_lang_covered = corpus_lang_dist.get(topic_lang, 0) > 0
-        metrics.set("cross_lang_mismatch", not topic_lang_covered)
-        if not topic_lang_covered and topic_lang != "en":
-            print(f"[Reasoner] WARN topic_lang={topic_lang} has 0 papers in "
-                  f"corpus_lang_distribution={corpus_lang_dist}. "
-                  "Cross-language retrieval is not implemented; expect "
-                  "no_admitted_docs.")
+    else:
+        corpus_lang_dist = {"en": len(all_doc_ids)}
+    # Dominant corpus language = most frequent non-unknown lang, default en.
+    _ranked = sorted(
+        ((k, v) for k, v in corpus_lang_dist.items() if k and k != "unknown"),
+        key=lambda kv: kv[1], reverse=True,
+    )
+    corpus_lang = _ranked[0][0] if _ranked else "en"
+    metrics.set("corpus_lang_distribution", corpus_lang_dist)
+    metrics.set("corpus_lang", corpus_lang)
+    cross_lang = corpus_lang != topic_lang
+    metrics.set("cross_lang_retrieval", cross_lang)
+    # Expose the pivot language to prompt builders (writer output contract).
+    os.environ["RRR_CORPUS_LANG"] = corpus_lang
+    if cross_lang:
+        print(f"[Reasoner] cross-language: topic_lang={topic_lang} "
+              f"corpus_lang={corpus_lang} → planner emits {corpus_lang} probes, "
+              f"writer outputs {topic_lang}.")
 
     ensure_dir(str(runs_path()))
     ensure_dir(str(runs_path("layered_docs")))
@@ -1342,7 +1354,8 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     from rrr.query_planner import plan as plan_query
     with metrics.stage("planning"):
-        plan_obj = plan_query(topic, metrics=metrics)
+        plan_obj = plan_query(topic, metrics=metrics,
+                              corpus_lang=corpus_lang, topic_lang=topic_lang)
     score_query = " ".join(plan_obj.get("keywords_must", []) + plan_obj.get("keywords_any", []))
     score_query = score_query.strip() or topic
     planner_mode = plan_obj.get("planner_meta", {}).get("mode", "unknown")

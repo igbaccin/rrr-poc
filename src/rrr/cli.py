@@ -104,6 +104,17 @@ def t1(args, meta_path):
 
 
 def main():
+    # v15.12: force UTF-8 on stdout/stderr so multilingual output (accented
+    # Latin, CJK, Arabic, Cyrillic) prints correctly regardless of the host
+    # locale. On a POSIX/C locale (common on cloud pods) Python may otherwise
+    # pick an ASCII console encoding and mangle non-ASCII prints. File writes
+    # already pass encoding="utf-8" explicitly; this covers the console path.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     ap = argparse.ArgumentParser(
         description="RRR CLI. `t2` runs the full literature-review pipeline; "
                     "`t1` runs the claim-evaluator (same up to Stage 2, no writer)."
