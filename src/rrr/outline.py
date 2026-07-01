@@ -67,10 +67,10 @@ _KEEP_ALIVE = "30m"
 #     - off-topic corpora wrote 1.4k-word hallucinated reviews because
 #       inclusive-clustering force-fit everything into clusters and
 #       unassigned_share never reached the refusal threshold
-_PRECHECK_PROMPT_VERSION = "2026-07-01-v15.10-precheck-gibberish-guard"
-_CLUSTER_PROMPT_VERSION = "2026-06-30-v15.7-cluster-streams-soft-target"
-_POSTURE_PROMPT_VERSION = "2026-06-30-v15.2.3-conduit-also-fires-on-adjacent"
-_ORDER_PROMPT_VERSION = "2026-06-30-v15a-order"
+_PRECHECK_PROMPT_VERSION = "2026-07-01-v15.11-precheck-lang-directive"
+_CLUSTER_PROMPT_VERSION = "2026-07-01-v15.11-cluster-lang-directive"
+_POSTURE_PROMPT_VERSION = "2026-07-01-v15.11-posture-lang-directive"
+_ORDER_PROMPT_VERSION = "2026-07-01-v15.11-order-lang-directive"
 
 # v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
 # context can be small. Cheap call.
@@ -203,7 +203,18 @@ def _sig_precheck(topic: str, doc_titles: List[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _language_prefix() -> str:
+    """v15.11: prepend a one-line language directive so mistral/qwen respond
+    in the user's language. Empty for English (majority path, keeps prompts
+    unchanged for byte-identical behaviour when RRR_TOPIC_LANG is unset).
+    """
+    from rrr.language import language_directive
+    directive = language_directive(os.environ.get("RRR_TOPIC_LANG", "en"))
+    return f"{directive}\n\n" if directive else ""
+
+
 def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
+    _lang_pfx = _language_prefix()
     titles_block = "\n".join(f"  - {t}" for t in doc_titles)
     # NOTE on examples: every illustrative example below is drawn from a
     # domain DELIBERATELY unrelated to any topic this pipeline is
@@ -212,6 +223,7 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
     # overlaps the user's actual topic would nudge the model's classification
     # in a non-agnostic way. Keep new examples cross-domain.
     return (
+        _lang_pfx +
         "You are doing a PRE-FLIGHT check for a literature-review generator. "
         "Two decisions, ONE JSON output.\n\n"
         f"TOPIC: {topic}\n\n"
@@ -481,7 +493,7 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
         "",
         "Return ONLY the JSON object. No commentary.",
     ]
-    return "\n".join(lines)
+    return _language_prefix() + "\n".join(lines)
 
 
 def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optional[dict]:
@@ -841,7 +853,7 @@ def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
         "",
         "Return ONLY the JSON object.",
     ]
-    return "\n".join(lines)
+    return _language_prefix() + "\n".join(lines)
 
 
 def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dict]:
@@ -1166,7 +1178,7 @@ def _build_order_prompt(topic: str, cluster_summaries: List[dict]) -> str:
         "Return ONE JSON object: { \"ordered_cluster_ids\": [\"C1\", \"C3\", ...] }",
         "Every cluster_id above must appear exactly once.",
     ]
-    return "\n".join(lines)
+    return _language_prefix() + "\n".join(lines)
 
 
 def _validate_order(obj, valid_ids: set) -> Optional[List[str]]:

@@ -1,6 +1,5 @@
-import argparse, re, sys
+import argparse, os, re, sys
 import pandas as pd
-from rrr.reasoner import layered_t2
 
 
 # v15.10: deterministic sanity gate before any LLM call. Rejects topics that
@@ -10,9 +9,18 @@ from rrr.reasoner import layered_t2
 # coherent meaning. The gate is intentionally lenient: real scholarly topics
 # with unusual phrasings must not be rejected. If in doubt, let it through
 # and rely on Stage 0.
-_MIN_TOPIC_CHARS = 12
-_MIN_ALPHA_TOKENS = 2  # at least two >=3-char alphabetic tokens
-_ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{3,}")
+#
+# v15.11: Unicode-aware. Recognises non-Latin scholarly topics (CJK, Arabic,
+# Cyrillic, Devanagari) as legitimate. The letter-count minimum uses
+# Unicode isalpha() so each CJK character counts as one letter. Multi-token
+# rule fires only when whitespace is present (Latin, Cyrillic, Arabic, etc.);
+# scriptio-continua languages (CJK) get a special path that rejects only
+# when the input mixes letters with digits or punctuation (the keyboard-slam
+# signature: '09p<GYHKLGCH' is a single letter run alongside symbols, while
+# '机构改革与经济增长' is a pure letter run).
+_MIN_LETTER_CODEPOINTS = 4
+_MIN_MULTI_LETTER_TOKENS = 2
+_MULTI_LETTER_TOKEN_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 
 def _reject_gibberish_topic(topic: str) -> str | None:
@@ -24,13 +32,22 @@ def _reject_gibberish_topic(topic: str) -> str | None:
     stripped = topic.strip()
     if not stripped:
         return "topic is empty"
-    if len(stripped) < _MIN_TOPIC_CHARS:
-        return (f"topic has {len(stripped)} chars (<{_MIN_TOPIC_CHARS}); "
-                "not a scholarly research question")
-    alpha_tokens = _ALPHA_TOKEN_RE.findall(stripped)
-    if len(alpha_tokens) < _MIN_ALPHA_TOKENS:
-        return (f"topic has {len(alpha_tokens)} alphabetic token(s) of length "
-                f">=3 (<{_MIN_ALPHA_TOKENS}); not a scholarly research question")
+    letter_count = sum(1 for c in stripped if c.isalpha())
+    if letter_count < _MIN_LETTER_CODEPOINTS:
+        return (f"topic has {letter_count} letter codepoint(s) "
+                f"(<{_MIN_LETTER_CODEPOINTS}); not a scholarly research question")
+    if re.search(r"\s", stripped):
+        tokens = _MULTI_LETTER_TOKEN_RE.findall(stripped)
+        if len(tokens) < _MIN_MULTI_LETTER_TOKENS:
+            return (f"topic has {len(tokens)} multi-letter token(s) "
+                    f"(<{_MIN_MULTI_LETTER_TOKENS}); not a scholarly "
+                    "research question")
+    else:
+        non_letter = sum(1 for c in stripped
+                          if not c.isalpha() and not c.isspace())
+        if non_letter > 0:
+            return ("single-run topic mixes letters with digits or "
+                    "punctuation; looks like a keyboard slam")
     return None
 
 
@@ -64,6 +81,9 @@ def t2(args, meta_path):
             "use scripts/run_small_validation.py or scripts/run_battery.sh for the "
             "full layered pipeline."
         )
+    # v15.11: deferred import so env vars set by main() (RRR_MODEL,
+    # RRR_TOPIC_LANG) take effect before reasoner reads them at import time.
+    from rrr.reasoner import layered_t2
     layered_t2(args, meta_path)
 
 
@@ -78,6 +98,8 @@ def t1(args, meta_path):
     setattr(args, "t1_only", True)
     # narrative-only saves us the T2_review.md appendix step we don't need.
     setattr(args, "narrative_only", True)
+    # v15.11: deferred import (see t2 comment).
+    from rrr.reasoner import layered_t2
     layered_t2(args, meta_path)
 
 
@@ -107,8 +129,20 @@ def main():
         raise SystemExit(2)
 
     if args.linkify:
-        import os
         os.environ["RRR_LINKIFY"] = "1"
+
+    # v15.11: detect topic language + select model BEFORE importing reasoner.
+    # Modules read _MODEL at import time, so setting env vars here binds the
+    # whole pipeline to the language-appropriate tier. Falls back to
+    # RRR_MODEL / mistral if the language detector is unavailable.
+    from rrr.language import detect_topic_language, select_model
+    topic_lang = detect_topic_language(args.topic)
+    selected_model = select_model(topic_lang)
+    os.environ["RRR_TOPIC_LANG"] = topic_lang
+    os.environ["RRR_MODEL"] = selected_model
+    sys.stderr.write(
+        f"[RRR] topic_lang={topic_lang} selected_model={selected_model}\n"
+    )
 
     if args.task == "t1":
         t1(args, args.metadata)

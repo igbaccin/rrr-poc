@@ -202,6 +202,19 @@ _MIN_SECTION_CITED_DOCS = int(os.environ.get("RRR_WRITER_MIN_SECTION_CITED_DOCS"
 # longer a supported configuration.
 _ENFORCE_COVERAGE = True
 
+
+def _writer_system_prompt() -> str:
+    """v15.11: compose the writer's system message with an optional
+    language directive prepended so the model emits prose in the user's
+    language. Empty prefix for English (byte-identical to the pre-v15.11
+    system prompt)."""
+    from rrr.language import language_directive
+    directive = language_directive(os.environ.get("RRR_TOPIC_LANG", "en"))
+    if directive:
+        return f"{directive}\n\n{_SYSTEM_CITATION_INSTRUCTION}"
+    return _SYSTEM_CITATION_INSTRUCTION
+
+
 # v10: cite as 'Author (Year, p.N)'. Underscore-keyed canonical form retired.
 _SYSTEM_CITATION_INSTRUCTION = (
     # v14.2.1 simplification: reorganised into BOUNDARY (architecturally
@@ -2429,13 +2442,14 @@ def _dump_writer_prompt(stage: str, system: str, user: str) -> None:
 def _ollama_chat(prompt: str, metrics=None, stage="writer"):
     import ollama
     import time
-    _dump_writer_prompt(stage, _SYSTEM_CITATION_INSTRUCTION, prompt)
+    _system = _writer_system_prompt()
+    _dump_writer_prompt(stage, _system, prompt)
     start = time.perf_counter()
     try:
         res = ollama.chat(
             model=_MODEL,
             messages=[
-                {"role": "system", "content": _SYSTEM_CITATION_INSTRUCTION},
+                {"role": "system", "content": _system},
                 {"role": "user", "content": prompt}
             ],
             options=_DEFAULT_CHAT_OPTIONS,
@@ -4463,13 +4477,14 @@ def _ollama_chat_single_pass(user_prompt: str, metrics=None,
         "num_predict": 3500,
         "top_p": 0.9,
     }
-    _dump_writer_prompt(stage, _SYSTEM_CITATION_INSTRUCTION, user_prompt)
+    _system = _writer_system_prompt()
+    _dump_writer_prompt(stage, _system, user_prompt)
     start = _time.perf_counter()
     try:
         res = ollama.chat(
             model=_MODEL,
             messages=[
-                {"role": "system", "content": _SYSTEM_CITATION_INSTRUCTION},
+                {"role": "system", "content": _system},
                 {"role": "user", "content": user_prompt},
             ],
             options=options,

@@ -1214,6 +1214,15 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
     metrics.set("restart_attempt", restart_attempt)
 
+    # v15.11: language routing. CLI sets these before importing us; we
+    # surface them on metrics for observability. Absence means the pipeline
+    # is running via a non-CLI entry point (test/battery script) — fall back
+    # to English so the majority path keeps its zero-directive prompts.
+    topic_lang = os.environ.get("RRR_TOPIC_LANG", "en")
+    selected_model = os.environ.get("RRR_MODEL", _MODEL)
+    metrics.set("topic_lang", topic_lang)
+    metrics.set("selected_model", selected_model)
+
     # v15.9 (#4): mint a per-invocation run_id so this call's artifacts land
     # in runs/<utc>_<slug>/ rather than the flat runs/ folder — concurrent
     # runs on the same corpus no longer collide.
@@ -1290,6 +1299,26 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     else:
         _content_sha_by_docid = {}
     metrics.set("content_sha1_populated", len(_content_sha_by_docid))
+
+    # v15.11: corpus language distribution. Emits {"en": 20, "fr": 10, ...}
+    # for observability + a boolean cross_lang_mismatch flag when the topic
+    # language is missing from the corpus (indicates cross-language
+    # retrieval is going to under-return). Silent when the ingest cascade
+    # hasn't populated a lang column yet — the whole feature is additive.
+    if "lang" in df.columns:
+        from collections import Counter
+        corpus_lang_dist = dict(Counter(
+            str(r.get("lang", "") or "unknown").strip().lower()
+            for _, r in df.iterrows()
+        ))
+        metrics.set("corpus_lang_distribution", corpus_lang_dist)
+        topic_lang_covered = corpus_lang_dist.get(topic_lang, 0) > 0
+        metrics.set("cross_lang_mismatch", not topic_lang_covered)
+        if not topic_lang_covered and topic_lang != "en":
+            print(f"[Reasoner] WARN topic_lang={topic_lang} has 0 papers in "
+                  f"corpus_lang_distribution={corpus_lang_dist}. "
+                  "Cross-language retrieval is not implemented; expect "
+                  "no_admitted_docs.")
 
     ensure_dir(str(runs_path()))
     ensure_dir(str(runs_path("layered_docs")))
