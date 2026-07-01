@@ -37,17 +37,83 @@ DISPLAY_PAREN_CITE_RE = re.compile(
 )
 
 
-def _doc_id_to_author_label(doc_id: str) -> str:
-    """v10: derive the human-readable author label from a canonical doc_id.
+# v15.9 (#1): metadata-driven author label lookup.
+#
+# Historically _doc_id_to_author_label parsed doc_id filenames via regex
+# (Author_Year / AuthorEtAl_Year / Author1&Author2_Year). That convention
+# only works when the user names PDFs to match it. To support arbitrary
+# filenames, we now consult a module-level dict populated from
+# metadata.csv at pipeline entry (reasoner._layered_t2_inner calls
+# set_metadata_labels). If a doc_id is not in the dict, we fall back to
+# the regex — preserving byte-identical behaviour on legacy corpora that
+# don't have display_label / first_author_surname columns.
+_METADATA_LABEL_LOOKUP: dict = {}
 
-    Conventions used by the corpus filenames (and therefore doc_ids):
-      Author_Year                 -> "Author"
-      AuthorEtAl_Year             -> "Author et al."
-      Author1&Author2_Year        -> "Author1 and Author2"
-      Author1&Author2&Author3_Year -> "Author1 et al."   (3+ defaults to et al.)
-    The doc_id may carry a trailing letter (e.g. 1989a) which we strip for the
-    year. Surnames containing camelCase particles (e.g. vanZanden) are split.
+
+def set_metadata_labels(rows, *, clear: bool = True) -> int:
+    """Populate the module-level lookup from metadata.csv rows.
+
+    Each row can be a dict (from pandas.DataFrame.to_dict(orient='records'))
+    or any mapping with 'doc_id', 'authors', 'year' at minimum.
+    Optional columns override the derived values:
+      - display_label: 'Acemoglu et al. (2001)' (used as-is)
+      - first_author_surname: 'Acemoglu' (used as-is)
+
+    When display_label / first_author_surname are missing, the seed values
+    come from the regex-based _regex_doc_id_to_author_label / _regex_author_surnames_only
+    so the pre-v15.9 output is preserved byte-for-byte on the 50-paper
+    hand-curated corpus.
+
+    Returns the number of entries loaded.
     """
+    global _METADATA_LABEL_LOOKUP
+    if clear:
+        _METADATA_LABEL_LOOKUP = {}
+    count = 0
+    for row in rows or []:
+        try:
+            doc_id = str(row.get("doc_id", "") or "").strip()
+        except AttributeError:
+            continue
+        if not doc_id:
+            continue
+        display_label = str(row.get("display_label", "") or "").strip()
+        first_surname = str(row.get("first_author_surname", "") or "").strip()
+        year = str(row.get("year", "") or "").strip()
+        # Seed from regex when explicit columns are missing (backward compat)
+        if not display_label:
+            display_label = _regex_doc_id_to_author_label(doc_id)
+        if not first_surname:
+            first_surname = _regex_author_surnames_only(display_label).split(" and ")[0].split(",")[0].strip()
+        _METADATA_LABEL_LOOKUP[doc_id] = {
+            "display_label": display_label,
+            "first_author_surname": first_surname,
+            "year": year,
+            "surnames": _regex_author_surnames_only(display_label),
+        }
+        count += 1
+    return count
+
+
+def get_metadata_label_entry(doc_id: str):
+    """Public accessor: returns the lookup entry for doc_id, or None."""
+    if not doc_id:
+        return None
+    return _METADATA_LABEL_LOOKUP.get(str(doc_id).strip())
+
+
+def _regex_author_surnames_only(label: str) -> str:
+    """Strip trailing ' (Year)' from an 'Acemoglu et al. (2001)' style label."""
+    if not label:
+        return ""
+    return re.sub(r"\s*\(\d{4}[a-z]?\)\s*$", "", label).strip()
+
+
+def _regex_doc_id_to_author_label(doc_id: str) -> str:
+    """Legacy regex-based label derivation. Preserved for corpora that
+    follow the Author_YYYY filename convention and don't yet have a
+    metadata-driven lookup populated. See _doc_id_to_author_label below
+    for the composed path."""
     if not doc_id:
         return ""
     m = re.match(r"^(.+?)_(\d{4})[a-z]?$", str(doc_id))
@@ -57,7 +123,6 @@ def _doc_id_to_author_label(doc_id: str) -> str:
     year = m.group(2)
 
     def _normalise_surname(s: str) -> str:
-        # Split lowercase particle prefixes ("vanZanden" -> "van Zanden").
         return re.sub(r"\b(van|von|de|del|der)([A-Z])", r"\1 \2", s)
 
     if "EtAl" in name_part:
@@ -71,6 +136,25 @@ def _doc_id_to_author_label(doc_id: str) -> str:
             return f"{parts[0]} and {parts[1]} ({year})"
         return f"{parts[0]} et al. ({year})"
     return f"{_normalise_surname(name_part)} ({year})"
+
+
+def _doc_id_to_author_label(doc_id: str) -> str:
+    """v15.9 (#1): metadata lookup first, regex fallback.
+
+    Conventions used by the corpus filenames (regex path):
+      Author_Year                 -> "Author"
+      AuthorEtAl_Year             -> "Author et al."
+      Author1&Author2_Year        -> "Author1 and Author2"
+      Author1&Author2&Author3_Year -> "Author1 et al."
+    The doc_id may carry a trailing letter (e.g. 1989a) which we strip for the
+    year. Surnames containing camelCase particles (e.g. vanZanden) are split.
+    """
+    if not doc_id:
+        return ""
+    entry = _METADATA_LABEL_LOOKUP.get(str(doc_id).strip())
+    if entry and entry.get("display_label"):
+        return entry["display_label"]
+    return _regex_doc_id_to_author_label(doc_id)
 
 
 def render_citation(doc_id, page) -> str:
@@ -95,12 +179,26 @@ def render_citation_canonical(doc_id, page) -> str:
 def _build_author_year_lookup(allowed_docs):
     """Build reverse lookup: (author, year) -> doc_id for academic citation
     matching. Shared by writer.py (final citation collection) and reasoner.py
-    (fallback when runs/review_cited_docs.json is missing). v13: promoted to
-    render.py to retire the byte-identical copies that previously lived in
-    both modules.
+    (fallback when runs/review_cited_docs.json is missing).
+
+    v15.9 (#1): metadata lookup first (via _METADATA_LABEL_LOOKUP); regex
+    parse of the doc_id string as fallback. This lets arbitrary-filename
+    corpora work — as long as metadata.csv is populated, we don't need
+    the doc_id string to encode the author.
     """
     author_year_to_docid = {}
     for did in allowed_docs:
+        entry = _METADATA_LABEL_LOOKUP.get(str(did).strip())
+        if entry and entry.get("first_author_surname") and entry.get("year"):
+            author = entry["first_author_surname"].lower()
+            year = entry["year"].rstrip("abcdefgh")
+            author_year_to_docid[(author, year)] = did
+            # 'Author et al.' variant if the label ends with 'et al.'
+            surnames = entry.get("surnames", "")
+            if surnames.endswith(" et al.") or " et al." in surnames:
+                author_year_to_docid[(author + " et al", year)] = did
+            continue
+        # Regex fallback (legacy Author_YYYY convention)
         clean = did.replace("EtAl", "").replace("&", "")
         parts = clean.split("_")
         if len(parts) >= 2:

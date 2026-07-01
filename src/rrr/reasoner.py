@@ -1262,6 +1262,17 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     metrics.set("metadata_path", str(meta_path))
     metrics.set("docs_total", len(all_doc_ids))
 
+    # v15.9 (#1): populate the render-time metadata → author label lookup so
+    # in-text citations and reference-list rendering can use metadata.csv as
+    # the source of truth instead of parsing doc_ids via regex. When a
+    # metadata row lacks display_label / first_author_surname columns, the
+    # seed values come from the legacy regex — so the 50-paper hand-curated
+    # corpus produces byte-identical output.
+    from rrr.render import set_metadata_labels
+    n_labels = set_metadata_labels(df.to_dict(orient="records"))
+    metrics.set("metadata_labels_loaded", n_labels)
+    print(f"[Reasoner] loaded {n_labels} metadata-driven author labels")
+
     # v15.9 (#5): corpus_fingerprint namespaces the claim cache; content_sha1
     # (per paper) becomes the primary cache key when populated by the ingest
     # cascade. Existing metadata.csv without those columns falls back to
