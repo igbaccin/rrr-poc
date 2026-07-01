@@ -71,10 +71,30 @@ def sha256_file(path):
 
 
 def save_json(obj, path):
+    # v15.14: atomic write (tmp + os.replace). Run artifacts (ledger,
+    # manifest, metrics, per-doc summaries) were written in place; a crash
+    # mid-write left a truncated JSON that a replay/downstream reader then
+    # failed to parse. os.replace is atomic on both POSIX and Windows.
     path = str(path)
     ensure_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def env_int(name: str, default: int) -> int:
+    """v15.14: guarded int(os.environ...) parse. A malformed value used to
+    raise ValueError deep inside the pipeline (or at module import time for
+    writer knobs); now it warns and falls back to the default."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        print(f"[RRR] WARN: env {name}={raw!r} is not an integer; using default {default}")
+        return default
 
 
 def write_run(task, claim, evidence, result, subdir=None):

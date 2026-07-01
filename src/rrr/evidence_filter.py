@@ -1,6 +1,7 @@
 import os, re
 from rapidfuzz import fuzz
 from rrr.text import normalize_text, sentence_spans
+from rrr.utils import env_int
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
@@ -121,13 +122,13 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
     # 1 in v11.1 (was 0 in v10.3 for backwards compatibility, verified safe in
     # the v11 smoke). 0 = off; 1 = drop sentences with any corruption signal;
     # 2 = drop only when multiple signals fire.
-    quote_quality_min = int(os.environ.get("RRR_WRITER_QUOTE_QUALITY_MIN", "1"))
+    quote_quality_min = env_int("RRR_WRITER_QUOTE_QUALITY_MIN", 1)
     if quote_quality_min > 0:
         sentences = [s for s in sentences if _quote_corruption_signals(s) < quote_quality_min]
         if not sentences:
             return []
 
-    min_score = int(os.environ.get("RRR_MIN_SENT_SCORE", "40"))
+    min_score = env_int("RRR_MIN_SENT_SCORE", 40)
 
     scored = []
     for s in sentences:
@@ -165,7 +166,7 @@ def select_sentences(page_text: str, claim: str, max_sentences: int = 6, min_cha
     # widening does not consume the budget. Default N=1 captures the
     # Hopkins/Englebert attribution case ("Englebert concludes that... .
     # Societies can be ethnically homogeneous...") without inflating snippets.
-    n_context = int(os.environ.get("RRR_EVIDENCE_CONTEXT_SENTENCES", "1"))
+    n_context = env_int("RRR_EVIDENCE_CONTEXT_SENTENCES", 1)
     if n_context <= 0 or not all_sentences:
         return chosen
 

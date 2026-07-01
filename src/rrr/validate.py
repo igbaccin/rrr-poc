@@ -27,10 +27,18 @@ def quote_exact(page_text: str, snippet: str) -> bool:
     return _norm(page_text).find(_norm(snippet)) != -1
 
 def quote_soft(page_text: str, snippet: str, threshold: float = 0.78):
+    # v15.14: containment, not Jaccard. The old score was |a∩b| / |a∪b|
+    # against the ENTIRE page's vocabulary, so for any snippet ⊂ page the
+    # ceiling was |snippet| / |page| (~0.2 for a normal page) — the 0.78
+    # threshold was mathematically unreachable and the soft_ok tier was
+    # dead: every non-exact quote failed as quote_not_found. Containment
+    # (share of the snippet's words present on the page) is what the
+    # threshold was calibrated against conceptually: 0.78 ≈ tolerate OCR
+    # noise on up to a fifth of the snippet's words.
     a = set(_norm(snippet).lower().split())
     b = set(_norm(page_text).lower().split())
-    inter = len(a & b); union = len(a | b) or 1
-    score = inter / union
+    inter = len(a & b)
+    score = inter / (len(a) or 1)
     return (score >= threshold, score)
 
 def validate_evidence_verbose(evidence, metadata_df, soft_threshold: float = 0.78):

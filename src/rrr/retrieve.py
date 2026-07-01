@@ -2,6 +2,7 @@ import os, pickle, numpy as np
 from functools import lru_cache
 from rrr.paths import indices_path, page_text_path, require_file, require_indices_dir, require_page_text_dir
 from rrr.text import tokenize_query
+from rrr.utils import env_int
 
 @lru_cache(maxsize=1)
 def _load_bm25_and_ids():
@@ -73,7 +74,7 @@ def retrieve_breadth(query: str, docs_k=20, pages_per_doc=2):
     doc_rank = doc_rank[:max(1, docs_k)]
 
     # Page cap per doc
-    per_doc_cap = int(os.environ.get("RRR_PAGES_PER_DOC_CAP", str(pages_per_doc)))
+    per_doc_cap = env_int("RRR_PAGES_PER_DOC_CAP", pages_per_doc)
     out = []
     for did, entries in doc_rank:
         entries.sort(key=lambda x: x[1], reverse=True)

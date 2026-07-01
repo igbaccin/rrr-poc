@@ -71,6 +71,23 @@ def install():
 
     _original = ollama.chat
 
+    # v15.14: request timeout. No ollama.chat call site passes one, so a hung
+    # server stalled a run indefinitely (30m keep_alive, sequential writer).
+    # Route every local call through a timeout-configured Client when the
+    # installed client supports it. RRR_OLLAMA_TIMEOUT seconds, default 600;
+    # 0 disables. Read at install time — the CLI sets its env before the
+    # reasoner import that triggers install(), same contract as RRR_MODEL.
+    try:
+        _timeout_s = float(os.environ.get("RRR_OLLAMA_TIMEOUT", "600") or 0)
+    except ValueError:
+        _timeout_s = 600.0
+    _base_chat = _original
+    if _timeout_s > 0:
+        try:
+            _base_chat = ollama.Client(timeout=_timeout_s).chat
+        except Exception:
+            _base_chat = _original  # older client without timeout kwarg
+
     def _patched(*args, **kwargs):
         # v15.13: frontier-API runtime. When RRR_RUNTIME=api, route every
         # ollama.chat call to the Anthropic/OpenAI backend instead of a local
@@ -86,15 +103,15 @@ def install():
         model = kwargs.get("model") or (args[0] if args else "")
         if _is_thinking_model(model) and "think" not in kwargs:
             try:
-                return _original(*args, think=False, **kwargs)
+                return _base_chat(*args, think=False, **kwargs)
             except TypeError:
                 # Older ollama client: no think kwarg. Fall back to the
                 # in-band /no_think switch on the messages.
                 if "messages" in kwargs:
                     kwargs = dict(kwargs)
                     kwargs["messages"] = _inject_no_think(kwargs["messages"])
-                return _original(*args, **kwargs)
-        return _original(*args, **kwargs)
+                return _base_chat(*args, **kwargs)
+        return _base_chat(*args, **kwargs)
 
     _patched._rrr_thinking_shim = True
     _patched._rrr_original = _original

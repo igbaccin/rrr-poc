@@ -146,9 +146,20 @@ def main():
     # Modules read _MODEL at import time, so setting env vars here binds the
     # whole pipeline to the language-appropriate tier. Falls back to
     # RRR_MODEL / mistral if the language detector is unavailable.
-    from rrr.language import detect_topic_language, select_model
-    topic_lang = detect_topic_language(args.topic)
-    selected_model = select_model(topic_lang)
+    # v15.14: the fallback the comment above promised now actually exists —
+    # the import was unguarded, so a missing/broken rrr.language (or absent
+    # langdetect dependency) crashed the CLI instead of degrading.
+    try:
+        from rrr.language import detect_topic_language, select_model
+        topic_lang = detect_topic_language(args.topic)
+        selected_model = select_model(topic_lang)
+    except Exception as lang_e:
+        topic_lang = "en"
+        selected_model = os.environ.get("RRR_MODEL", "mistral")
+        sys.stderr.write(
+            f"[RRR] language detector unavailable ({lang_e}); "
+            f"falling back to topic_lang=en model={selected_model}\n"
+        )
     os.environ["RRR_TOPIC_LANG"] = topic_lang
     os.environ["RRR_MODEL"] = selected_model
     sys.stderr.write(

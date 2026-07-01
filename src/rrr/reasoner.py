@@ -1,6 +1,6 @@
 from typing import List
 import os, subprocess, json, re, ast, hashlib, time
-from rrr.utils import ensure_dir
+from rrr.utils import ensure_dir, env_int
 # v15.12: patch ollama.chat to disable qwen3 thinking mode BEFORE any stage
 # runs. Every `import ollama` in the package resolves to the same module
 # object, so this one call covers all ~30 call sites.
@@ -889,16 +889,16 @@ def _clean_latex(s: str) -> str:
         return s
     s = s.replace('{', '').replace('}', '')
     replacements = [
-        (r"\\'e", 'Ã©'), (r"\\`e", 'Ã¨'), (r'\\"e', 'Ã«'), (r'\\^e', 'Ãª'),
-        (r"\\'a", 'Ã¡'), (r"\\`a", 'Ã '), (r'\\"a', 'Ã¤'), (r'\\^a', 'Ã¢'),
-        (r"\\'o", 'Ã³'), (r"\\`o", 'Ã²'), (r'\\"o', 'Ã¶'), (r'\\^o', 'Ã´'),
-        (r"\\'u", 'Ãº'), (r"\\`u", 'Ã¹'), (r'\\"u', 'Ã¼'), (r'\\^u', 'Ã»'),
-        (r"\\'i", 'Ã­'), (r"\\`i", 'Ã¬'), (r'\\"i', 'Ã¯'), (r'\\^i', 'Ã®'),
-        (r'\\c{c}', 'Ã§'), (r'\\c{C}', 'Ã‡'),
-        (r'\\c{s}', 'ÅŸ'), (r'\\c{S}', 'Åž'),
-        (r'\\v{s}', 'Å¡'), (r'\\v{S}', 'Å '),
-        (r'\\~n', 'Ã±'), (r'\\~N', 'Ã‘'),
-        (r'\\ss', 'ÃŸ'),
+        (r"\\'e", 'é'), (r"\\`e", 'è'), (r'\\"e', 'ë'), (r'\\^e', 'ê'),
+        (r"\\'a", 'á'), (r"\\`a", 'à'), (r'\\"a', 'ä'), (r'\\^a', 'â'),
+        (r"\\'o", 'ó'), (r"\\`o", 'ò'), (r'\\"o', 'ö'), (r'\\^o', 'ô'),
+        (r"\\'u", 'ú'), (r"\\`u", 'ù'), (r'\\"u', 'ü'), (r'\\^u', 'û'),
+        (r"\\'i", 'í'), (r"\\`i", 'ì'), (r'\\"i', 'ï'), (r'\\^i', 'î'),
+        (r'\\c{c}', 'ç'), (r'\\c{C}', 'Ç'),
+        (r'\\c{s}', 'ş'), (r'\\c{S}', 'Ş'),
+        (r'\\v{s}', 'š'), (r'\\v{S}', 'Š'),
+        (r'\\~n', 'ñ'), (r'\\~N', 'Ñ'),
+        (r'\\ss', 'ß'),
         (r"\\'", ''), (r'\\`', ''), (r'\\"', ''), (r'\\^', ''),
         (r'\\c', ''), (r'\\v', ''), (r'\\~', ''),
     ]
@@ -1213,7 +1213,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     from rrr.retrieve import retrieve
     from rrr.evidence_filter import select_sentences
     from rrr.validate import validate_evidence_verbose
-    from rrr.utils import ensure_dir, write_run, normalize_space
+    from rrr.utils import ensure_dir, env_int, write_run, normalize_space
 
     topic = args.topic
     metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
@@ -1340,18 +1340,20 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     ensure_dir(str(runs_path()))
     ensure_dir(str(runs_path("layered_docs")))
 
-    PER_DOC_TOPK = int(os.environ.get("RRR_PER_DOC_TOPK", "30"))
-    MAX_SENTS_PER_PAGE = int(os.environ.get("RRR_MAX_SENTS_PAGE", "8"))
-    MIN_CHARS = int(os.environ.get("RRR_MIN_SENT_CHARS", "20"))
-    MIN_DOC_SNIPS = int(os.environ.get("RRR_MIN_DOC_SNIPS", "3"))
-    GLOBAL_MIN_DOCS = int(os.environ.get("RRR_GLOBAL_MIN_DOCS", "5"))
-    MD_QUOTE_CAP = int(os.environ.get("RRR_MD_QUOTE_CAP", "8"))
-    DOC_BUDGET = int(os.environ.get("RRR_DOC_BUDGET", "24"))
+    # v15.14: env_int — a malformed env value degrades to the default with a
+    # warning instead of an unhandled ValueError mid-run.
+    PER_DOC_TOPK = env_int("RRR_PER_DOC_TOPK", 30)
+    MAX_SENTS_PER_PAGE = env_int("RRR_MAX_SENTS_PAGE", 8)
+    MIN_CHARS = env_int("RRR_MIN_SENT_CHARS", 20)
+    MIN_DOC_SNIPS = env_int("RRR_MIN_DOC_SNIPS", 3)
+    GLOBAL_MIN_DOCS = env_int("RRR_GLOBAL_MIN_DOCS", 5)
+    MD_QUOTE_CAP = env_int("RRR_MD_QUOTE_CAP", 8)
+    DOC_BUDGET = env_int("RRR_DOC_BUDGET", 24)
     # v13: RRR_DOC_ADMIT_CACHE retired (always on). The cache is cheap to
     # write, the v8 default was 1, and no battery script overrode it.
     DOC_ADMIT_CACHE = True
     DOC_ADMIT_REPLAY = os.environ.get("RRR_DOC_ADMIT_REPLAY", "0") == "1"
-    EV_CAP = int(os.environ.get("RRR_EV_PER_DOC_CAP", "8"))
+    EV_CAP = env_int("RRR_EV_PER_DOC_CAP", 8)
     metrics.set("doc_admit_cache_enabled", 1)
     metrics.set("doc_admit_replay", int(DOC_ADMIT_REPLAY))
 
@@ -1399,7 +1401,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         extra={"admit_settings": admit_settings, "restart_attempt": restart_attempt},
     )
 
-    MAX_WORKERS = int(os.environ.get("RRR_CONCURRENCY", "4"))
+    MAX_WORKERS = env_int("RRR_CONCURRENCY", 4)
     admission_rejections = []
     rejection_lock = threading.Lock()
 
@@ -1758,8 +1760,8 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     for entry in doc_summaries:
         did = entry["doc_id"]
-        with open(runs_path("layered_docs", f"{did}.json"), "w", encoding="utf-8") as f:
-            json.dump(entry, f, indent=2, ensure_ascii=False)
+        from rrr.utils import save_json as _save_json_atomic
+        _save_json_atomic(entry, runs_path("layered_docs", f"{did}.json"))
 
     kept = len(doc_summaries)
     metrics.set("docs_represented", kept)
@@ -2168,10 +2170,11 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         "restarts_required": restart_attempt
     }
     with metrics.stage("write_ledger"):
-        with open(runs_path("review_ledger.json"), "w", encoding="utf-8") as f:
-            json.dump(ledger_data, f, indent=2, ensure_ascii=False)
-        with open(runs_path("plan.json"), "w", encoding="utf-8") as f:
-            json.dump(plan_obj, f, indent=2, ensure_ascii=False)
+        # v15.14: atomic via save_json — the ledger is the writer's input; a
+        # crash mid-write left a truncated file that broke any replay.
+        from rrr.utils import save_json as _save_json_atomic
+        _save_json_atomic(ledger_data, runs_path("review_ledger.json"))
+        _save_json_atomic(plan_obj, runs_path("plan.json"))
 
     narrative_md = _render_review_narrative(topic, doc_summaries, len(all_doc_ids), outline_plan)
     with open(runs_path("review_narrative.md"), "w", encoding="utf-8") as f:
@@ -2268,6 +2271,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         # fallback so v13.1.1 5-topic smokes remain reproducible.
         from rrr.writer import compose_review
         print("[Layered-T2] composing long-form literature review...")
+        writer_error_msg = None
         try:
             with metrics.stage("writing"):
                 composed_path = compose_review(str(runs_path("review_ledger.json")), metrics=metrics)
@@ -2379,8 +2383,22 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         except Exception as e:
             print(f"[Layered-T2] writer failed: {e}")
             metrics.set("writer_error", str(e))
+            writer_error_msg = str(e)
 
     metrics.set("refusal", False)
+    # v15.14: the manifest previously recorded an unconditional success shape
+    # even when the writer crashed — downstream automation reading it saw a
+    # healthy run with no review_composed.md. Record writer_failed explicitly
+    # and only list outputs that actually exist on disk.
+    outputs = [
+        "review_ledger.json",
+        "review_narrative.md",
+        "topic_fit.json",
+        "admission_rejections.json",
+        "run_metrics.json",
+    ]
+    if os.path.exists(str(runs_path("review_composed.md"))):
+        outputs.append("review_composed.md")
     write_run_manifest(
         "T2_LAYERED_GLOBAL",
         topic,
@@ -2390,13 +2408,9 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         extra={
             "admit_settings": admit_settings,
             "topic_fit": topic_fit,
-            "outputs": [
-                "review_ledger.json",
-                "review_narrative.md",
-                "topic_fit.json",
-                "admission_rejections.json",
-                "run_metrics.json",
-            ],
+            "writer_failed": bool(writer_error_msg),
+            "writer_error": writer_error_msg,
+            "outputs": outputs,
         },
     )
     metrics.save()

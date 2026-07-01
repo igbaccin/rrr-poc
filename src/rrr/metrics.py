@@ -3,11 +3,24 @@ from contextlib import contextmanager
 import datetime as _dt
 import json
 import os
+import re
 import threading
 import time
 
 from rrr.paths import runs_path
 from rrr.utils import ensure_dir
+
+
+# v15.14: never persist credential-looking env values into run artifacts —
+# run_metrics.json gets tarred, downloaded, and shared in replication
+# bundles, and the API runtime makes RRR_*-prefixed credentials plausible.
+_SENSITIVE_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASS|CREDENTIAL", re.IGNORECASE)
+
+
+def _redact_env_value(key: str, value):
+    if value and _SENSITIVE_ENV_RE.search(key or ""):
+        return "***redacted***"
+    return value
 
 
 class RunMetrics:
@@ -94,15 +107,18 @@ class RunMetrics:
             "llm_calls_by_stage": dict(llm_by_stage),
             "llm_calls": list(self.llm_calls),
             "env": {
-                k: os.environ.get(k)
+                k: _redact_env_value(k, os.environ.get(k))
                 for k in sorted(os.environ)
                 if k.startswith("RRR_") or k in {"OLLAMA_HOST", "OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS"}
             },
         }
 
     def save(self, path=None):
-        out_path = path or runs_path("run_metrics.json")
-        ensure_dir(os.path.dirname(str(out_path)))
-        with open(out_path, "w", encoding="utf-8") as f:
+        # v15.14: atomic write — a crash mid-save left truncated metrics.
+        out_path = str(path or runs_path("run_metrics.json"))
+        ensure_dir(os.path.dirname(out_path))
+        tmp = out_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
-        return str(out_path)
+        os.replace(tmp, out_path)
+        return out_path

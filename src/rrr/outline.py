@@ -67,10 +67,23 @@ _KEEP_ALIVE = "30m"
 #     - off-topic corpora wrote 1.4k-word hallucinated reviews because
 #       inclusive-clustering force-fit everything into clusters and
 #       unassigned_share never reached the refusal threshold
-_PRECHECK_PROMPT_VERSION = "2026-07-01-v15.11-precheck-lang-directive"
-_CLUSTER_PROMPT_VERSION = "2026-07-01-v15.11-cluster-lang-directive"
-_POSTURE_PROMPT_VERSION = "2026-07-01-v15.11-posture-lang-directive"
-_ORDER_PROMPT_VERSION = "2026-07-01-v15.11-order-lang-directive"
+# v15.14: bumped — (a) the v15.12 _language_prefix rewrite changed prompt
+# bytes without a version bump, so v15.11-keyed caches could serve stale
+# postures; (b) the signatures below now cover ALL prompt-shaping inputs
+# (corpus lang, topic_cause/outcome, shared_thread/cause, evidence), which
+# changes key layout.
+_PRECHECK_PROMPT_VERSION = "2026-07-02-v15.14-precheck"
+_CLUSTER_PROMPT_VERSION = "2026-07-02-v15.14-cluster"
+_POSTURE_PROMPT_VERSION = "2026-07-02-v15.14-posture"
+_ORDER_PROMPT_VERSION = "2026-07-02-v15.14-order"
+
+
+def _lang_sig() -> bytes:
+    """v15.14: corpus language participates in every stage prompt via
+    _language_prefix(), so it must participate in every cache key too —
+    otherwise switching RRR_CORPUS_LANG replays caches built under a
+    different prompt."""
+    return (os.environ.get("RRR_CORPUS_LANG", "en") or "en").encode("utf-8")
 
 # v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
 # context can be small. Cheap call.
@@ -114,13 +127,23 @@ _RELATIONS_BY_SHAPE: Dict[str, set] = {
 # runs/cache/outline/<stage>/<sig>.json. Keys are stable hashes; a prompt
 # version bump invalidates lookups without disk cleanup.
 
-def _sig_cluster(topic: str, doc_claims: List[Dict[str, str]]) -> str:
+def _sig_cluster(topic: str, doc_claims: List[Dict[str, str]],
+                 topic_shape: str = "", topic_outcome: str = "") -> str:
     h = hashlib.sha256()
     h.update(_CLUSTER_PROMPT_VERSION.encode())
     h.update(b"\x00")
     h.update((_MODEL or "").encode())
     h.update(b"\x00")
+    h.update(_lang_sig())
+    h.update(b"\x00")
     h.update((topic or "").encode("utf-8"))
+    # v15.14: shape + outcome condition the cluster prompt (pin lines) and
+    # were missing from the key — a re-run with a re-pinned Stage 0 silently
+    # replayed the old clustering.
+    h.update(b"\x04")
+    h.update((topic_shape or "").encode("utf-8"))
+    h.update(b"\x05")
+    h.update((topic_outcome or "").encode("utf-8"))
     # Order-independent over docs: sort by doc_id.
     for entry in sorted(doc_claims, key=lambda d: d.get("doc_id", "")):
         h.update(b"\x01")
@@ -131,20 +154,43 @@ def _sig_cluster(topic: str, doc_claims: List[Dict[str, str]]) -> str:
 
 
 def _sig_posture(topic: str, topic_shape: str, cluster_doc_ids: List[str],
-                 cluster_claims: List[str]) -> str:
+                 cluster_claims: List[str],
+                 topic_cause: str = "", topic_outcome: str = "",
+                 shared_thread: str = "", shared_cause: str = "",
+                 cluster_evidence: Dict[str, List[str]] = None) -> str:
     h = hashlib.sha256()
     h.update(_POSTURE_PROMPT_VERSION.encode())
     h.update(b"\x00")
     h.update((_MODEL or "").encode())
     h.update(b"\x00")
+    h.update(_lang_sig())
+    h.update(b"\x00")
     h.update((topic or "").encode("utf-8"))
     h.update(b"\x01")
     h.update((topic_shape or "").encode())
+    # v15.14: everything else the posture prompt renders now participates in
+    # the key. Previously a re-run where Stage 0 pinned different
+    # cause/outcome slots, or where evidence extraction changed, silently
+    # reused the old posture.
+    h.update(b"\x04")
+    h.update((topic_cause or "").encode("utf-8"))
+    h.update(b"\x05")
+    h.update((topic_outcome or "").encode("utf-8"))
+    h.update(b"\x06")
+    h.update((shared_thread or "").encode("utf-8"))
+    h.update(b"\x07")
+    h.update((shared_cause or "").encode("utf-8"))
     for did, claim in sorted(zip(cluster_doc_ids, cluster_claims), key=lambda p: p[0]):
         h.update(b"\x02")
         h.update(str(did).encode("utf-8"))
         h.update(b"\x03")
         h.update((claim or "").encode("utf-8"))
+    for did in sorted(cluster_evidence or {}):
+        h.update(b"\x08")
+        h.update(str(did).encode("utf-8"))
+        for snip in (cluster_evidence or {}).get(did) or []:
+            h.update(b"\x09")
+            h.update((snip or "").encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -154,6 +200,8 @@ def _sig_order(topic: str, cluster_summaries: List[Dict[str, str]]) -> str:
     h.update(b"\x00")
     h.update((_MODEL or "").encode())
     h.update(b"\x00")
+    h.update(_lang_sig())
+    h.update(b"\x00")
     h.update((topic or "").encode("utf-8"))
     for cs in sorted(cluster_summaries, key=lambda c: c.get("cluster_id", "")):
         h.update(b"\x01")
@@ -162,6 +210,9 @@ def _sig_order(topic: str, cluster_summaries: List[Dict[str, str]]) -> str:
         h.update((cs.get("relation") or "").encode())
         h.update(b"\x03")
         h.update((cs.get("elaboration") or "").encode("utf-8"))
+        # v15.14: shared_thread is rendered into the order prompt.
+        h.update(b"\x04")
+        h.update((cs.get("shared_thread") or "").encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -178,9 +229,14 @@ def _load_cache(stage: str, sig: str):
 
 
 def _save_cache(stage: str, sig: str, obj) -> None:
+    # v15.14: atomic — a crash mid-write left a truncated cache entry
+    # (self-healing on load, but pointlessly re-paying the LLM call).
     ensure_dir(str(runs_path("cache", "outline", stage)))
-    with open(_cache_path(stage, sig), "w", encoding="utf-8") as f:
+    path = _cache_path(stage, sig)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +251,8 @@ def _sig_precheck(topic: str, doc_titles: List[str]) -> str:
     h.update(_PRECHECK_PROMPT_VERSION.encode())
     h.update(b"\x00")
     h.update((_MODEL or "").encode())
+    h.update(b"\x00")
+    h.update(_lang_sig())
     h.update(b"\x00")
     h.update((topic or "").encode("utf-8"))
     for t in sorted(doc_titles):
@@ -585,7 +643,7 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
         return None
 
     valid_doc_ids = {d["doc_id"] for d in doc_claims}
-    sig = _sig_cluster(topic, doc_claims)
+    sig = _sig_cluster(topic, doc_claims, topic_shape=topic_shape, topic_outcome=topic_outcome)
     cached = _load_cache("cluster", sig)
     if cached and isinstance(cached, dict) and cached.get("clusters"):
         if metrics:
@@ -920,7 +978,13 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
     """
     doc_ids = list(cluster.get("doc_ids") or [])
     claims = [cluster.get("claims_by_doc", {}).get(d, "") for d in doc_ids]
-    sig = _sig_posture(topic, topic_shape, doc_ids, claims)
+    sig = _sig_posture(
+        topic, topic_shape, doc_ids, claims,
+        topic_cause=topic_cause, topic_outcome=topic_outcome,
+        shared_thread=(cluster.get("shared_thread") or ""),
+        shared_cause=(cluster.get("shared_cause") or ""),
+        cluster_evidence=cluster_evidence,
+    )
     cached = _load_cache("posture", sig)
     if cached and isinstance(cached, dict) and cached.get("relation"):
         if metrics:
@@ -1034,6 +1098,9 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
             posture["mechanism_grounding"] = f"promoted_{original}_to_upstream_via_conduit_check"
             if metrics:
                 metrics.inc("outline_posture_grounding_promotions")
+                # v15.14: this counter was initialised in build_outline but
+                # never incremented — batteries reading it always saw 0.
+                metrics.inc("outline_posture_conduit_promotions")
 
     posture["model"] = _MODEL
     posture["prompt_version"] = _POSTURE_PROMPT_VERSION

@@ -3,12 +3,23 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from rrr.paths import data_path, indices_path, repo_path, runs_path
 from rrr.utils import ensure_dir
+
+# v15.14: mirror of metrics._redact_env_value — the manifest's env snapshot
+# ships in the same downloaded artifacts.
+_SENSITIVE_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASS|CREDENTIAL", re.IGNORECASE)
+
+
+def _redact_env_value(key: str, value):
+    if value and _SENSITIVE_ENV_RE.search(key or ""):
+        return "***redacted***"
+    return value
 
 
 def _sha256_file(path: Path):
@@ -100,7 +111,7 @@ def _env_snapshot():
             "OLLAMA_MAX_LOADED_MODELS",
             "PYTHONPATH",
         }:
-            keep[key] = os.environ.get(key)
+            keep[key] = _redact_env_value(key, os.environ.get(key))
     return keep
 
 
@@ -140,7 +151,11 @@ def build_run_manifest(task: str, topic: str, meta_path, model: str, plan=None, 
 def write_run_manifest(task: str, topic: str, meta_path, model: str, plan=None, extra=None):
     ensure_dir(str(runs_path()))
     manifest = build_run_manifest(task, topic, meta_path, model, plan=plan, extra=extra)
-    path = runs_path("run_manifest.json")
-    with path.open("w", encoding="utf-8") as f:
+    # v15.14: atomic write — the manifest is the run's provenance record; a
+    # crash mid-write must not leave a truncated one that parses as absent.
+    path = str(runs_path("run_manifest.json"))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
     return manifest

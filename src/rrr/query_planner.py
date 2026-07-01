@@ -379,7 +379,12 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
                                response_chars=len(raw))
         return obj
     except Exception as e:
-        obj = _ensure_probes(topic, _heuristic_plan(topic))
+        # v15.14: honour cross_lang in the fallback too. The success path
+        # already skips inserting the raw topic as probe[0] when the topic
+        # language differs from the corpus (it tokenises to nothing against
+        # the BM25 index); the fallback used the default and re-inserted it.
+        obj = _ensure_probes(topic, _heuristic_plan(topic),
+                             insert_raw_topic=not cross_lang)
         obj["planner_meta"] = {
             "mode": "heuristic_fallback",
             "model": model,

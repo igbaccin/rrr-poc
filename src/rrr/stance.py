@@ -168,7 +168,10 @@ def extract_paper_claim(doc_id: str, metrics=None, *,
         if cp.is_file():
             try:
                 cached = json.loads(cp.read_text(encoding="utf-8"))
-                if isinstance(cached, dict) and cached.get("claim") is not None:
+                # v15.14: truthy check, not `is not None` — pre-fix cache
+                # files hold claim: "" (a cached FAILURE) and were served
+                # forever; empty claims should re-extract like any miss.
+                if isinstance(cached, dict) and str(cached.get("claim") or "").strip():
                     cached.setdefault("source", "cache")
                     cached.setdefault("duration_s", 0.0)
                     if metrics:

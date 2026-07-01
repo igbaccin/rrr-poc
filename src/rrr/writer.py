@@ -4,7 +4,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
-from rrr.utils import ensure_dir
+from rrr.utils import ensure_dir, env_int
 from rrr.paths import runs_path
 from rrr.render import (
     CITE_RE,
@@ -18,6 +18,13 @@ from rrr.render import (
     _collect_cited_docs as _shared_collect_cited_docs,
     _doc_id_to_author_label,
 )
+# v15.14: install the central ollama.chat shim here too (idempotent). The
+# reasoner installs it at pipeline entry, but the writer can also be driven
+# standalone (__main__ / compose_review from a script), in which case the
+# thinking-mode suppression, RRR_RUNTIME=api routing, and request timeout
+# would silently not apply without this call.
+from rrr.llm import install as _install_llm_shim
+_install_llm_shim()
 # v15.5: citation surface postproc (rewrite_canonical_to_display,
 # rewrite_misplaced_narrative_citations, collapse_nested_narrative_multicite,
 # fix_orphan_outer_paren_narrative, merge_redundant_inline_paren_citations)
@@ -196,7 +203,8 @@ _AUTHOR_VERB_RE = re.compile(
     r"finds|points out|underscores|argues that|notes that)\b",
     re.IGNORECASE,
 )
-_MIN_SECTION_CITED_DOCS = int(os.environ.get("RRR_WRITER_MIN_SECTION_CITED_DOCS", "2"))
+# v15.14: env_int — a malformed value here used to kill the module IMPORT.
+_MIN_SECTION_CITED_DOCS = env_int("RRR_WRITER_MIN_SECTION_CITED_DOCS", 2)
 # v13: RRR_WRITER_ENFORCE_COVERAGE retired (always on). Section-level coverage
 # enforcement is part of the corpus-grounding contract; disabling it is no
 # longer a supported configuration.
@@ -339,7 +347,7 @@ def _format_doc_entry(d) -> str:
         lines.append("  Mechanisms (legacy):")
         for m in mechanisms[:2]:
             lines.append(f"  - {_clip(m, n=180)}")
-    quotes_per_doc = int(os.environ.get("RRR_WRITER_QUOTES_PER_DOC", "2"))
+    quotes_per_doc = env_int("RRR_WRITER_QUOTES_PER_DOC", 2)
     qs = d.get("quotes") or []
     for q in qs[:max(1, quotes_per_doc)]:
         lines.append(f"  {_format_quote(q)}")
@@ -872,17 +880,35 @@ def _mechanical_dash_replace(text: str) -> tuple:
     # structure and never changes citation tokens.
     if not text:
         return text or "", 0
-    count = len(_TYPOGRAPHIC_DASH_RE.findall(text))
+    # v15.14: never touch a dash BETWEEN DIGITS. "1846–1873", "pp. 5–9" and
+    # similar numeric ranges are factual content in an economic-history
+    # corpus; replacing the dash with a comma ("1846, 1873") silently
+    # corrupts dates. Only gloss/pause dashes (non-numeric context) reduce
+    # to commas.
+    count = 0
+
+    def _dash_sub(m):
+        nonlocal count
+        s, e = m.start(), m.end()
+        prev_c = text[s - 1] if s > 0 else ""
+        next_c = text[e] if e < len(text) else ""
+        if prev_c.isdigit() and next_c.isdigit():
+            return m.group(0)
+        count += 1
+        return ","
+
+    cleaned = _TYPOGRAPHIC_DASH_RE.sub(_dash_sub, text)
     if count == 0:
         return text, 0
-    cleaned = _TYPOGRAPHIC_DASH_RE.sub(",", text)
     # The dash often sat between two words with no surrounding space ("word—word")
     # or with single spaces ("word — word"). Either way, ", " is the target.
     # Collapse "  ," and ",  " and ", ," that the naive substitution can create.
-    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    # v15.14: horizontal whitespace only — the old \s* forms could eat a
+    # newline after a line-final comma and silently join paragraphs.
+    cleaned = re.sub(r"[ \t]*,[ \t]*", ", ", cleaned)
     # Don't double up on existing punctuation: ", ," -> ",", ". ," -> ".",
-    cleaned = re.sub(r"([.,;:!?])\s*,", r"\1", cleaned)
-    cleaned = re.sub(r",\s*([.,;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([.,;:!?])[ \t]*,", r"\1", cleaned)
+    cleaned = re.sub(r",[ \t]*([.,;:!?])", r"\1", cleaned)
     return cleaned, count
 
 
@@ -901,19 +927,43 @@ def _mechanical_dash_replace(text: str) -> tuple:
 # whitespace/punctuation/comma. The fix is to insert ", " before the author
 # label, turning the citation into a proper narrative continuation.
 _MID_SENTENCE_NARRATIVE_CITE_RE = re.compile(
-    r"(?<=[a-z0-9])\s+"  # preceded by a lowercase content character + whitespace
+    r"\b([A-Za-z0-9][A-Za-z0-9\-]*)"  # preceding word (validated in repl)
+    r"(\s+)"
     r"((?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)\s+[A-Z][A-Za-z&.\-]+)"
     r"(?:\s+and\s+(?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)\s+[A-Z][A-Za-z&.\-]+))?"
     r"(?:\s+et\s+al\.?)?)"
-    r"\s+\((\d{4})\s*,\s*p\.(\d+)\)"
+    r"(\s+\((\d{4})\s*,\s*p\.(\d+)\))"
 )
+
+# v15.14: closed-class function words that legitimately precede a narrative
+# citation WITHOUT a comma. Two corruption classes the v13 pass manufactured:
+#   1. connectives/particles — "North and Weingast (1989)" became
+#      "North and, Weingast (1989)" (FIX-A then repaired a subset);
+#   2. prepositions — "the work of Ogilvie (2007)" became
+#      "the work of, Ogilvie (2007)" with NO repairing pass.
+# The comma insertion is only correct after a CONTENT word ("…extractive
+# controls Akyeampong and Fofack (2014)"), so anything in this set skips.
+_NARRATIVE_CITE_PRECEDING_EXCLUDE = {
+    "and", "with", "or", "nor", "van", "von", "de", "del", "der", "den",
+    "of", "by", "in", "on", "to", "at", "as", "from", "for", "per", "than",
+    "like", "unlike", "between", "among", "against", "versus", "vs",
+    "following", "after", "before", "within", "across", "alongside",
+    "around", "beyond", "under", "over", "through", "toward", "towards",
+    "upon", "via", "see", "cf", "eg", "including", "include", "includes",
+    "notably", "particularly", "especially", "both", "either", "neither",
+    "whereas", "while", "that", "which", "because", "since", "although",
+    "though", "if", "when", "where", "but", "yet", "so", "then", "also",
+}
 
 
 def _fix_mid_sentence_narrative_cites(text: str) -> tuple:
-    """v13: insert a comma before narrative citations that sit mid-sentence
-    without preceding punctuation. Returns (text, count). Conservative — only
-    fires when the prior character is a lowercase letter or digit; never edits
-    a citation that already sits after a sentence boundary or comma.
+    """v13 (rewritten v15.14): insert a comma before narrative citations that
+    sit mid-sentence without preceding punctuation. Returns (text, count).
+    Conservative — fires only when the preceding word ends in a lowercase
+    letter or digit AND is not a closed-class function word (connective,
+    particle, preposition). The v13 version keyed on the single preceding
+    character, so it fired on the "and"/"of" inside multi-author labels and
+    prepositional attachments, corrupting them with a stray comma.
     """
     if not text:
         return text or "", 0
@@ -921,11 +971,14 @@ def _fix_mid_sentence_narrative_cites(text: str) -> tuple:
 
     def repl(m):
         nonlocal count
+        prev = m.group(1)
+        last = prev[-1]
+        if not (last.islower() or last.isdigit()):
+            return m.group(0)
+        if prev.lower() in _NARRATIVE_CITE_PRECEDING_EXCLUDE:
+            return m.group(0)
         count += 1
-        author = m.group(1)
-        year = m.group(2)
-        page = m.group(3)
-        return f", {author} ({year}, p.{page})"
+        return f"{prev},{m.group(2)}{m.group(3)}{m.group(4)}"
 
     cleaned = _MID_SENTENCE_NARRATIVE_CITE_RE.sub(repl, text)
     return cleaned, count
@@ -1717,29 +1770,42 @@ def _strip_continuation_markers(text: str) -> str:
     return text.strip()
 
 
-def _strip_conclusion(text: str) -> str:
-    # Remove conclusion paragraphs.
-    patterns = [
-        r'\n\s*In conclusion[,.].*$',
-        r'\n\s*To conclude[,.].*$',
-        r'\n\s*In summary[,.].*$',
-    ]
+def _strip_tail_after(text: str, patterns, min_frac: float = 0.6) -> str:
+    """v15.14: shared tail-stripper for conclusion/references removal.
+
+    The old passes used DOTALL '.*$' with no position guard, so a single
+    mid-essay "In summary," paragraph or an inline "References:" line
+    deleted EVERYTHING after it — up to half the essay. Guard: only strip
+    when the matched marker begins in the final (1 - min_frac) of the text,
+    where a genuine closing/bibliography actually lives. Earlier matches
+    are left alone (the meta-commentary and zero-cite passes still police
+    mid-essay filler on their own terms).
+    """
     for pattern in patterns:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        for m in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+            if m.start() >= len(text) * min_frac:
+                text = text[:m.start()]
+                break
     return text.strip()
 
 
+def _strip_conclusion(text: str) -> str:
+    # Remove conclusion paragraphs (tail-guarded since v15.14).
+    return _strip_tail_after(text, [
+        r'\n\s*In conclusion[,.].*$',
+        r'\n\s*To conclude[,.].*$',
+        r'\n\s*In summary[,.].*$',
+    ])
+
+
 def _strip_references_section(text: str) -> str:
-    # Remove formal References/Bibliography sections.
-    patterns = [
+    # Remove formal References/Bibliography sections (tail-guarded since v15.14).
+    return _strip_tail_after(text, [
         r'\n\s*References\s*:?\s*\n.*$',
         r'\n\s*Bibliography\s*:?\s*\n.*$',
         r'\n\s*Works Cited\s*:?\s*\n.*$',
         r'\n\s*\(References:.*?\).*$',
-    ]
-    for pattern in patterns:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
-    return text.strip()
+    ])
 
 
 def _count_words(text: str) -> int:
@@ -1820,9 +1886,16 @@ def _audit_section_coverage(text: str, chunk_docs, section_kind: str):
 _COVERAGE_PATCH_SENTINEL = "[[COV-PATCH]] "
 
 
-def _append_coverage_fallback(text: str, chunk_docs, required_docs: int, allowed_pairs=None) -> tuple:
+def _append_coverage_fallback(text: str, chunk_docs, required_docs: int,
+                              allowed_pairs=None, display_lookup=None) -> tuple:
+    # v15.14: accept display_lookup. Without it, the post-rendered text's
+    # display-form cites resolved to doc_id=None and were invisible here —
+    # the fallback believed nothing was cited and injected patch sentences
+    # for docs the section already cites (the v15.6 over-injection mode).
     allowed_pairs = set(allowed_pairs or [])
-    cited = _strict_cited_doc_ids(text, allowed_pairs=allowed_pairs)
+    cited = _strict_cited_doc_ids(
+        text, allowed_pairs=allowed_pairs, display_lookup=display_lookup,
+    )
     if len(cited) >= required_docs:
         return text, 0
 
@@ -3134,7 +3207,8 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         "follow a scope condition — rather than re-introducing the topic.",
         "",
         "STRICT RULES:",
-        "- Keep every (Doc_Year: p.N) citation token UNCHANGED.",
+        "- Keep every citation token — 'Author (Year, p.N)', '(Author Year, p.N)', "
+        "'(Doc_Year: p.N)' or '[E####]' — exactly UNCHANGED, character for character.",
         "- Do NOT add or remove any citation.",
         "- Do NOT exceed the original block length by more than ~20%.",
         f"- Return ONLY a single JSON object whose 'rewritten' field is the "
@@ -3194,7 +3268,22 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     skipped_tail_echo = 0
     interior_set = set(interior_indices)
     prev_tail_by_index = {e["index"]: e["prev_tail"] for e in extracts}
-    cite_token_re = re.compile(r"\([A-Za-z0-9_&.\-]+:\s*p\.\d+\)")
+
+    # v15.14: the drift check was canonical-only ('(Doc_Year: p.N)'), but
+    # post-v15.5 chunks reach the stitch ALREADY RENDERED to display form —
+    # both sides matched zero tokens and the guard passed vacuously, letting
+    # the stitch LLM drop or invent citations undetected. Fingerprint across
+    # all three surfaces via parse_citations, plus any unrendered [E####]
+    # markers, and require an exact multiset match.
+    _eid_token_re = re.compile(r"\[E\d{4,5}\]")
+
+    def _cite_fingerprints(block: str):
+        fps = []
+        for c in parse_citations(block or ""):
+            label = (c.get("label") or c.get("doc_id") or "").strip().lower()
+            fps.append((label, str(c.get("year") or ""), int(c.get("page") or 0)))
+        fps.extend(("__eid__", t, 0) for t in _eid_token_re.findall(block or ""))
+        return sorted(fps)
 
     # v11.1: topic-paraphrase guard. Compute the topic's content-token set once,
     # then reject any stitch rewrite that pulls back to a near-restatement of
@@ -3243,8 +3332,8 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         n_open = opener_sent_count_by_index.get(idx, 1)
         n_open = min(n_open, len(sents))
         orig_opener_block = " ".join(s.strip() for s in sents[:n_open])
-        orig_cites = sorted(cite_token_re.findall(orig_opener_block))
-        new_cites = sorted(cite_token_re.findall(rewritten))
+        orig_cites = _cite_fingerprints(orig_opener_block)
+        new_cites = _cite_fingerprints(rewritten)
         if orig_cites != new_cites:
             skipped_citation += 1
             continue
@@ -3638,12 +3727,16 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # v8 (R11): try the deterministic fallback FIRST — it's free, uses the
         # same allowed-pairs provenance as the LLM retry would, and resolves
         # the small-shortfall case (which dominates) without a ~2s LLM call.
-        chunk_allowed_pairs, _, _ = _build_allowed_citations(chunk_docs)
+        chunk_allowed_pairs, chunk_allowed_doc_ids, _ = _build_allowed_citations(chunk_docs)
+        # v15.14: display_lookup so the fallback sees the rendered display
+        # cites (same fix as _audit_section_coverage got in v15.7).
+        chunk_fallback_dl = _build_display_lookup(chunk_allowed_doc_ids)
         chunk, fallback_count = _append_coverage_fallback(
             chunk,
             chunk_docs,
             audit["required_cited_docs"],
             allowed_pairs=chunk_allowed_pairs,
+            display_lookup=chunk_fallback_dl,
         )
         if fallback_count:
             total_coverage_fallbacks += fallback_count
@@ -3674,6 +3767,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
                 chunk_docs,
                 audit["required_cited_docs"],
                 allowed_pairs=chunk_allowed_pairs,
+                display_lookup=chunk_fallback_dl,
             )
             if fallback_count2:
                 total_coverage_fallbacks += fallback_count2
@@ -3919,6 +4013,17 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             chunks = _apply_cross_section_stitch(chunks, topic, metrics=metrics)
     else:
         chunks = _apply_cross_section_stitch(chunks, topic, metrics=None)
+
+    # v15.14: refuse to ship an empty essay. Previously, if every section
+    # generation failed (opening, all streams, closing), chunks == [] and an
+    # EMPTY review_composed.md was written with exit code 0 — downstream
+    # automation read that as a healthy run. Raising here lets the reasoner's
+    # writer-error path record the failure honestly.
+    if not chunks or not any((c or "").strip() for c in chunks):
+        raise RuntimeError(
+            "writer produced no usable sections (all chunk generations failed); "
+            "refusing to write an empty review_composed.md"
+        )
 
     # Final assembly
     full_text = "\n\n".join(chunks)
