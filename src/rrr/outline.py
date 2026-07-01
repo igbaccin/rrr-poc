@@ -1426,23 +1426,34 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
 
 
 def _parse_and_validate(raw: str, validate_fn):
-    """Tolerant JSON parsing: find the first {...} block, parse it, run the
-    validator. Returns whatever the validator returns, or None on any error.
+    """Tolerant JSON parsing: extract the first complete JSON object, parse
+    it, run the validator. Returns whatever the validator returns, or None on
+    any error.
+
+    v15.13: uses the bracket-matching extractor (utils.extract_first_json) so
+    verbose models that emit prose after the object — qwen3:30b-a3b, or a
+    frontier API model appending an explanation — no longer break parsing.
+    Falls back to the old first-{ / last-} slice + trailing-comma repair when
+    the strict extractor finds nothing (handles the trailing-comma case the
+    strict json.loads would reject).
     """
     if not raw:
         return None
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    payload = raw[start:end + 1]
-    # Strip trailing commas that the model sometimes emits.
-    payload = re.sub(r",\s*}", "}", payload)
-    payload = re.sub(r",\s*]", "]", payload)
-    try:
-        obj = json.loads(payload)
-    except Exception:
-        return None
+    from rrr.utils import extract_first_json
+    obj = extract_first_json(raw)
+    if obj is None:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        payload = raw[start:end + 1]
+        # Strip trailing commas that the model sometimes emits.
+        payload = re.sub(r",\s*}", "}", payload)
+        payload = re.sub(r",\s*]", "]", payload)
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return None
     try:
         return validate_fn(obj)
     except Exception:

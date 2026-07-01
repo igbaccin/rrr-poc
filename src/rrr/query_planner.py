@@ -316,7 +316,12 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
             stream=False,
         )
         raw = res["message"]["content"].strip()
-        obj = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+        # v15.13: robust extraction tolerates verbose models (qwen3:30b-a3b,
+        # frontier API models) that wrap the object in prose or fences.
+        from rrr.utils import extract_first_json
+        obj = extract_first_json(raw)
+        if obj is None:
+            raise ValueError("no JSON object in planner response")
 
         for k in ("keywords_must", "keywords_any", "exclude", "probes"):
             if k not in obj or not isinstance(obj[k], list):
