@@ -1262,6 +1262,24 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
     metrics.set("metadata_path", str(meta_path))
     metrics.set("docs_total", len(all_doc_ids))
 
+    # v15.9 (#5): corpus_fingerprint namespaces the claim cache; content_sha1
+    # (per paper) becomes the primary cache key when populated by the ingest
+    # cascade. Existing metadata.csv without those columns falls back to
+    # doc_id keying (legacy flat cache is still readable via fallback path
+    # in stance._claim_cache_path).
+    from rrr.stance import compute_corpus_fingerprint
+    corpus_fingerprint = compute_corpus_fingerprint(df)
+    metrics.set("corpus_fingerprint", corpus_fingerprint)
+    if "content_sha1" in df.columns:
+        _content_sha_by_docid = {
+            str(r["doc_id"]): str(r["content_sha1"]).strip()
+            for _, r in df.iterrows()
+            if str(r.get("content_sha1", "")).strip()
+        }
+    else:
+        _content_sha_by_docid = {}
+    metrics.set("content_sha1_populated", len(_content_sha_by_docid))
+
     ensure_dir(str(runs_path()))
     ensure_dir(str(runs_path("layered_docs")))
 
@@ -1474,7 +1492,14 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         # the outline.cluster_papers call has accurate inputs.
         did = doc["doc_id"]
         from rrr.stance import extract_paper_claim
-        claim_info = extract_paper_claim(did, metrics=metrics)
+        # v15.9 (#5): pass corpus_fingerprint + content_sha1 (when populated)
+        # so this per-paper cache entry lands in the corpus-namespaced dir
+        # keyed by PDF content, not by doc_id string.
+        claim_info = extract_paper_claim(
+            did, metrics=metrics,
+            corpus_fingerprint=corpus_fingerprint,
+            content_sha1=_content_sha_by_docid.get(did) or None,
+        )
         paper_claim = claim_info.get("claim", "")
         metrics.inc("docs_kept")
         enriched = dict(doc)

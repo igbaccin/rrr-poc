@@ -63,20 +63,33 @@ def _get_conclusion(doc_id: str, max_chars: int = 1500) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
-def _claim_cache_path(doc_id: str, sig: str):
-    """Return Path to <claim_cache_root>/<doc_id>_<sig>.json.
+def _claim_cache_path(paper_key: str, sig: str, corpus_fingerprint: str = None):
+    """Return Path to the claim-cache entry for this paper.
 
-    v15.0.2: claims now live OUTSIDE runs/ so the per-topic smoke harness
-    cannot evict them between runs. Defaults to <repo>/claim_cache; pod
-    sessions should set RRR_CLAIM_CACHE_DIR=/workspace/claim_cache so the
-    cache also survives across pod restarts. The cache key already
-    composes (model + prompt_version + abstract + conclusion), so a new
-    batch of papers transparently produces new entries and stale entries
-    never serve fresh queries.
+    v15.9 (#5): key by content_sha1 when available, doc_id as fallback,
+    and namespace by corpus_fingerprint. Two corpora with a shared doc_id
+    ('Ogilvie_2007' in Corpus A and 'Ogilvie_2007' in Corpus B, DIFFERENT
+    papers) no longer poison each other's cache. Same PDF ingested in two
+    corpora hits the shared entry (via content_sha1) without duplicating
+    work.
+
+    Layout:
+      <root>/                         (legacy, flat — read-only fallback)
+      <root>/<corpus_fp>/             (v15.9 primary; corpus_fp is 16 hex)
+
+    File name is `<paper_key>_<sig>.json` in both layouts. Legacy entries
+    remain readable via the fall-through in extract_paper_claim.
+
+    v15.0.2 rationale still applies: cache lives OUTSIDE runs/ so the per-
+    topic smoke harness cannot evict it; RRR_CLAIM_CACHE_DIR points at a
+    persistent volume on pods.
     """
-    cache_dir = claim_cache_path()
+    if corpus_fingerprint:
+        cache_dir = claim_cache_path(corpus_fingerprint)
+    else:
+        cache_dir = claim_cache_path()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{doc_id}_{sig}.json"
+    return cache_dir / f"{paper_key}_{sig}.json"
 
 
 def _claim_sig(doc_id: str, abstract: str, conclusion: str, model: str) -> str:
@@ -91,7 +104,34 @@ def _claim_sig(doc_id: str, abstract: str, conclusion: str, model: str) -> str:
     return h.hexdigest()[:12]
 
 
-def extract_paper_claim(doc_id: str, metrics=None) -> dict:
+def compute_corpus_fingerprint(df) -> str:
+    """v15.9 (#5): stable fingerprint of a metadata.csv DataFrame used to
+    namespace the claim cache. Prefers content_sha1 (when populated by the
+    ingest cascade) so identical PDFs across corpora share fingerprint
+    components; falls back to sorted doc_id list when content_sha1 is
+    missing (existing 50-paper hand-curated corpus). Returns 16 hex chars.
+    """
+    h = hashlib.sha256()
+    h.update(b"rrr-corpus-fp-v1\x00")
+    keys: list = []
+    if df is not None and "content_sha1" in df.columns:
+        col = df["content_sha1"].fillna("").astype(str)
+        vals = [v for v in col.tolist() if v]
+        if vals:
+            keys = sorted(vals)
+            h.update(b"via=content_sha1\x00")
+    if not keys and df is not None and "doc_id" in df.columns:
+        keys = sorted(str(x) for x in df["doc_id"].fillna("").astype(str).tolist() if x)
+        h.update(b"via=doc_id\x00")
+    for k in keys:
+        h.update(k.encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def extract_paper_claim(doc_id: str, metrics=None, *,
+                         corpus_fingerprint: str = None,
+                         content_sha1: str = None) -> dict:
     """v14.4 Shape B: extract the paper's central claim from its abstract +
     conclusion using one cheap LLM call. Cached PER PAPER (not per topic) so
     a corpus is processed once across all topics — ~50 calls × ~5s = ~4 min
@@ -112,18 +152,31 @@ def extract_paper_claim(doc_id: str, metrics=None) -> dict:
         return {"claim": "", "source": "no_text", "duration_s": 0.0}
 
     sig = _claim_sig(doc_id, abstract, conclusion, _MODEL)
-    cache_path = _claim_cache_path(doc_id, sig)
-    if cache_path.is_file():
-        try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(cached, dict) and cached.get("claim") is not None:
-                cached.setdefault("source", "cache")
-                cached.setdefault("duration_s", 0.0)
-                if metrics:
-                    metrics.cache_event("paper_claim", "hits")
-                return cached
-        except Exception:
-            pass  # corrupt cache; fall through and recompute
+    # v15.9 (#5): try three cache locations in priority order:
+    #   1. namespaced content_sha1: <root>/<corpus_fp>/<content_sha1>_<sig>.json
+    #   2. namespaced doc_id:      <root>/<corpus_fp>/<doc_id>_<sig>.json
+    #   3. legacy flat doc_id:     <root>/<doc_id>_<sig>.json
+    # First hit wins. Writes always go to the primary (namespaced,
+    # content_sha1-preferred) so new entries land in the v15.9 layout.
+    paper_key = content_sha1 or doc_id
+    primary_path = _claim_cache_path(paper_key, sig, corpus_fingerprint=corpus_fingerprint)
+    fallback_paths = []
+    if content_sha1 and doc_id != content_sha1:
+        fallback_paths.append(_claim_cache_path(doc_id, sig, corpus_fingerprint=corpus_fingerprint))
+    fallback_paths.append(_claim_cache_path(doc_id, sig, corpus_fingerprint=None))
+    for cp in [primary_path, *fallback_paths]:
+        if cp.is_file():
+            try:
+                cached = json.loads(cp.read_text(encoding="utf-8"))
+                if isinstance(cached, dict) and cached.get("claim") is not None:
+                    cached.setdefault("source", "cache")
+                    cached.setdefault("duration_s", 0.0)
+                    if metrics:
+                        metrics.cache_event("paper_claim", "hits")
+                    return cached
+            except Exception:
+                pass  # corrupt cache entry; try the next fallback
+    cache_path = primary_path  # writes below always go here
 
     if metrics:
         metrics.cache_event("paper_claim", "misses")
