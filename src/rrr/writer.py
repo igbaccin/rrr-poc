@@ -222,15 +222,23 @@ def _writer_system_prompt() -> str:
     tl = language_name(topic_lang)
     cl = language_name(corpus_lang)
     contract = (
-        f"OUTPUT LANGUAGE — READ FIRST. Write the ENTIRE review in {tl}. "
-        f"The source evidence, quotes, cluster syntheses, and section notes "
-        f"below are in {cl}; you must READ them in {cl} but WRITE every "
-        f"sentence of your output in {tl}. Do NOT copy {cl} sentences "
-        f"verbatim into the review — translate the meaning and express it in "
-        f"{tl}. Do NOT switch languages mid-review; do NOT emit any {cl} "
-        f"paragraphs. The ONLY {cl} tokens allowed in your output are author "
-        f"surnames and publication years inside citation markers (e.g. "
-        f"[E0001]); everything else is {tl}."
+        f"OUTPUT LANGUAGE — READ FIRST. The source evidence, cluster "
+        f"syntheses, and section notes below are in {cl}. Write the review "
+        f"in {tl}, with this rule:\n"
+        f"  - YOUR OWN WORDS — all narration, analysis, synthesis, topic "
+        f"sentences, transitions, everything that is not a quotation — MUST "
+        f"be in {tl}. Do NOT copy {cl} sentences from the evidence into your "
+        f"prose as if they were your narration; read the {cl} evidence, "
+        f"understand it, and express the point in {tl}.\n"
+        f"  - VERBATIM QUOTATIONS may stay in {cl}. A verbatim quote is "
+        f"scholarly evidence and keeps its ORIGINAL language — do NOT "
+        f"translate a quote. But it MUST be a genuine short excerpt "
+        f"(<=12 words) inside quotation marks (\" \") followed by its "
+        f"[E####] citation. Anything in {cl} that is NOT inside quotation "
+        f"marks is a mistake — rewrite it in {tl}.\n"
+        f"  - Author surnames and years inside citation markers stay as-is.\n"
+        f"Net: a reader sees {tl} prose throughout, with occasional clearly-"
+        f"marked {cl} quotations. No unquoted {cl} sentences anywhere."
     )
     return f"{contract}\n\n{_SYSTEM_CITATION_INSTRUCTION}"
 
