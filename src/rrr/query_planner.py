@@ -149,7 +149,26 @@ def _reformulate_topic(topic: str, model: str, metrics=None):
     start = time.perf_counter()
     try:
         import ollama
+        import os
+        # v15.11: reformulation MUST preserve the input's language. Without
+        # this, the writer (which consumes topic_question, not topic_display)
+        # generates prose in whatever language the reformulation drifted to
+        # — nearly always English on mistral. Explicit language directive
+        # + explicit "same language" clause in the prompt fixes this.
+        from rrr.language import language_directive
+        topic_lang = os.environ.get("RRR_TOPIC_LANG", "en")
+        _lang_directive = language_directive(topic_lang)
+        _lang_pfx = f"{_lang_directive}\n\n" if _lang_directive else ""
+        _same_lang_clause = (
+            "3. CRITICAL: the topic_question and every topic_dimensions "
+            "entry MUST be written in the SAME LANGUAGE as the user's "
+            "topic above. Do NOT translate to English. If the user wrote "
+            "French, respond in French; Spanish → Spanish; Chinese → "
+            "Chinese; etc.\n\n"
+            if topic_lang != "en" else ""
+        )
         prompt = (
+            _lang_pfx +
             "Read the user's research topic. Produce a normalised internal "
             "version that the literature-review writer will use as its frame.\n\n"
             "Goals:\n"
@@ -161,7 +180,9 @@ def _reformulate_topic(topic: str, model: str, metrics=None):
             "in shaping Y?' (fill in the implicit verb).\n"
             "2. Name 3-5 dimensions of disagreement the literature would have "
             "around this question (e.g. mechanism, scope conditions, "
-            "measurement, period, region).\n\n"
+            "measurement, period, region).\n"
+            + _same_lang_clause +
+            "\n"
             "Topic from user:\n" + topic + "\n\n"
             "Return ONLY a JSON object with two keys:\n"
             "  topic_question: a single sentence ending with '?'\n"
