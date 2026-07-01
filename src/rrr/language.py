@@ -154,13 +154,23 @@ def _list_ollama_models() -> Optional[set]:
     except Exception:
         return None
     names = set()
-    # ollama.list() shape varies by client version: {"models":[{"name":...}]}
-    # or {"models":[{"model":...}]}.
-    models = raw.get("models", []) if isinstance(raw, dict) else []
+    # ollama.list() shape varies by client version:
+    #   old (dict):    {"models": [{"name": "mistral:latest"}, ...]}
+    #   new (pydantic): ListResponse(models=[Model(model="mistral:latest"), ...])
+    # Handle both. Individual model entries can be dicts OR pydantic Models
+    # (Model.get(field) works via pydantic-compat, but attribute access is
+    # the more portable path).
+    if isinstance(raw, dict):
+        models = raw.get("models", []) or []
+    else:
+        models = getattr(raw, "models", None) or []
     for m in models:
-        if not isinstance(m, dict):
-            continue
-        name = m.get("name") or m.get("model") or ""
+        if isinstance(m, dict):
+            name = m.get("name") or m.get("model") or ""
+        else:
+            name = (getattr(m, "model", None)
+                    or getattr(m, "name", None)
+                    or "")
         if name:
             names.add(name)
     return names
