@@ -1,4 +1,4 @@
-import argparse, os, re, sys
+import argparse, json, os, re, sys
 import pandas as pd
 
 
@@ -103,6 +103,108 @@ def t1(args, meta_path):
     layered_t2(args, meta_path)
 
 
+def ingest_main(argv):
+    """v16: `rrr ingest` — the confidence-gated front door for arbitrary-
+    filename corpora (wires src/rrr/ingest.py into the main path; it was
+    previously eval-only).
+
+    Gate contract (per revision_notes design): every metadata field carries
+    a recorded source; rows that are LOW confidence, FAILED, or purely
+    LLM-inferred without external corroboration do NOT enter the canonical
+    metadata.csv. They are written to <output>.pending.csv for human review
+    and the command exits 3 until the user either hand-edits them in or
+    reruns with --accept-low-confidence (an explicit, logged choice).
+    """
+    ap = argparse.ArgumentParser(
+        prog="rrr ingest",
+        description="Build metadata.csv from a folder of PDFs (arbitrary "
+                    "filenames) via the confidence-gated ingest cascade.")
+    ap.add_argument("--corpus", required=True, help="Folder of PDFs")
+    ap.add_argument("--output", default="metadata.csv")
+    ap.add_argument("--bib", default=None, help="Optional BibTeX sidecar")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="Disable the LLM-extraction rung of the cascade")
+    ap.add_argument("--no-crossref", action="store_true")
+    ap.add_argument("--no-openalex", action="store_true")
+    ap.add_argument("--accept-low-confidence", action="store_true",
+                    help="Explicitly admit pending rows into metadata.csv "
+                         "(recorded in the ingest report)")
+    ap.add_argument("--report", default=None,
+                    help="Ingest report path (default: <output dir>/ingest_report.json)")
+    args = ap.parse_args(argv)
+
+    from pathlib import Path
+    from rrr.ingest import ingest_corpus, _write_metadata_csv
+
+    corpus_dir = Path(args.corpus)
+    if not corpus_dir.is_dir():
+        sys.stderr.write(f"[ingest] corpus folder not found: {corpus_dir}\n")
+        raise SystemExit(2)
+    out_path = Path(args.output)
+    report_path = Path(args.report) if args.report else (
+        out_path.parent / "ingest_report.json")
+
+    results = ingest_corpus(
+        corpus_dir,
+        output_csv=None,  # gate BEFORE anything reaches the canonical file
+        sidecar_bib=Path(args.bib) if args.bib else None,
+        use_llm=not args.no_llm,
+        use_crossref=not args.no_crossref,
+        use_openalex=not args.no_openalex,
+    )
+
+    def _needs_review(m):
+        if m.confidence in ("low", "failed"):
+            return True
+        # Purely LLM-inferred with no external corroboration requires human
+        # approval regardless of the model's own confidence.
+        return m.source == "llm_extraction"
+
+    approved = [m for m in results if not _needs_review(m)]
+    pending = [m for m in results if _needs_review(m)]
+
+    report = {
+        "corpus": str(corpus_dir),
+        "n_pdfs": len(results),
+        "n_approved": len(approved),
+        "n_pending": len(pending),
+        "accept_low_confidence": bool(args.accept_low_confidence),
+        "rows": [
+            {"doc_id": m.doc_id, "pdf": m.pdf_path, "title": m.title,
+             "authors": m.authors_short, "year": m.year,
+             "confidence": m.confidence, "source": m.source,
+             "lang": m.lang, "notes": m.notes,
+             "status": ("approved" if m in approved else
+                        "accepted_by_flag" if args.accept_low_confidence else
+                        "pending_review")}
+            for m in results
+        ],
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    if pending and not args.accept_low_confidence:
+        _write_metadata_csv(approved, out_path)
+        pending_path = out_path.with_suffix(".pending.csv")
+        _write_metadata_csv(pending, pending_path)
+        print(f"[ingest] {len(approved)} rows -> {out_path}")
+        print(f"[ingest] {len(pending)} rows NEED REVIEW -> {pending_path}")
+        for m in pending:
+            print(f"  REVIEW: {m.pdf_path}  confidence={m.confidence} "
+                  f"source={m.source}  ({m.notes or 'no notes'})")
+        print("[ingest] Inspect the pending rows, then either hand-correct "
+              "them into metadata.csv or rerun with --accept-low-confidence.")
+        print(f"[ingest] report: {report_path}")
+        raise SystemExit(3)
+
+    _write_metadata_csv(results, out_path)
+    print(f"[ingest] {len(results)} rows -> {out_path} "
+          f"({len(pending)} admitted via --accept-low-confidence)" if pending
+          else f"[ingest] {len(results)} rows -> {out_path}")
+    print(f"[ingest] report: {report_path}")
+
+
 def main():
     # v15.12: force UTF-8 on stdout/stderr so multilingual output (accented
     # Latin, CJK, Arabic, Cyrillic) prints correctly regardless of the host
@@ -114,6 +216,12 @@ def main():
             _stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
+
+    # v16: `rrr ingest` has its own argument contract; dispatch before the
+    # t1/t2 parser (whose --metadata/--topic are required) sees the argv.
+    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
+        ingest_main(sys.argv[2:])
+        return
 
     ap = argparse.ArgumentParser(
         description="RRR CLI. `t2` runs the full literature-review pipeline; "
