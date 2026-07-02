@@ -11,7 +11,7 @@ _install_llm_shim()
 from rrr.outline import build_outline
 from rrr.metrics import RunMetrics
 from rrr.manifest import write_run_manifest
-from rrr.paths import runs_path, logs_path
+from rrr.paths import runs_path, logs_path, stage_cache_path, stage_cache_enabled
 from rrr.text import tokenize
 from rapidfuzz import fuzz
 
@@ -246,7 +246,7 @@ def _mechanism_signature(topic: str, quotes, model: str = _MODEL, prompt_version
     return h.hexdigest()[:16]
 
 def _mechanism_cache_path(doc_id: str, sig: str) -> str:
-    return str(runs_path("cache", "mechanisms", f"{doc_id}_{sig}.json"))
+    return str(stage_cache_path("mechanisms", f"{doc_id}_{sig}.json"))
 
 def _load_mechanism_cache(doc_id: str, sig: str):
     try:
@@ -256,7 +256,7 @@ def _load_mechanism_cache(doc_id: str, sig: str):
         return None
 
 def _save_mechanism_cache(doc_id: str, sig: str, obj):
-    ensure_dir(str(runs_path("cache", "mechanisms")))
+    ensure_dir(str(stage_cache_path("mechanisms")))
     with open(_mechanism_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
@@ -283,7 +283,7 @@ def _fused_signature(topic: str, quotes, model: str = _MODEL,
 
 
 def _fused_cache_path(doc_id: str, sig: str) -> str:
-    return str(runs_path("cache", "fused", f"{doc_id}_{sig}.json"))
+    return str(stage_cache_path("fused", f"{doc_id}_{sig}.json"))
 
 
 def _load_fused_cache(doc_id: str, sig: str):
@@ -295,7 +295,7 @@ def _load_fused_cache(doc_id: str, sig: str):
 
 
 def _save_fused_cache(doc_id: str, sig: str, obj):
-    ensure_dir(str(runs_path("cache", "fused")))
+    ensure_dir(str(stage_cache_path("fused")))
     with open(_fused_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
@@ -491,7 +491,7 @@ def _cluster_synth_signature(topic: str, stance: str, cluster_label: str,
 
 
 def _cluster_synth_cache_path(sig: str) -> str:
-    return str(runs_path("cache", "cluster_synth", f"{sig}.json"))
+    return str(stage_cache_path("cluster_synth", f"{sig}.json"))
 
 
 def _load_cluster_synth_cache(sig: str):
@@ -503,7 +503,7 @@ def _load_cluster_synth_cache(sig: str):
 
 
 def _save_cluster_synth_cache(sig: str, obj):
-    ensure_dir(str(runs_path("cache", "cluster_synth")))
+    ensure_dir(str(stage_cache_path("cluster_synth")))
     with open(_cluster_synth_cache_path(sig), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
@@ -989,7 +989,9 @@ def _doc_admit_signature(topic: str, probes: list, doc_ids: list, settings: dict
 
 
 def _doc_admit_cache_path(sig: str):
-    return runs_path("cache", "doc_admit", f"{sig}.json")
+    # v15.16: workspace-level (was runs_path("cache", ...) — per-run
+    # under the v15.9 minted-run-id layout, so replay never worked).
+    return stage_cache_path("doc_admit", f"{sig}.json")
 
 
 def _load_doc_admit_cache(sig: str):
@@ -1001,6 +1003,8 @@ def _load_doc_admit_cache(sig: str):
 
 
 def _load_doc_admit_cache_obj(sig: str):
+    if not stage_cache_enabled():
+        return None  # RRR_STAGE_CACHE=0: cold-run measurement mode
     try:
         with open(_doc_admit_cache_path(sig), encoding="utf-8") as f:
             obj = json.load(f)
@@ -1011,7 +1015,7 @@ def _load_doc_admit_cache_obj(sig: str):
 
 
 def _save_doc_admit_cache(sig: str, docs: list, meta: dict, rejections: list = None):
-    ensure_dir(str(runs_path("cache", "doc_admit")))
+    ensure_dir(str(stage_cache_path("doc_admit")))
     with open(_doc_admit_cache_path(sig), "w", encoding="utf-8") as f:
         json.dump({"meta": meta, "docs": docs, "rejections": rejections or []}, f, indent=2, ensure_ascii=False)
 
@@ -2435,7 +2439,7 @@ def layered_t2(args, meta_path):
             if restart_attempt < MAX_RESTARTS - 1:
                 print(f"[Layered-T2] Restarting full pipeline...")
                 import shutil
-                cache_path = str(runs_path("cache", "mechanisms"))
+                cache_path = str(stage_cache_path("mechanisms"))
                 if os.path.isdir(cache_path):
                     shutil.rmtree(cache_path)
                 continue

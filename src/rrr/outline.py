@@ -46,7 +46,7 @@ import re
 import time
 from typing import List, Dict, Any, Optional
 
-from rrr.paths import runs_path
+from rrr.paths import runs_path, stage_cache_path, stage_cache_enabled
 from rrr.utils import ensure_dir
 
 
@@ -217,10 +217,14 @@ def _sig_order(topic: str, cluster_summaries: List[Dict[str, str]]) -> str:
 
 
 def _cache_path(stage: str, sig: str) -> str:
-    return str(runs_path("cache", "outline", stage, f"{sig}.json"))
+    # v15.16: workspace-level (was runs_path("cache", ...) — per-run under
+    # the v15.9 minted-run-id layout, so nothing was ever reused).
+    return str(stage_cache_path("outline", stage, f"{sig}.json"))
 
 
 def _load_cache(stage: str, sig: str):
+    if not stage_cache_enabled():
+        return None  # RRR_STAGE_CACHE=0: cold-run measurement mode
     try:
         with open(_cache_path(stage, sig), encoding="utf-8") as f:
             return json.load(f)
@@ -231,7 +235,7 @@ def _load_cache(stage: str, sig: str):
 def _save_cache(stage: str, sig: str, obj) -> None:
     # v15.14: atomic — a crash mid-write left a truncated cache entry
     # (self-healing on load, but pointlessly re-paying the LLM call).
-    ensure_dir(str(runs_path("cache", "outline", stage)))
+    ensure_dir(str(stage_cache_path("outline", stage)))
     path = _cache_path(stage, sig)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

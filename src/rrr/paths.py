@@ -46,6 +46,23 @@ def mint_run_id(topic: Optional[str] = None) -> str:
     return f"{stamp}_{_slugify(topic)}" if topic else stamp
 
 
+def _stage_cache_root_for(workdir: Path) -> Path:
+    """v15.16: workspace-level root for stage caches (outline, doc-admit,
+    legacy mechanism/fused). Override with RRR_STAGE_CACHE_DIR (mirrors
+    RRR_CLAIM_CACHE_DIR) to survive across sessions on an ephemeral pod."""
+    override = os.environ.get("RRR_STAGE_CACHE_DIR")
+    return Path(override).expanduser() if override else workdir / "cache"
+
+
+def stage_cache_enabled() -> bool:
+    """v15.16: RRR_STAGE_CACHE=0 disables stage-cache READS (writes still
+    happen, for forensics). The battery sets 0 so repeat runs of the same
+    topic measure whole-pipeline variance rather than replaying cached
+    precheck/cluster/posture/order results; smokes keep the default 1 for
+    fast iteration."""
+    return os.environ.get("RRR_STAGE_CACHE", "1") != "0"
+
+
 # ---------------------------------------------------------------------------
 # Workspace
 # ---------------------------------------------------------------------------
@@ -72,6 +89,12 @@ class Workspace:
     metadata_path: Path
     bibliography_path: Path
     claim_cache_root: Path
+    # v15.16: stage caches (outline precheck/cluster/posture/order, doc-admit,
+    # legacy mechanism/fused) live at workspace level like the claim cache.
+    # They previously lived under runs_path("cache", ...), which the v15.9
+    # per-run-id layout silently scoped PER RUN — replay was impossible and
+    # every minted run recomputed all stages cold.
+    stage_cache_root: Path = None  # type: ignore[assignment]
     run_id: Optional[str] = None
 
     # --- constructors ---
@@ -96,6 +119,7 @@ class Workspace:
             metadata_path=workdir / "metadata.csv",
             bibliography_path=workdir / "bibliography.bib",
             claim_cache_root=claim_cache_root,
+            stage_cache_root=_stage_cache_root_for(workdir),
             run_id=None,
         )
 
@@ -138,6 +162,7 @@ class Workspace:
             metadata_path=metadata_path,
             bibliography_path=bibliography_path,
             claim_cache_root=claim_cache_root,
+            stage_cache_root=_stage_cache_root_for(workdir),
             run_id=run_id,
         )
 
@@ -193,6 +218,9 @@ class Workspace:
 
     def claim_cache_path(self, *parts) -> Path:
         return self.claim_cache_root.joinpath(*parts)
+
+    def stage_cache_path(self, *parts) -> Path:
+        return self.stage_cache_root.joinpath(*parts)
 
     def repo_path(self, *parts) -> Path:
         """Alias for workdir.joinpath — kept for backward compat with old
@@ -294,3 +322,14 @@ def claim_cache_path(*parts) -> Path:
     ephemeral pod), making per-paper claim extraction a true one-time cost.
     """
     return default().claim_cache_path(*parts)
+
+
+def stage_cache_path(*parts) -> Path:
+    """v15.16: persistent stage-cache root (outline, doc-admit, legacy
+    mechanism/fused). Lives OUTSIDE runs/ — under the v15.9 per-run-id
+    layout the old runs_path("cache", ...) location was silently scoped to
+    each minted run, so caches could never be reused or replayed. Content
+    keys (prompt version + model + inputs) make cross-run sharing safe;
+    RRR_STAGE_CACHE=0 disables reads for cold-run measurement.
+    """
+    return default().stage_cache_path(*parts)
