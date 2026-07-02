@@ -271,7 +271,7 @@ def _merge_probes_with_terms(probes, terms, cap=None):
 
 
 def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "en"):
-    model = os.environ.get("RRR_PLANNER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
+    model = os.environ.get("RRR_PLANNER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
     start = time.perf_counter()
     # v15.12: cross-language retrieval. BM25 matches on corpus-language
     # tokens, so when the topic language differs from the corpus language

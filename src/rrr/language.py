@@ -19,7 +19,7 @@ Both env vars are overridable so operators without the qwen model
 installed can point RRR_MODEL_NONLATIN back at RRR_MODEL_LATIN. When the
 routed model isn't in the local ollama registry, select_model falls back
 to RRR_MODEL_LATIN with a stderr warning; a cold registry (no models
-pulled at all) falls back to the RRR_MODEL / "mistral" chain that the
+pulled at all) falls back to the RRR_MODEL / mistral-small:24b chain that the
 pipeline was built on.
 
 The whole module is import-safe — no LLM calls, no network. Both
@@ -181,9 +181,14 @@ def select_model(topic_lang: str) -> str:
 
     # Neither tier available. Fall through to legacy env-var chain so the
     # caller sees a clean ollama error at the first chat call.
+    # v15.15: the ultimate default is MODEL_LATIN_DEFAULT (mistral-small:24b),
+    # not mistral 7B. 7B is no longer a default anywhere — it stays reachable
+    # for benchmarking via RRR_MODEL_LATIN=mistral:latest. Keep the stage-module
+    # fallbacks in reasoner/writer/stance/outline/query_planner/cli in sync
+    # with this value.
     legacy = os.environ.get(
         "RRR_REASONER_MODEL",
-        os.environ.get("RRR_MODEL", "mistral"),
+        os.environ.get("RRR_MODEL", MODEL_LATIN_DEFAULT),
     )
     sys.stderr.write(
         f"[RRR] language={topic_lang}: neither {preferred!r} nor {other!r} "

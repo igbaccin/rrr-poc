@@ -52,7 +52,7 @@ from rrr.utils import ensure_dir
 
 _MODEL = os.environ.get(
     "RRR_OUTLINE_MODEL",
-    os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral")),
+    os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b")),
 )
 _KEEP_ALIVE = "30m"
 

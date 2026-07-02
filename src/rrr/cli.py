@@ -155,7 +155,7 @@ def main():
         selected_model = select_model(topic_lang)
     except Exception as lang_e:
         topic_lang = "en"
-        selected_model = os.environ.get("RRR_MODEL", "mistral")
+        selected_model = os.environ.get("RRR_MODEL", "mistral-small:24b")
         sys.stderr.write(
             f"[RRR] language detector unavailable ({lang_e}); "
             f"falling back to topic_lang=en model={selected_model}\n"

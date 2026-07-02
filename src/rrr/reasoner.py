@@ -19,7 +19,7 @@ from rapidfuzz import fuzz
 # stance+mechanism, clustering, and cluster_synth — all structured-JSON calls
 # whose quality bottleneck is schema obedience, not prose. Falls back to
 # RRR_MODEL if unset (preserves v11.1 behaviour).
-_MODEL      = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
+_MODEL      = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
 # v8 (R12) values frozen into source in v13: harmonised per-stage num_ctx
 # down from 8192 to 4096 for the small reasoner/cluster prompts. Under
 # OLLAMA_MAX_LOADED_MODELS=1 each ctx change forces a KV-cache reinit.

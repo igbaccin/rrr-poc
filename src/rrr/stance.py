@@ -7,7 +7,7 @@ from rrr.paths import page_text_path, require_page_text_dir, runs_path, claim_ca
 
 # v11.2 lever 2: stance is logically part of reasoning, so prefer
 # RRR_REASONER_MODEL if set; fall back to RRR_MODEL otherwise.
-_MODEL = os.environ.get("RRR_STANCE_MODEL", os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral")))
+_MODEL = os.environ.get("RRR_STANCE_MODEL", os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b")))
 _STANCE_TOKENS = {"supports", "critiques", "complicates", "tangential"}
 
 # v14.4 Shape B: paper-claim extraction prompt version. Bump to invalidate the

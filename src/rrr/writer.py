@@ -36,7 +36,7 @@ _install_llm_shim()
 # the reasoner needs JSON-schema obedience. Splitting lets the writer stay on
 # a prose-tier model while the reasoner runs on a smaller, cheaper model.
 # Falls back to RRR_MODEL if unset (preserves v11.1 behaviour).
-_MODEL = os.environ.get("RRR_WRITER_MODEL", os.environ.get("RRR_MODEL", "mistral"))
+_MODEL = os.environ.get("RRR_WRITER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
 _KEEP_ALIVE = "30m"
 
 # v13: RRR_WRITER_T/CTX/PRED/TOPP/TAIL_CHARS retired (lever pruning). Per-stage
