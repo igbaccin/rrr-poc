@@ -173,9 +173,23 @@ _E3_SOFT_PATTERNS = [
     ("author_year_parenthetical", re.compile(rf"\({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?,\s*\d{{4}}\)")),
 ]
 
-# E4 / E5 helpers — straight-double-quoted spans of >=20 chars; nearby
-# canonical (doc: p.N) cite within +/- 200 chars.
-_QUOTED_SPAN_RE = re.compile(r'"([^"\n]{20,})"')
+# E4 / E5 helpers — quoted spans of >=20 chars; nearby canonical (doc: p.N)
+# cite within +/- 200 chars.
+# v16.8 precision fix: (1) match smart quotes as well as straight ones — LLM
+# essays routinely use “ ” for real quotations, which the old straight-only
+# regex missed while stray straight " marks paired across prose; (2) cap the
+# span length so a mispaired quote can't swallow half a paragraph. A real
+# inline quotation is short; a 500-char "quote" is a pairing error.
+_QUOTED_SPAN_RE = re.compile(r'["“]([^"”\n]{20,500})["”]')
+# v16.8: a clean verbatim quotation never EMBEDS an in-text citation or an
+# evidence-id bracket. When the span matcher pairs the wrong quote marks it
+# swallows prose + citations; such spans are not checkable quotations and
+# would inflate E4/E5 as false fabrications. Used to reject them.
+_SPAN_HAS_CITATION_RE = re.compile(
+    r"\([A-Za-z0-9_&.\-]+:\s*p\.\s*\d+\)"      # canonical (doc: p.N)
+    r"|\([^()]*\b\d{4}[a-z]?\s*,\s*p\.\s*\d+\)"  # display (Author Year, p.N)
+    r"|\[E\d{3,5}\]"                             # unrendered evidence id
+)
 _NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 # Display-form cite for quote attribution lookup when the canonical form is
 # absent (e.g. when checking the FINAL user-facing review where cites have
@@ -352,6 +366,7 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
 
     e1, e2 = 0, 0
     e1_details, e2_details = [], []
+    e1_loose_advisory = []  # v16.8: bare "Word Year" prose, advisory only
     docs_cited = set()
 
     for c in citations:
@@ -467,13 +482,23 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
             continue
         did = _resolve_display_label(label, year)
         if did is None:
-            e1 += 1
+            # v16.8: bare "Word Year" (no parentheses, no page) is
+            # STRUCTURALLY AMBIGUOUS with ordinary historical prose —
+            # "England 1066", "Parliament 1688", "In 1850" all match this
+            # pattern. Counting them as fabricated citations produced
+            # systematic false positives, especially on unrestricted /
+            # off-the-shelf essays full of "ProperNoun Year" prose. A hard
+            # fabrication metric must not fire on ambiguous surfaces, so
+            # these are recorded as an ADVISORY signal (e1_loose_advisory)
+            # and NOT summed into E1. Genuine out-of-corpus citations in
+            # canonical `(doc: p.N)` or display `Author (Year, p.N)` form —
+            # which ARE structurally unambiguous — still count toward E1.
             ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
-            e1_details.append({
+            e1_loose_advisory.append({
                 "doc_id": None, "label": label.strip(), "year": year,
                 "page": None, "raw": m.group(0), "context": ctx,
                 "surface": "display_loose",
-                "reason": "display_label_not_in_corpus",
+                "reason": "bare_author_year_ambiguous_with_prose",
             })
         else:
             docs_cited.add(did)
@@ -520,6 +545,11 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
     if quote_check and os.path.isdir(page_text_dir):
         for qm in _QUOTED_SPAN_RE.finditer(text):
             quote = qm.group(1)
+            # v16.8: reject mispaired spans that embed a citation / evidence
+            # id — they are not verbatim quotations and would false-positive
+            # as E4/E5.
+            if _SPAN_HAS_CITATION_RE.search(quote):
+                continue
             q_start, q_end = qm.span()
             win_start = max(0, q_start - _QUOTE_WINDOW_CHARS)
             win_end = min(len(text), q_end + _QUOTE_WINDOW_CHARS)
@@ -610,6 +640,8 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         "quotes_checked": quotes_checked,
         "quotes_verified": quotes_verified,
         "e1_details": e1_details,
+        "e1_loose_advisory": e1_loose_advisory,
+        "e1_loose_advisory_count": len(e1_loose_advisory),
         "e2_details": e2_details,
         "e3_details": e3_details,
         "e3_soft_details": e3_soft_details,
