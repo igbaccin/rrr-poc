@@ -20,11 +20,14 @@ refused rather than papered over; every run leaves an audit trail
 
 ## Workflow
 
-1. **Install (once per workspace).**
-   - `pip install rrr-poc` if available on the index; otherwise
-     `git clone https://github.com/igbaccin/rrr-poc && pip install -e rrr-poc`.
-   - Verify: `rrr --help` (or `python -m rrr.cli --help` with
+1. **Verify RRR is available (do NOT re-install).**
+   - The RRR package is already installed in this environment. **Verify only**
+     with `rrr --help` (or `python -m rrr.cli --help` with
      `PYTHONPATH=<repo>/src`).
+   - Do **not** `pip install rrr-poc` or `git clone` the repo — a network
+     install would replace the exact, audited checkout under test with a
+     possibly-different published version and break reproducibility. If
+     `rrr --help` fails, stop and report it rather than installing.
 
 2. **Choose the LLM runtime.**
    - Local: Ollama running with `mistral-small:24b` pulled (16 GB VRAM), or
