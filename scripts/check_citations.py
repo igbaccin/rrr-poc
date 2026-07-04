@@ -186,9 +186,12 @@ _QUOTED_SPAN_RE = re.compile(r'["“]([^"”\n]{20,500})["”]')
 # swallows prose + citations; such spans are not checkable quotations and
 # would inflate E4/E5 as false fabrications. Used to reject them.
 _SPAN_HAS_CITATION_RE = re.compile(
-    r"\([A-Za-z0-9_&.\-]+:\s*p\.\s*\d+\)"      # canonical (doc: p.N)
-    r"|\([^()]*\b\d{4}[a-z]?\s*,\s*p\.\s*\d+\)"  # display (Author Year, p.N)
-    r"|\[E\d{3,5}\]"                             # unrendered evidence id
+    # v16.9: page RANGES (`p.1-2`, en-dash too) count as citations — models
+    # write them, and a range defeated the v16.8 pattern, letting a mispaired
+    # span containing "(AcemogluEtAl_2002: p.1-2)" through as a "quote".
+    r"\([A-Za-z0-9_&.\-]+:\s*p\.\s*\d+(?:\s*[-–]\s*\d+)?\)"        # canonical (doc: p.N[-M])
+    r"|\([^()]*\b\d{4}[a-z]?\s*,\s*p\.\s*\d+(?:\s*[-–]\s*\d+)?\)"  # display (Author Year, p.N[-M])
+    r"|\[E\d{3,5}\]"                                               # unrendered evidence id
 )
 _NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
 # Display-form cite for quote attribution lookup when the canonical form is
@@ -549,6 +552,18 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
             # id — they are not verbatim quotations and would false-positive
             # as E4/E5.
             if _SPAN_HAS_CITATION_RE.search(quote):
+                continue
+            # v16.9: reject mispaired scare-quote spans structurally. A
+            # quoted phrase SHORTER than the 20-char span floor (e.g.
+            # "reversal of fortune", 19 chars) cannot match as a quote, so
+            # the matcher pairs its CLOSING mark with the NEXT phrase's
+            # opening mark and captures the interstitial PROSE as a phantom
+            # quote — which then false-positives as E4. A genuine quotation
+            # never begins or ends with whitespace inside its marks, so edge
+            # whitespace is the mispairing signature. Production audit
+            # (80 Claude-arm essays): 16/151 Sonnet and 71/262 Opus E4s
+            # carried it; every inspected case was interstitial prose.
+            if quote != quote.strip():
                 continue
             q_start, q_end = qm.span()
             win_start = max(0, q_start - _QUOTE_WINDOW_CHARS)
