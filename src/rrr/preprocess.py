@@ -43,6 +43,25 @@ _INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)', re.IGNORECASE)
 # signal, honoured only when its own page is also reference-dense.
 _STRONG_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)')
 
+# v16.13: JSTOR cover-page boilerplate — "REFERENCES / Linked references are
+# available on JSTOR for this article ...". Metadata noise on the cover, NOT
+# the article bibliography; a page carrying it is never a reference boundary
+# and is exempt from the post-extraction leak invariant.
+_JSTOR_COVER_RE = re.compile(r'Linked references are available on JSTOR', re.IGNORECASE)
+
+# A bibliographic entry line: "Surname, I. ..." / "Surname, Firstname ..." at
+# line start, followed by SUBSTANTIAL content (author + title/journal). The
+# trailing-length requirement distinguishes a real reference entry from a short
+# "City, Country" data-table row (Nunn_2008 Table I: "Valencia, Spain"), which
+# would otherwise false-positive. Digit-independent, so it survives OCR that
+# drops the year/pages (Koepke&Baten: "ALLEN, R. (). Economic structure ...").
+_BIB_ENTRY_LINE_RE = re.compile(
+    r'(?m)^\s*[A-Z][A-Za-z\'.\-]+,\s+(?:[A-Z]\.|[A-Z][a-z]+).{20,}')
+
+# A standalone reference-section heading on its own line (for the invariant).
+_STANDALONE_REF_HEADER_RE = re.compile(
+    r'(?m)^\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography|WORKS CITED|Works Cited)\s*$')
+
 
 def _has_reference_header(page_text: str) -> bool:
     """Check if page contains a reference section header (line-anchored or
@@ -100,9 +119,15 @@ def _is_reference_dense(page_text: str) -> bool:
     editors = len(re.findall(r'\beds?\.', page_text))
     # DOI patterns
     dois = len(re.findall(r'doi:|DOI:', page_text))
-    
-    total_indicators = author_year + journals + page_ranges + publishers + vol_num + editors + dois
-    
+    # v16.13: reference-entry lines are a DIGIT-INDEPENDENT signal — they
+    # survive OCR that mangles years/pages (Koepke&Baten's "()" / "pp. -"),
+    # which used to zero out every numeric indicator and hide a dense
+    # bibliography page from the density fallback.
+    entry_lines = len(_BIB_ENTRY_LINE_RE.findall(page_text))
+
+    total_indicators = (author_year + journals + page_ranges + publishers
+                        + vol_num + editors + dois + entry_lines)
+
     # Calculate density per 500 chars
     density = total_indicators / (len(page_text) / 500)
     
@@ -130,9 +155,24 @@ def _is_reference_start_page(pages: list, i: int) -> bool:
     body prose (Bryant_2006's coda) does not trigger a premature cut."""
     page_text = pages[i]
     n = len(pages)
+    # JSTOR cover boilerplate is metadata noise, never a reference boundary.
+    if _JSTOR_COVER_RE.search(page_text):
+        return False
     if _is_strong_reference_header(page_text):
+        # v16.13: a TAIL-positioned structural REFERENCES/BIBLIOGRAPHY heading
+        # is strong evidence on its own — cut regardless of density (that
+        # density requirement was what let Kuznets_1973, Peters_2004 and
+        # Koepke&Baten_2005 leak their bibliographies: their numbers were
+        # mangled in extraction or the header sat on the last page with no next
+        # page to corroborate). An EARLY header (intro/body) still needs
+        # corroboration to avoid a false cut. Boundary truncation
+        # (_truncate_at_reference_header) keeps any main text preceding the
+        # header on the same page.
+        if i >= n * 0.5:
+            return True
         return _is_reference_dense(page_text) or (
             i + 1 < n and _is_reference_dense(pages[i + 1]))
+    # A weak lowercase 'references' counts only when its own page is dense.
     if _INLINE_REFERENCES_RE.search(page_text) and _is_reference_dense(page_text):
         return True
     return False
@@ -182,11 +222,16 @@ def _process_one(row_dict):
     pdf = row_dict.get("pdf_path")
     doc_id = str(row_dict.get("doc_id"))
 
-    # Clear old pages for this doc before writing new ones
+    # Clear old pages for this doc before writing new ones — page_text AND
+    # page_meta. v16.13: clearing only page_text left stale page_meta files
+    # whenever a doc's page count DECREASED (e.g. Peters_2004 39->38,
+    # Koepke&Baten_2005 35->31 once their leaked bibliographies were stripped),
+    # breaking the page_text/page_meta consistency invariant.
     import glob
-    old_pages = glob.glob(str(data_path("page_text", f"{doc_id}_page_*.txt")))
-    for old in old_pages:
-        os.remove(old)
+    for _pat in (data_path("page_text", f"{doc_id}_page_*.txt"),
+                 data_path("page_meta", f"{doc_id}_page_*.json")):
+        for old in glob.glob(str(_pat)):
+            os.remove(old)
 
     if not (isinstance(pdf, str) and os.path.isfile(pdf)):
         return {"doc_id": doc_id, "ok": False, "reason": "missing_pdf"}
@@ -251,6 +296,27 @@ def _process_one(row_dict):
     except Exception as e:
         return {"doc_id": doc_id, "ok": False, "reason": str(e)}
 
+def scan_reference_leaks(page_text_dir):
+    """Post-extraction invariant (v16.13): NO retained non-cover page may still
+    contain a reference section. Returns a list of (filename, reason) for each
+    violation. JSTOR cover pages (metadata boilerplate) are exempt. A hard guard
+    against silently reintroducing the reference-leak bug class — it would have
+    caught Kuznets_1973 / Peters_2004 / Koepke&Baten_2005 immediately."""
+    import glob as _glob
+    leaks = []
+    for fp in sorted(_glob.glob(os.path.join(str(page_text_dir), "*_page_*.txt"))):
+        with open(fp, encoding="utf-8") as f:
+            txt = f.read()
+        if _JSTOR_COVER_RE.search(txt):
+            continue  # cover metadata, exempt
+        n_entries = len(_BIB_ENTRY_LINE_RE.findall(txt))
+        if _STANDALONE_REF_HEADER_RE.search(txt) and n_entries >= 3:
+            leaks.append((os.path.basename(fp), f"standalone ref header + {n_entries} entry lines"))
+        elif n_entries >= 10:
+            leaks.append((os.path.basename(fp), f"{n_entries} bib-entry lines (no header)"))
+    return leaks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--metadata", required=True)
@@ -270,6 +336,17 @@ def main():
                 print(f"[skip] {res['doc_id']}: {res.get('reason')}")
     
     print(f"[done] preprocessing - excluded {total_ref_excluded} reference pages total")
+
+    # v16.13 invariant: fail loudly if any retained page still leaks a
+    # bibliography into the corpus (BM25 must never be fed reference lists).
+    leaks = scan_reference_leaks(data_path("page_text"))
+    if leaks:
+        print(f"[FATAL] reference-leak invariant FAILED — {len(leaks)} retained "
+              f"page(s) still contain a bibliography:")
+        for fn, why in leaks:
+            print(f"    {fn}: {why}")
+        raise SystemExit(1)
+    print("[invariant] OK - no reference-section leaks in retained page_text.")
 
 if __name__ == "__main__":
     main()
