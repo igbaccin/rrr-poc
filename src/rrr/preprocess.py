@@ -36,6 +36,13 @@ _REF_HEADERS = [
 # the page.
 _INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)', re.IGNORECASE)
 
+# v16.12: a STRONG glued reference header — ALL-CAPS 'REFERENCES' only (the
+# JSTOR 'control.REFERENCESAlatas' run-on). Distinct from the mere word
+# 'references' in body prose. Header detection uses this to take precedence
+# over the density fallback; the IGNORECASE matcher above stays the WEAK
+# signal, honoured only when its own page is also reference-dense.
+_STRONG_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)')
+
 
 def _has_reference_header(page_text: str) -> bool:
     """Check if page contains a reference section header (line-anchored or
@@ -101,29 +108,56 @@ def _is_reference_dense(page_text: str) -> bool:
     
     return density > 3  # More than 3 indicators per 500 chars = likely references
 
+def _is_strong_reference_header(page_text: str) -> bool:
+    """A STRUCTURAL reference header: a line-anchored heading (REFERENCES,
+    BIBLIOGRAPHY, WORKS CITED, ...) or a glued ALL-CAPS 'REFERENCES' run-on.
+    High-confidence, unlike the bare word 'references' which also occurs in
+    body prose."""
+    for pattern in _REF_HEADERS:
+        if re.search(pattern, page_text, re.MULTILINE):
+            return True
+    return bool(_STRONG_INLINE_REFERENCES_RE.search(page_text))
+
+
+def _is_reference_start_page(pages: list, i: int) -> bool:
+    """True if page i begins the reference section.
+
+    A strong structural header counts when this page OR the next is
+    reference-dense (covers a header sitting at the very bottom of a page).
+    A weak, case-insensitive 'references' match (e.g. the glued lowercase
+    'Footnote references Allen, R. C., ...' in Bolt&vanZanden_2014) counts
+    ONLY when its OWN page is reference-dense — so the word 'references' in
+    body prose (Bryant_2006's coda) does not trigger a premature cut."""
+    page_text = pages[i]
+    n = len(pages)
+    if _is_strong_reference_header(page_text):
+        return _is_reference_dense(page_text) or (
+            i + 1 < n and _is_reference_dense(pages[i + 1]))
+    if _INLINE_REFERENCES_RE.search(page_text) and _is_reference_dense(page_text):
+        return True
+    return False
+
+
 def _find_reference_start(pages: list) -> int:
-    """
-    Find the page index where references section starts.
-    Returns -1 if no reference section detected.
-    """
-    for i, page_text in enumerate(pages):
-        # Check for explicit header
-        if _has_reference_header(page_text):
-            # Verify it's followed by reference-dense content
-            # Check this page or next page
-            if _is_reference_dense(page_text):
-                return i
-            if i + 1 < len(pages) and _is_reference_dense(pages[i + 1]):
-                return i
-        
-        # For pages without header but very high reference density
-        # (handles cases where header is at bottom of previous page)
-        if i > len(pages) * 0.6:  # Only check last 40% of document
-            if _is_reference_dense(page_text):
-                # Check if next page is also reference-dense
-                if i + 1 < len(pages) and _is_reference_dense(pages[i + 1]):
-                    return i
-    
+    """Find the page index where the reference section starts (-1 if none).
+
+    v16.12: header detection takes PRECEDENCE over the density fallback. The
+    old single pass interleaved them per page, so a short 'CONCLUSION' page or
+    a data appendix (dense with year-ranges) could be returned BEFORE the
+    document's real reference header — dropping genuine body text (Allen_2001
+    lost its conclusion). Pass 1 now finds the first genuine reference-section
+    page anywhere in the document; the density-only fallback (pass 2) fires
+    solely when no reference header exists at all."""
+    n = len(pages)
+    # Pass 1: first genuine reference-section page (header-anchored).
+    for i in range(n):
+        if _is_reference_start_page(pages, i):
+            return i
+    # Pass 2: no header anywhere — trailing density run in the last 40%.
+    for i in range(n):
+        if i > n * 0.6 and _is_reference_dense(pages[i]) and \
+                i + 1 < n and _is_reference_dense(pages[i + 1]):
+            return i
     return -1
 
 def extract_pages(pdf_path: str):
