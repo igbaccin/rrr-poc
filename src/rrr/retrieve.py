@@ -20,7 +20,11 @@ def _split_pid(pid):
     return pid, 1
 
 # ---------- Phase B2: cache BM25 scoring per topic ----------
-@lru_cache(maxsize=8)
+# v16.16: maxsize was 8 but the planner issues up to _PROBE_CAP=12 distinct
+# probe queries per run (query_planner.py). An 8-slot LRU cycled by >8 distinct
+# keys thrashes to ~100% miss -> a full-corpus BM25 rescan per (probe, doc).
+# 32 holds every probe for the whole run; byte-identical output, fewer rescans.
+@lru_cache(maxsize=32)
 def _scores_for_query_cached(query: str):
     """Compute BM25 scores once per topic, then reuse.
 
