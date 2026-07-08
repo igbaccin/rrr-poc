@@ -570,75 +570,66 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
             win_end = min(len(text), q_end + _QUOTE_WINDOW_CHARS)
             window = text[win_start:win_end]
 
-            # v16.16: gather ALL nearby citations (canonical + display) and
-            # check the quote against every one before ruling. The old code
-            # picked the SINGLE nearest cite by distance and checked only it,
-            # which mis-paired a quote sitting near the START of its sentence
-            # (governing cite at the END) with a DIFFERENT sentence's closer
-            # cite behind it — producing E4 false-positives. Real case
-            # (phase_a run_024): "equilibrium institutions" paired to
-            # (North 1989, p.9) and flagged fabricated, when it is verbatim on
-            # AcemogluEtAl_2002 p.33 — the FOLLOWING cite. New rule: VERIFIED if
-            # the quote is on ANY nearby cited page; E5 if it is elsewhere in
-            # ANY nearby cited doc; E4 only if it appears in NO nearby cited
-            # document at all. See revision_notes/scorer_followups.md.
-            nearby = []  # ordered, de-duped (doc_id, page), in-corpus only
-            _seen = set()
-            for m in _NEARBY_CANONICAL_CITE_RE.finditer(window):
+            # Look for canonical cites first; fall back to display cites.
+            doc_id = None
+            page = None
+            canonical_cites = list(_NEARBY_CANONICAL_CITE_RE.finditer(window))
+            if canonical_cites:
+                q_center = (q_start + q_end) / 2 - win_start
+                nearest = min(canonical_cites,
+                              key=lambda m: abs((m.start() + m.end()) / 2 - q_center))
+                doc_id = nearest.group(1)
                 try:
-                    dp = (m.group(1), int(m.group(2)))
+                    page = int(nearest.group(2))
                 except ValueError:
-                    continue
-                if dp[0] in valid_docs and dp not in _seen:
-                    _seen.add(dp); nearby.append(dp)
-            for pat in (DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE):
-                for m in pat.finditer(window):
+                    pass
+            else:
+                # Fallback: display cite resolution (for final user-facing reviews).
+                disp_matches = []
+                for pat in (DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE):
+                    for m in pat.finditer(window):
+                        disp_matches.append(m)
+                if disp_matches:
+                    q_center = (q_start + q_end) / 2 - win_start
+                    nearest = min(disp_matches,
+                                  key=lambda m: abs((m.start() + m.end()) / 2 - q_center))
+                    label, year = nearest.group(1), nearest.group(2)
                     try:
-                        pg = int(m.group(3))
+                        page = int(nearest.group(3))
                     except (ValueError, IndexError):
-                        continue
-                    d = _resolve_display_label(m.group(1), m.group(2))
-                    dp = (d, pg)
-                    if d and d in valid_docs and dp not in _seen:
-                        _seen.add(dp); nearby.append(dp)
+                        page = None
+                    doc_id = _resolve_display_label(label, year)
 
             ctx = text[max(0, q_start - 80):q_end + 80].replace("\n", " ").strip()
-            if not nearby:
-                # No actionable in-corpus attribution nearby — skip.
+            if not doc_id or page is None or doc_id not in valid_docs:
+                # No actionable attribution — skip the quote check.
                 continue
             quotes_checked += 1
-            norm_q = _normalise_for_quote_match(quote)
-            if not norm_q:
+            page_txt = _load_page_text(doc_id, page, page_text_dir)
+            if page_txt is None:
                 continue
-            # (a) verified if the quote is on ANY nearby cited page
-            if any(
-                (pt := _load_page_text(d, pg, page_text_dir)) is not None
-                and norm_q in _normalise_for_quote_match(pt)
-                for (d, pg) in nearby
-            ):
+            norm_q = _normalise_for_quote_match(quote)
+            if norm_q and norm_q in _normalise_for_quote_match(page_txt):
                 quotes_verified += 1
                 continue
-            # (b) E5 if it appears elsewhere in ANY nearby cited doc
-            e5_hit = None
-            for (d, pg) in nearby:
-                other = _find_other_pages_with_quote(d, quote, page_text_dir, exclude_page=pg)
-                if other:
-                    e5_hit = (d, pg, other); break
-            if e5_hit:
-                d, pg, other = e5_hit
+            # Quote is not on the cited page. Check other pages of the same
+            # doc — if it appears elsewhere, that's E5 (mis-attribution);
+            # otherwise E4 (fabrication).
+            other_pages = _find_other_pages_with_quote(doc_id, quote, page_text_dir,
+                                                       exclude_page=page)
+            if other_pages:
                 e5 += 1
                 e5_details.append({
-                    "doc_id": d, "cited_page": pg, "found_on_pages": other,
+                    "doc_id": doc_id, "cited_page": page,
+                    "found_on_pages": other_pages,
                     "quote": quote[:240], "context": ctx,
                 })
-                continue
-            # (c) E4: the quote is in NO nearby cited document
-            e4 += 1
-            e4_details.append({
-                "doc_id": nearby[0][0], "cited_page": nearby[0][1],
-                "nearby_cites": [f"{d} p.{pg}" for (d, pg) in nearby],
-                "quote": quote[:240], "context": ctx,
-            })
+            else:
+                e4 += 1
+                e4_details.append({
+                    "doc_id": doc_id, "cited_page": page,
+                    "quote": quote[:240], "context": ctx,
+                })
 
     word_count = len(re.findall(r"\b\w+\b", text))
 
