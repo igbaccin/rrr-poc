@@ -12,7 +12,7 @@ Rather than thread a `think=False` kwarg through all ~30 ollama.chat call
 sites, we patch `ollama.chat` once. Every `import ollama` in the package
 resolves to the same cached module object, so patching `ollama.chat` here —
 imported once at reasoner entry — covers all call sites (planner, precheck,
-cluster, posture, order, stance, writer, prewarm, ingest).
+cluster, posture, order, claim extraction, writer, prewarm, ingest).
 
 The patch is idempotent and version-tolerant: if the installed ollama client
 predates the `think=` kwarg it falls back to injecting a `/no_think` soft

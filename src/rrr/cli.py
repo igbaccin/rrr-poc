@@ -1,5 +1,4 @@
 import argparse, json, os, re, sys
-import pandas as pd
 
 
 # v15.10: deterministic sanity gate before any LLM call. Rejects topics that
@@ -49,21 +48,6 @@ def _reject_gibberish_topic(topic: str) -> str | None:
             return ("single-run topic mixes letters with digits or "
                     "punctuation; looks like a keyboard slam")
     return None
-
-
-def load_refs(meta_path):
-    df = pd.read_csv(meta_path)
-    refs = {}
-    for _, r in df.iterrows():
-        def safe(x): return str(x).strip() if isinstance(x, str) else ""
-        y = f" ({safe(r.get('year'))})" if 'year' in r and pd.notna(r.get('year')) and safe(r.get('year')) else ""
-        parts = []
-        if safe(r.get('authors')): parts.append(safe(r.get('authors')) + y)
-        if safe(r.get('title')):   parts.append(f"*{safe(r.get('title'))}*")
-        if safe(r.get('venue')):   parts.append(safe(r.get('venue')))
-        cite = ". ".join(parts).strip() or str(r.get('doc_id'))
-        refs[str(r["doc_id"])] = cite
-    return df, refs
 
 
 def t2(args, meta_path):

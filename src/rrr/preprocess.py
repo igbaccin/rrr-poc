@@ -63,17 +63,6 @@ _STANDALONE_REF_HEADER_RE = re.compile(
     r'(?m)^\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography|WORKS CITED|Works Cited)\s*$')
 
 
-def _has_reference_header(page_text: str) -> bool:
-    """Check if page contains a reference section header (line-anchored or
-    glued inline)."""
-    for pattern in _REF_HEADERS:
-        if re.search(pattern, page_text, re.MULTILINE):
-            return True
-    if _INLINE_REFERENCES_RE.search(page_text):
-        return True
-    return False
-
-
 def _truncate_at_reference_header(page_text: str) -> tuple:
     """v14.3: when a reference header appears mid-page (line-anchored or
     glued inline), return (text_before_header, True). When no header,
@@ -103,11 +92,11 @@ def _is_reference_dense(page_text: str) -> bool:
     """Check if page has dense reference-list patterns."""
     if len(page_text) < 200:
         return False
-    
+
     # Count reference indicators
     # Author, Initial. (Year) pattern
     author_year = len(re.findall(r'[A-Z][a-z]+,?\s+[A-Z]\..*?\(\d{4}\)', page_text))
-    # Journal of / Review of / Quarterly patterns  
+    # Journal of / Review of / Quarterly patterns
     journals = len(re.findall(r'\b(Journal of|Review of|Quarterly|Economic History|American Economic)\b', page_text, re.IGNORECASE))
     # Page ranges: 123-456 or 123–456
     page_ranges = len(re.findall(r'\b\d{1,4}[-–]\d{1,4}\b', page_text))
@@ -130,7 +119,7 @@ def _is_reference_dense(page_text: str) -> bool:
 
     # Calculate density per 500 chars
     density = total_indicators / (len(page_text) / 500)
-    
+
     return density > 3  # More than 3 indicators per 500 chars = likely references
 
 def _is_strong_reference_header(page_text: str) -> bool:
@@ -262,7 +251,7 @@ def _process_one(row_dict):
             if truncated and trimmed:
                 content_pages = content_pages + [trimmed]
                 ref_pages -= 1
-        
+
         # Write only content pages
         for i, ptxt in enumerate(content_pages, start=1):
             outp = data_path("page_text", f"{doc_id}_page_{i}.txt")
@@ -281,7 +270,7 @@ def _process_one(row_dict):
                 },
                 str(meta_dir / f"{doc_id}_page_{i}.json"),
             )
-        
+
         meta = {
             "doc_id": doc_id,
             "pdf_path": pdf,
@@ -291,7 +280,7 @@ def _process_one(row_dict):
             "ref_pages_excluded": ref_pages
         }
         save_json(meta, str(data_path(f"{doc_id}.json")))
-        
+
         return {"doc_id": doc_id, "ok": True, "pages": len(content_pages), "hash": h[:12], "ref_excluded": ref_pages}
     except Exception as e:
         return {"doc_id": doc_id, "ok": False, "reason": str(e)}
@@ -324,7 +313,7 @@ def main():
     args = ap.parse_args()
     df = pd.read_csv(args.metadata)
     rows = [r.to_dict() for _, r in df.iterrows()]
-    
+
     total_ref_excluded = 0
     with Pool(processes=args.workers) as pool:
         for res in pool.imap_unordered(_process_one, rows, chunksize=1):
@@ -334,7 +323,7 @@ def main():
                 total_ref_excluded += res.get('ref_excluded', 0)
             else:
                 print(f"[skip] {res['doc_id']}: {res.get('reason')}")
-    
+
     print(f"[done] preprocessing - excluded {total_ref_excluded} reference pages total")
 
     # v16.13 invariant: fail loudly if any retained page still leaks a

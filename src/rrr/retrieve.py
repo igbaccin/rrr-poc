@@ -1,4 +1,6 @@
-import os, pickle, numpy as np
+import pickle
+
+import numpy as np
 from functools import lru_cache
 from rrr.paths import indices_path, page_text_path, require_file, require_indices_dir, require_page_text_dir
 from rrr.text import tokenize_query

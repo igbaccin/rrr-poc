@@ -68,7 +68,6 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 MODEL_LATIN_DEFAULT = "mistral-small:24b"
 MODEL_NONLATIN_DEFAULT = "qwen3:14b"          # dense, RTX 4090, shipped default
-MODEL_NONLATIN_PREMIUM_DENSE = "qwen3:32b"    # dense, RTX 5090, quality tier
 
 
 # Latin-script European languages where mistral-small:24b handles

@@ -19,7 +19,7 @@ from __future__ import annotations
 import datetime
 import os
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -47,8 +47,8 @@ def mint_run_id(topic: Optional[str] = None) -> str:
 
 
 def _stage_cache_root_for(workdir: Path) -> Path:
-    """v15.16: workspace-level root for stage caches (outline, doc-admit,
-    legacy mechanism/fused). Override with RRR_STAGE_CACHE_DIR (mirrors
+    """v15.16: workspace-level root for outline and admission caches.
+    Override with RRR_STAGE_CACHE_DIR (mirrors
     RRR_CLAIM_CACHE_DIR) to survive across sessions on an ephemeral pod."""
     override = os.environ.get("RRR_STAGE_CACHE_DIR")
     return Path(override).expanduser() if override else workdir / "cache"
@@ -89,8 +89,8 @@ class Workspace:
     metadata_path: Path
     bibliography_path: Path
     claim_cache_root: Path
-    # v15.16: stage caches (outline precheck/cluster/posture/order, doc-admit,
-    # legacy mechanism/fused) live at workspace level like the claim cache.
+    # v15.16: outline and document-admission caches live at workspace level
+    # like the claim cache.
     # They previously lived under runs_path("cache", ...), which the v15.9
     # per-run-id layout silently scoped PER RUN — replay was impossible and
     # every minted run recomputed all stages cold.
@@ -240,17 +240,6 @@ def default() -> Workspace:
     return _DEFAULT_WORKSPACE
 
 
-def set_default(ws: Workspace) -> None:
-    """Replace the module-level default workspace.
-
-    Called once per invocation from the pipeline entry point (layered_t2 /
-    rrr.review). All downstream code that goes through the module-level
-    delegates below then resolves against this workspace automatically.
-    """
-    global _DEFAULT_WORKSPACE
-    _DEFAULT_WORKSPACE = ws
-
-
 def set_default_run_id(run_id: Optional[str]) -> None:
     """Convenience: set only the run_id on the module-level workspace."""
     global _DEFAULT_WORKSPACE
@@ -260,10 +249,6 @@ def set_default_run_id(run_id: Optional[str]) -> None:
 # The functions below are the pre-v15.9 API. They delegate to `default()` so
 # every existing caller works unchanged. Do not add new callers — prefer
 # `paths.default().<method>()` for new code.
-
-def project_root() -> Path:
-    return default().workdir
-
 
 def repo_path(*parts) -> Path:
     return default().repo_path(*parts)
@@ -283,10 +268,6 @@ def require_file(path: Path, label: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"{label} not found: {path}")
     return path
-
-
-def require_data_dir() -> Path:
-    return require_dir(default().data_dir, "RRR data directory")
 
 
 def require_page_text_dir() -> Path:
@@ -325,8 +306,8 @@ def claim_cache_path(*parts) -> Path:
 
 
 def stage_cache_path(*parts) -> Path:
-    """v15.16: persistent stage-cache root (outline, doc-admit, legacy
-    mechanism/fused). Lives OUTSIDE runs/ — under the v15.9 per-run-id
+    """v15.16: persistent stage-cache root for outline and document admission.
+    It lives outside runs/, where the v15.9 per-run-id
     layout the old runs_path("cache", ...) location was silently scoped to
     each minted run, so caches could never be reused or replayed. Content
     keys (prompt version + model + inputs) make cross-run sharing safe;

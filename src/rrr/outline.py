@@ -44,9 +44,9 @@ import json
 import os
 import re
 import time
-from typing import List, Dict, Any, Optional
+from typing import Dict, List, Optional
 
-from rrr.paths import runs_path, stage_cache_path, stage_cache_enabled
+from rrr.paths import stage_cache_enabled, stage_cache_path
 from rrr.utils import ensure_dir
 
 

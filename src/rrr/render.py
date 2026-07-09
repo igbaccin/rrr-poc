@@ -95,13 +95,6 @@ def set_metadata_labels(rows, *, clear: bool = True) -> int:
     return count
 
 
-def get_metadata_label_entry(doc_id: str):
-    """Public accessor: returns the lookup entry for doc_id, or None."""
-    if not doc_id:
-        return None
-    return _METADATA_LABEL_LOOKUP.get(str(doc_id).strip())
-
-
 def _regex_author_surnames_only(label: str) -> str:
     """Strip trailing ' (Year)' from an 'Acemoglu et al. (2001)' style label."""
     if not label:
@@ -332,14 +325,6 @@ def parse_citations(text: str, display_lookup: dict = None):
         }
 
 
-# v15.5: rewrite_canonical_to_display, rewrite_misplaced_narrative_citations,
-# collapse_nested_narrative_multicite, fix_orphan_outer_paren_narrative, and
-# merge_redundant_inline_paren_citations have been moved to
-# legacy_citation_postproc.py. The writer now emits ONLY evidence-ID
-# citations [E####] and the new context-aware _render_evidence_id_citations
-# in writer.py produces clean display form directly — eliminating the
-# surface variations these passes used to clean up. Import from
-# rrr.legacy_citation_postproc if you need them back for cross-model
-# fallback testing.
-
+# Citation rendering now has one active path. The writer emits evidence IDs,
+# and its context-aware renderer converts them directly to display citations.
 

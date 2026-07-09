@@ -1,883 +1,27 @@
-from typing import List
-import os, subprocess, json, re, ast, hashlib, time
+import hashlib
+import json
+import os
+import re
 from rrr.utils import ensure_dir, env_int
 # v15.12: patch ollama.chat to disable qwen3 thinking mode BEFORE any stage
 # runs. Every `import ollama` in the package resolves to the same module
 # object, so this one call covers all ~30 call sites.
 from rrr.llm import install as _install_llm_shim
 _install_llm_shim()
-# v15: classify_evidence_stance no longer called — discrete per-paper stance
-# replaced by corpus-level outline (build_outline) from rrr.outline.
+# The corpus-level outline assigns free-text structural relations across the
+# admitted literature. The retired per-paper stance path is no longer part of
+# this module.
 from rrr.outline import build_outline
 from rrr.metrics import RunMetrics
 from rrr.manifest import write_run_manifest
-from rrr.paths import runs_path, logs_path, stage_cache_path, stage_cache_enabled
-from rrr.text import tokenize
+from rrr.paths import runs_path, stage_cache_path, stage_cache_enabled
 from rapidfuzz import fuzz
 
-# v11.2 lever 2: per-stage model selection. The reasoner stage covers fused
-# stance+mechanism, clustering, and cluster_synth — all structured-JSON calls
-# whose quality bottleneck is schema obedience, not prose. Falls back to
-# RRR_MODEL if unset (preserves v11.1 behaviour).
-_MODEL      = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
-# v8 (R12) values frozen into source in v13: harmonised per-stage num_ctx
-# down from 8192 to 4096 for the small reasoner/cluster prompts. Under
-# OLLAMA_MAX_LOADED_MODELS=1 each ctx change forces a KV-cache reinit.
-# Cluster prompt observed ~2400 chars (well inside 4096). Mechanism already
-# at 4096. Net effect: removes 3-5s of reinit time at each stage transition
-# (~6-10s/run). Previously these were RRR_REASONER_CTX / RRR_REASONER_PRED /
-# RRR_MECH_CTX / RRR_MECH_PRED / RRR_CLUSTER_CTX / RRR_CLUSTER_PRED env
-# overrides — retired in the v13 lever-pruning pass because they were never
-# set by any caller (battery, smoke, or pod scripts).
-_OPTIONS_REASON = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 2000}
-_OPTIONS_MECHANISM = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 300}
-_OPTIONS_CLUSTER = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 2500}
+# The active reasoner handles document admission, claim extraction, and the
+# corpus-level outline. Model selection follows the shared reasoner fallback.
+_MODEL = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
 _KEEP_ALIVE = "30m"
-# v8 (R2): bump prompt version so v7 caches don't collide with v8 mechanism format.
-# Frozen in v13 (was RRR_MECH_PROMPT_VERSION); bump in source when the prompt changes.
-_MECHANISM_PROMPT_VERSION = "2026-06-25-v8"
-# v9 (R3): version key for fused stance+mechanism cache entries (separate from
-# mechanism cache so a v8 mechanism cache hit cannot serve a v9 caller missing
-# stance/rationale/contested). Frozen in v13 (was RRR_FUSED_PROMPT_VERSION).
-_FUSED_PROMPT_VERSION = "2026-06-29-v10-fused-claim"
-# v9 (R3): structured-output options for the fused call. num_predict bumped
-# vs mechanism because the JSON contains stance + rationale + mechanism +
-# contested + mechanisms[] (richer payload). Frozen in v13.
-_OPTIONS_FUSED = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 500}
-_FUSED_STANCE_TOKENS = {"supports", "critiques", "complicates", "tangential"}
 
-# v11-C: cluster-level synthesis call. One LLM pass per (stance, cluster) bucket
-# of >=2 docs producing {shared_mechanism, supporting_doc_ids, qualifying_doc_ids,
-# contested_dimension}. Lets the writer say "established across the literature
-# (X; Y; Z)" instead of one-citation-per-claim.
-# v13: prompt-version and CTX/PRED tuning frozen in source.
-_CLUSTER_SYNTH_PROMPT_VERSION = "2026-06-26-v11c"
-_OPTIONS_CLUSTER_SYNTH = {"temperature": 0.0, "num_ctx": 8192, "num_predict": 600}
-
-
-# v8 (R2): sanitiser for mechanism strings. The mechanism LLM call returns free
-# text that often embeds citation-like substrings; mistral occasionally mis-types
-# years (baseline had "North_1689" for "North_1989"). Mechanisms bypass
-# validate.py because they are not citation-validated; sanitising here closes
-# the only fabrication leak that touches review_narrative.md.
-_MECH_PAREN_CITE_RE = re.compile(
-    r"\(\s*([A-Za-z0-9_&.\-]+)_(\d{4})(?:\s*[:p\.]+\s*(\d+))?\s*\)",
-    re.IGNORECASE,
-)
-
-
-def _canonicalise_mech_citation(mechanism: str, allowed_doc_ids: set) -> str:
-    """Strip parentheticals from a mechanism string when the doc_id does not
-    match any document in the allowed set. Preserves valid corpus IDs.
-
-    The writer renders citations separately via the ledger evidence_id map, so
-    parentheticals in the mechanism text are mostly noise anyway. We choose to
-    DROP rather than rewrite so a misspelled year cannot leak as a confident
-    citation.
-    """
-    if not mechanism:
-        return mechanism
-
-    def repl(m):
-        candidate = f"{m.group(1)}_{m.group(2)}"
-        # Allow exact match against known corpus docs (including the doc that
-        # this mechanism came from). Anything else we drop.
-        if candidate in allowed_doc_ids:
-            page = m.group(3)
-            if page:
-                return f"({candidate}: p.{page})"
-            return f"({candidate})"
-        return ""
-
-    cleaned = _MECH_PAREN_CITE_RE.sub(repl, mechanism)
-    # Collapse the whitespace gaps the deletions leave behind.
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    cleaned = re.sub(r"\s+([.,;:])", r"\1", cleaned)
-    return cleaned
-
-
-def _canonicalise_mech_list(mechanisms, allowed_doc_ids: set):
-    out = []
-    for m in mechanisms or []:
-        s = _canonicalise_mech_citation(str(m).strip(), allowed_doc_ids)
-        if s:
-            out.append(s)
-    return out
-
-
-class ClusteringFailedError(Exception):
-    """Raised when clustering fails after all retries - triggers full pipeline restart."""
-    pass
-
-
-def _build_prompt(evidence_texts: List[str], claim: str) -> str:
-    prompt = (
-        "You are an economic historian.\n"
-        "Given the following evidence snippets, answer the claim ONLY using the retrieved text. Do not add external facts.\n\n"
-        f"Claim:\n{claim}\n\n"
-        "Evidence (page-bounded extracts):\n"
-        + "\n\n---\n\n".join(evidence_texts)
-        + "\n\n"
-    )
-    prompt += (
-        "Task: Produce ONE and ONLY ONE valid JSON object following this schema EXACTLY:\n\n"
-        "{\n"
-        '  "topic": "<string>",\n'
-        '  "positions": [\n'
-        '    {\n'
-        '      "label": "<short label>",\n'
-        '      "mechanism_summary": "<1-3 sentence summary>",\n'
-        '      "supporting_docs": ["DOCID", ...],\n'
-        '      "representative_quotes": [ { "doc_id":"DOCID", "page": X, "quote":"exact substring" }, ... ],\n'
-        '      "points_of_dispute": ["short bullet strings"]\n'
-        '    }\n'
-        '  ],\n'
-        '  "unrepresented_docs": ["DOCID", ...],\n'
-        '  "notes": "<short note or empty string>"\n'
-        "}\n\n"
-        "Strict output rules:\n"
-        "- The entire reply must be a SINGLE JSON object. No commentary, no explanations, no preambles.\n"
-        "- If you cannot fill a field, use an empty string or empty array [] - never omit the key.\n"
-        "- Do not add text before or after the JSON. The system will reject any non-JSON tokens.\n\n"
-        "After printing the JSON, output the word SUMMARY on a new line and then write your 2â€“6-sentence summary.\n"
-    )
-    return prompt
-
-def _extract_json_and_summary(raw: str):
-    start = raw.find('{')
-    if start == -1:
-        return None, raw.strip()
-    candidate = raw[start:]
-    try:
-        obj = json.loads(candidate)
-        pretty = json.dumps(obj, indent=2, ensure_ascii=False)
-        remainder = ""
-        if "SUMMARY" in candidate:
-            remainder = candidate.split("SUMMARY", 1)[-1].strip()
-        return pretty, remainder
-    except json.JSONDecodeError:
-        pass
-    fixed = re.sub(r"[^{}]*$", "", candidate)
-    opens, closes = fixed.count("{"), fixed.count("}")
-    if opens > closes:
-        fixed += "}" * (opens - closes)
-    try:
-        obj = json.loads(fixed)
-        pretty = json.dumps(obj, indent=2, ensure_ascii=False)
-        remainder = ""
-        if "SUMMARY" in candidate:
-            remainder = candidate.split("SUMMARY", 1)[-1].strip()
-        return pretty, remainder
-    except Exception:
-        try:
-            obj = ast.literal_eval(fixed)
-            pretty = json.dumps(obj, indent=2, ensure_ascii=False)
-            remainder = ""
-            if "SUMMARY" in candidate:
-                remainder = candidate.split("SUMMARY", 1)[-1].strip()
-            return pretty, remainder
-        except Exception:
-            ensure_dir(str(logs_path()))
-            with open(logs_path("invalid_json.txt"), "w", encoding="utf-8") as f:
-                f.write(raw)
-            return None, raw.strip()
-
-
-def parse_reasoned_json(raw: str):
-    pretty, _summary = _extract_json_and_summary(raw or "")
-    if not pretty:
-        return None
-    try:
-        return json.loads(pretty)
-    except Exception:
-        return None
-
-def reason_over_evidence(evidence_texts: List[str], claim: str, model: str = _MODEL, metrics=None) -> str:
-    if not evidence_texts:
-        return "No evidence to reason over."
-    prompt = _build_prompt(evidence_texts, claim)
-    start = time.perf_counter()
-    try:
-        import ollama
-        res = ollama.chat(model=model,
-                          messages=[{"role":"user","content":prompt}],
-                          options=_OPTIONS_REASON, keep_alive=_KEEP_ALIVE, stream=False)
-        out = res["message"]["content"].strip()
-        if metrics:
-            metrics.record_llm("reasoner", model, options=_OPTIONS_REASON,
-                               duration_s=time.perf_counter() - start,
-                               prompt_chars=len(prompt), response_chars=len(out))
-    except Exception as e_client:
-        try:
-            sub_start = time.perf_counter()
-            p = subprocess.run(["ollama","run", model],
-                               input=prompt.encode("utf-8"),
-                               capture_output=True, timeout=600)
-            out = p.stdout.decode("utf-8").strip() or "(no output)"
-            if metrics:
-                metrics.record_llm("reasoner_subprocess", model,
-                                   duration_s=time.perf_counter() - sub_start,
-                                   prompt_chars=len(prompt), response_chars=len(out))
-        except Exception as e_sub:
-            if metrics:
-                metrics.record_llm("reasoner", model, options=_OPTIONS_REASON,
-                                   success=False, duration_s=time.perf_counter() - start,
-                                   prompt_chars=len(prompt),
-                                   error=f"client {e_client}; fallback {e_sub}")
-            return f"[reasoner error: client {e_client} ; fallback {e_sub}]"
-    pretty_json, summary = _extract_json_and_summary(out)
-    if pretty_json:
-        if summary:
-            summary = summary.strip()
-            if not summary.lower().startswith("summary"):
-                summary = "SUMMARY\n\n" + summary
-            return pretty_json + "\n\n" + summary
-        else:
-            return pretty_json
-    else:
-        return out
-
-def _mechanism_signature(topic: str, quotes, model: str = _MODEL, prompt_version: str = _MECHANISM_PROMPT_VERSION) -> str:
-    h = hashlib.sha256()
-    h.update(f"model={model}|prompt_version={prompt_version}\n".encode("utf-8"))
-    h.update((topic or "").encode("utf-8"))
-    for q in quotes:
-        h.update(f"{q.get('doc_id','')}|{q.get('page','')}|{q.get('text','')}\n".encode("utf-8"))
-    return h.hexdigest()[:16]
-
-def _mechanism_cache_path(doc_id: str, sig: str) -> str:
-    return str(stage_cache_path("mechanisms", f"{doc_id}_{sig}.json"))
-
-def _load_mechanism_cache(doc_id: str, sig: str):
-    try:
-        with open(_mechanism_cache_path(doc_id, sig), encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def _save_mechanism_cache(doc_id: str, sig: str, obj):
-    ensure_dir(str(stage_cache_path("mechanisms")))
-    with open(_mechanism_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-
-
-# v9 (R3): cache for fused stance+mechanism call. Keyed on (topic, quotes, model,
-# fused_prompt_version). Stored separately from mechanism cache so a v8
-# mechanism-only cache entry cannot serve a v9 caller that needs stance.
-def _fused_signature(topic: str, quotes, model: str = _MODEL,
-                     prompt_version: str = _FUSED_PROMPT_VERSION,
-                     paper_claim: str = "") -> str:
-    h = hashlib.sha256()
-    h.update((topic or "").encode("utf-8"))
-    for q in quotes or []:
-        h.update(b"\x00")
-        h.update(str(q.get("doc_id", "")).encode("utf-8"))
-        h.update(str(q.get("page", 0)).encode("utf-8"))
-        h.update((q.get("text", "") or "")[:400].encode("utf-8"))
-    h.update(b"\x01" + (model or "").encode("utf-8"))
-    h.update(b"\x02" + (prompt_version or "").encode("utf-8"))
-    # v14.4 Shape B: include the pre-extracted paper claim in the cache key
-    # so a re-extracted claim invalidates the stance cache for that doc.
-    h.update(b"\x03" + (paper_claim or "").encode("utf-8"))
-    return h.hexdigest()[:16]
-
-
-def _fused_cache_path(doc_id: str, sig: str) -> str:
-    return str(stage_cache_path("fused", f"{doc_id}_{sig}.json"))
-
-
-def _load_fused_cache(doc_id: str, sig: str):
-    try:
-        with open(_fused_cache_path(doc_id, sig), encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _save_fused_cache(doc_id: str, sig: str, obj):
-    ensure_dir(str(stage_cache_path("fused")))
-    with open(_fused_cache_path(doc_id, sig), "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-
-
-def _build_fused_prompt(topic: str, ev_texts, paper_claim: str = ""):
-    """v14.4: prompt now (a) injects a pre-extracted PAPER CLAIM block above
-    the quotes when available (Shape B), and (b) rewrites the stance
-    definitions to make the critiques-vs-complicates boundary operational
-    — critique = argues thesis is wrong AND proposes a rival cause;
-    complicate = accepts thesis but adds scope conditions WITHOUT proposing a
-    rival cause. The tangential definition is honest: 'paper does not
-    substantively engage with the topic's thesis'.
-    """
-    has_claim = bool(paper_claim)
-    claim_block = ""
-    if has_claim:
-        claim_block = (
-            "PAPER'S CENTRAL CLAIM (pre-extracted from the paper's abstract + "
-            "conclusion — describes what the paper ARGUES, in the author's own "
-            "framing):\n" + paper_claim + "\n\n"
-        )
-    # When the claim is present, give the model an explicit precedence rule:
-    # claim is primary, quotes are confirmation. This is the load-bearing
-    # instruction for the critique-with-rival-cause case where the quotes
-    # often surface concessive prose that LOOKS supportive but is actually
-    # the position the paper is attacking. When no claim was extracted
-    # (no_text or LLM error), this instruction would dangle, so we emit a
-    # different sentence that points at quotes only.
-    primary_signal_sentence = (
-        "Use the PAPER'S CENTRAL CLAIM (above) as the PRIMARY signal; use "
-        "the quotes to confirm or refine the stance. If the claim and the "
-        "quotes appear to point to different stances, TRUST THE CLAIM — the "
-        "quotes may be fragments of a position the paper summarises in order "
-        "to attack it, not its own argument."
-        if has_claim else
-        "Use the quotes as the primary signal. No pre-extracted claim was "
-        "available for this paper."
-    )
-    return (
-        "Read the topic, the paper's central claim (if provided), and the "
-        "quoted evidence from this document. In ONE JSON object decide all of "
-        "the following:\n\n"
-        "1. stance: which of {supports, critiques, complicates, tangential} "
-        "best describes how this document's argument relates to the topic.\n"
-        "2. rationale: one short sentence (<=200 characters) explaining the stance.\n"
-        "3. mechanism: a single sentence (<=120 characters) naming the central "
-        "causal mechanism this document offers in relation to the topic, or "
-        "empty string if none.\n"
-        "4. contested: a single sentence (<=160 characters) naming what this "
-        "document treats as contested or in need of qualification, or empty if "
-        "nothing.\n"
-        "5. mechanisms: a list of 1-3 specific mechanism strings (8-15 words "
-        "each), each answering HOW or THROUGH WHAT, using nouns concrete to "
-        "this document's evidence.\n\n"
-        "Stance definitions (read CAREFULLY — the critiques/complicates "
-        "boundary is the one that matters most):\n"
-        "- supports: the paper actively DEFENDS the topic's thesis through "
-        "measurement, mechanism, or historical case. The paper agrees with "
-        "the thesis as stated AND does NOT identify another cause as equally "
-        "or more fundamental than the one named in the thesis.\n"
-        "- critiques: the paper argues the topic's thesis is INCORRECT or "
-        "NOT THE FUNDAMENTAL EXPLANATION, AND proposes a RIVAL primary cause "
-        "(e.g. geography, factor endowments, culture, technology, ideology, "
-        "slavery, ecological conditions). A critique attacks the thesis and "
-        "offers something else as the real driver.\n"
-        "- complicates: the paper ACCEPTS the thesis broadly but adds SCOPE "
-        "CONDITIONS — qualifications, contingencies, mediating factors, "
-        "measurement limits, region/period limits. A complication refines "
-        "the thesis; it does NOT propose a rival fundamental cause. A paper "
-        "that locates a more UPSTREAM cause (an antecedent that produces or "
-        "shapes the thesis-cause) without rejecting the thesis-cause itself "
-        "is a complicate, not a critique.\n"
-        "- tangential: the paper does not substantively ENGAGE with the "
-        "topic's thesis — it is in an adjacent conversation, addresses a "
-        "different sub-question, or is from a different intellectual domain "
-        "entirely (e.g. natural science when the topic is economic history). "
-        "Excluded from the literature review.\n\n"
-        "Key distinction: if the paper REJECTS the thesis and offers a rival "
-        "cause -> critiques. If the paper ACCEPTS the thesis but narrows when "
-        "or how it holds -> complicates. " + primary_signal_sentence + "\n\n"
-        "Topic:\n" + topic + "\n\n"
-        + claim_block +
-        "Quotes:\n" + "\n\n---\n\n".join(ev_texts) + "\n\n"
-        "Return ONLY a single JSON object with exactly these five keys."
-    )
-
-
-def _validate_fused_result(obj, allowed_doc_ids: set):
-    """Return a normalised fused dict, or None if the response is unusable."""
-    if not isinstance(obj, dict):
-        return None
-    stance = str(obj.get("stance", "")).strip().lower().strip("`'\" .,:;()[]{}")
-    if stance not in _FUSED_STANCE_TOKENS:
-        return None
-    rationale = str(obj.get("rationale", "") or "").strip()[:300]
-    mechanism = str(obj.get("mechanism", "") or "").strip()[:200]
-    contested = str(obj.get("contested", "") or "").strip()[:300]
-    raw_mechs = obj.get("mechanisms", []) or []
-    if not isinstance(raw_mechs, list):
-        raw_mechs = []
-    mechanisms = []
-    for m in raw_mechs[:3]:
-        s = str(m).strip()
-        if s:
-            mechanisms.append(s[:240])
-    # Sanitise embedded parentheticals (R2) so a mis-typed year cannot leak.
-    mechanism = _canonicalise_mech_citation(mechanism, allowed_doc_ids)
-    contested = _canonicalise_mech_citation(contested, allowed_doc_ids)
-    rationale = _canonicalise_mech_citation(rationale, allowed_doc_ids)
-    mechanisms = _canonicalise_mech_list(mechanisms, allowed_doc_ids)
-    return {
-        "stance": stance,
-        "rationale": rationale,
-        "mechanism": mechanism,
-        "contested": contested,
-        "mechanisms": mechanisms,
-    }
-
-
-def _fused_stance_and_mechanism(doc_id: str, topic: str, valid_quotes,
-                                allowed_doc_ids: set, metrics=None,
-                                paper_claim: str = ""):
-    """v9 (R3): single LLM call returning stance + rationale + mechanism +
-    contested + mechanisms[]. Returns a normalised dict on success, or None
-    on any failure (caller falls back to the two-call stance+mechanism path).
-
-    v14.4 Shape B: now also accepts `paper_claim` (pre-extracted central
-    claim from the paper's abstract + conclusion) and injects it into the
-    prompt so the classifier sees the paper's thesis directly, not just the
-    BM25-selected snippets which are often biased toward concessive prose.
-    """
-    ev_texts = []
-    for q in valid_quotes:
-        text = q.get("text", "") or ""
-        clipped = (text[:220] + "...") if len(text) > 220 else text
-        ev_texts.append(f"[{q['doc_id']} p.{q['page']}]\n- {clipped}")
-    prompt = _build_fused_prompt(topic, ev_texts, paper_claim=paper_claim)
-
-    try:
-        import ollama
-        start = time.perf_counter()
-        res = ollama.chat(
-            model=_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options=_OPTIONS_FUSED,
-            keep_alive=_KEEP_ALIVE,
-            format="json",
-            stream=False,
-        )
-        raw = (res.get("message", {}).get("content") or "").strip()
-        if metrics:
-            metrics.record_llm("fused_stance_mech", _MODEL, options=_OPTIONS_FUSED,
-                               duration_s=time.perf_counter() - start,
-                               prompt_chars=len(prompt),
-                               response_chars=len(raw))
-    except Exception as e:
-        if metrics:
-            metrics.record_llm("fused_stance_mech", _MODEL, options=_OPTIONS_FUSED,
-                               success=False, error=e)
-        return None
-
-    # Tolerant JSON parsing (model occasionally wraps with prose)
-    try:
-        start_idx = raw.find("{")
-        end_idx = raw.rfind("}")
-        if start_idx < 0 or end_idx <= start_idx:
-            return None
-        obj = json.loads(raw[start_idx:end_idx + 1])
-    except Exception:
-        return None
-    return _validate_fused_result(obj, allowed_doc_ids)
-
-
-# v11-C: cluster-level synthesis. Sits between per-doc clustering and the
-# writer. For each (stance, cluster) bucket of >=2 docs, asks the LLM to read
-# the cluster's docs as a group and produce a single shared-mechanism claim plus
-# the ids of the docs that support it. The writer renders this as a multi-doc
-# citation block instead of presenting each doc as a separate witness.
-
-def _cluster_synth_signature(topic: str, stance: str, cluster_label: str,
-                             doc_ids, model: str = _MODEL,
-                             prompt_version: str = _CLUSTER_SYNTH_PROMPT_VERSION) -> str:
-    h = hashlib.sha256()
-    h.update((topic or "").encode("utf-8"))
-    h.update(b"\x10" + (stance or "").encode("utf-8"))
-    h.update(b"\x11" + (cluster_label or "").encode("utf-8"))
-    for did in sorted(doc_ids or []):
-        h.update(b"\x00")
-        h.update(str(did).encode("utf-8"))
-    h.update(b"\x01" + (model or "").encode("utf-8"))
-    h.update(b"\x02" + (prompt_version or "").encode("utf-8"))
-    return h.hexdigest()[:16]
-
-
-def _cluster_synth_cache_path(sig: str) -> str:
-    return str(stage_cache_path("cluster_synth", f"{sig}.json"))
-
-
-def _load_cluster_synth_cache(sig: str):
-    try:
-        with open(_cluster_synth_cache_path(sig), encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _save_cluster_synth_cache(sig: str, obj):
-    ensure_dir(str(stage_cache_path("cluster_synth")))
-    with open(_cluster_synth_cache_path(sig), "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-
-
-def _build_cluster_synth_prompt(topic: str, stance: str, cluster_label: str,
-                                cluster_docs: list) -> str:
-    """Build the synthesis prompt. cluster_docs is a list of per-doc summaries
-    with keys: doc_id, mechanism (fused), mechanisms[], quotes[].
-    """
-    parts = [
-        "You are an economic historian writing a literature review.",
-        f"Topic: {topic}",
-        f"All sources below take the same stance toward the topic ({stance}).",
-        f"Cluster label: {cluster_label}",
-        "",
-        "Sources in this cluster:",
-    ]
-    for d in cluster_docs:
-        did = d.get("doc_id", "")
-        mech = (d.get("mechanism") or "").strip()
-        mechs = [m for m in (d.get("mechanisms") or []) if (m or "").strip()][:3]
-        quotes = []
-        for q in (d.get("quotes") or [])[:2]:
-            text = (q.get("text") or q.get("quote") or "").strip()
-            if not text:
-                continue
-            clipped = (text[:200] + "...") if len(text) > 200 else text
-            quotes.append(f"- p.{q.get('page','')}: {clipped}")
-        parts.append(f"\n[{did}]")
-        if mech:
-            parts.append(f"  Lead mechanism: {mech}")
-        if mechs:
-            parts.append("  Other mechanisms: " + " | ".join(mechs))
-        if quotes:
-            parts.append("  Quotes:")
-            parts.extend("  " + q for q in quotes)
-    parts += [
-        "",
-        "Read the cluster as a single stream of literature. In ONE JSON object:",
-        "1. shared_mechanism: ONE sentence (<=200 chars) naming the causal "
-        "mechanism these sources hold in common in relation to the topic. State "
-        "it as a substantive claim about the world, not 'the sources argue...'.",
-        "2. supporting_doc_ids: array of doc_id strings (subset of the listed "
-        "ids) for sources that hold the shared mechanism strongly.",
-        "3. qualifying_doc_ids: array of doc_id strings for sources that hold "
-        "the shared mechanism only with a scope condition or qualification. "
-        "May be empty.",
-        "4. contested_dimension: ONE sentence (<=180 chars) naming the axis on "
-        "which the sources WITHIN this cluster disagree, or empty if they "
-        "fully agree.",
-        "",
-        "Return ONLY a single JSON object with exactly these four keys.",
-    ]
-    return "\n".join(parts)
-
-
-def _validate_cluster_synth(obj, valid_doc_ids: set):
-    if not isinstance(obj, dict):
-        return None
-    shared = str(obj.get("shared_mechanism", "") or "").strip()[:280]
-    contested = str(obj.get("contested_dimension", "") or "").strip()[:240]
-    if not shared:
-        return None
-
-    def _filter_ids(raw):
-        if not isinstance(raw, list):
-            return []
-        out = []
-        for x in raw:
-            s = str(x).strip()
-            if s in valid_doc_ids and s not in out:
-                out.append(s)
-        return out
-
-    supporting = _filter_ids(obj.get("supporting_doc_ids", []))
-    qualifying = _filter_ids(obj.get("qualifying_doc_ids", []))
-    # Sources double-counted as both supporting and qualifying default to
-    # supporting (stronger signal wins).
-    qualifying = [d for d in qualifying if d not in supporting]
-    return {
-        "shared_mechanism": shared,
-        "supporting_doc_ids": supporting,
-        "qualifying_doc_ids": qualifying,
-        "contested_dimension": contested,
-    }
-
-
-def _synthesise_one_cluster(topic: str, stance: str, cluster_label: str,
-                            cluster_docs: list, metrics=None):
-    """One LLM call for a single (stance, cluster) bucket. Returns the
-    validated synthesis dict or None on any failure (writer falls back to the
-    pre-v11-C per-doc evidence path)."""
-    doc_ids = [d.get("doc_id", "") for d in cluster_docs if d.get("doc_id")]
-    valid_doc_ids = set(doc_ids)
-    if not valid_doc_ids:
-        return None
-
-    sig = _cluster_synth_signature(topic, stance, cluster_label, doc_ids)
-    cached = _load_cluster_synth_cache(sig)
-    if cached is not None:
-        if metrics:
-            metrics.cache_event("cluster_synth", "hits")
-        return cached
-    if metrics:
-        metrics.cache_event("cluster_synth", "misses")
-
-    prompt = _build_cluster_synth_prompt(topic, stance, cluster_label, cluster_docs)
-    try:
-        import ollama
-        start = time.perf_counter()
-        res = ollama.chat(
-            model=_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options=_OPTIONS_CLUSTER_SYNTH,
-            keep_alive=_KEEP_ALIVE,
-            format="json",
-            stream=False,
-        )
-        raw = (res.get("message", {}).get("content") or "").strip()
-        if metrics:
-            metrics.record_llm("cluster_synth", _MODEL, options=_OPTIONS_CLUSTER_SYNTH,
-                               duration_s=time.perf_counter() - start,
-                               prompt_chars=len(prompt),
-                               response_chars=len(raw))
-    except Exception as e:
-        if metrics:
-            metrics.record_llm("cluster_synth", _MODEL, options=_OPTIONS_CLUSTER_SYNTH,
-                               success=False, error=e)
-        return None
-
-    try:
-        start_idx = raw.find("{")
-        end_idx = raw.rfind("}")
-        if start_idx < 0 or end_idx <= start_idx:
-            return None
-        obj = json.loads(raw[start_idx:end_idx + 1])
-    except Exception:
-        return None
-    result = _validate_cluster_synth(obj, valid_doc_ids)
-    if result is None:
-        return None
-    _save_cluster_synth_cache(sig, result)
-    if metrics:
-        metrics.cache_event("cluster_synth", "writes")
-    return result
-
-
-def _synthesise_clusters(doc_summaries: list, topic: str, metrics=None) -> dict:
-    """Run cluster-level synthesis for every (stance, cluster) bucket of >=2
-    docs. Returns {(stance, cluster_label): synthesis_dict}. Toggle via
-    RRR_CLUSTER_SYNTHESIS (default ON). Singletons and clusters labelled
-    "Other" are skipped — the multi-citation prose move only makes sense when
-    multiple docs share a real cluster.
-    """
-    # v13: RRR_CLUSTER_SYNTHESIS retired (always on). The v11-C synthesis is
-    # cheap (~8 LLM calls, all cached after first run) and the writer relies
-    # on its output for multi-citation cluster openings.
-    buckets = {}
-    for d in doc_summaries or []:
-        stance = (d.get("stance") or "tangential").strip().lower()
-        cluster = (d.get("cluster") or "Other").strip()
-        buckets.setdefault((stance, cluster), []).append(d)
-
-    syntheses = {}
-    for (stance, cluster_label), cluster_docs in buckets.items():
-        if cluster_label == "Other":
-            continue
-        if len(cluster_docs) < 2:
-            continue
-        if stance not in {"supports", "critiques", "complicates"}:
-            continue
-        result = _synthesise_one_cluster(topic, stance, cluster_label,
-                                         cluster_docs, metrics=metrics)
-        if result is not None:
-            syntheses[(stance, cluster_label)] = result
-
-    if metrics:
-        metrics.set("cluster_syntheses_count", len(syntheses))
-    return syntheses
-
-
-def _try_parse_cluster_json(raw: str, n_mechs: int, all_mechs: list):
-    """Attempt to parse clustering JSON. Returns mech_to_cluster dict or None."""
-    start = raw.find('{')
-    end = raw.rfind('}') + 1
-    if start == -1 or end == 0:
-        return None
-    
-    json_str = raw[start:end]
-    json_str = re.sub(r',\s*}', '}', json_str)
-    json_str = re.sub(r',\s*]', ']', json_str)
-    json_str = re.sub(r'(\d)\s*\n\s*"', r'\1],\n"', json_str)
-    
-    try:
-        clusters = json.loads(json_str)
-    except json.JSONDecodeError:
-        return None
-    
-    if not isinstance(clusters, dict):
-        return None
-    
-    mech_to_cluster = {}
-    for label, indices in clusters.items():
-        if not isinstance(indices, list):
-            continue
-        for idx in indices:
-            if isinstance(idx, int) and 1 <= idx <= n_mechs:
-                mech_to_cluster[all_mechs[idx - 1]] = label
-    
-    # Check we got reasonable coverage
-    if len(mech_to_cluster) < n_mechs * 0.5:
-        return None
-    
-    return mech_to_cluster
-
-
-def _label_from_tokens(tokens):
-    if not tokens:
-        return "Other"
-    words = []
-    for tok in tokens:
-        if tok not in words:
-            words.append(tok)
-        if len(words) >= 4:
-            break
-    return " ".join(w.capitalize() for w in words) or "Other"
-
-
-def _fallback_cluster_mechanisms(all_mechs: list, topic: str, metrics=None) -> dict:
-    topic_tokens = set(tokenize(topic))
-    clusters = []
-    mech_to_cluster = {}
-
-    for mech in all_mechs:
-        toks = set(tokenize(mech)) - topic_tokens
-        if not toks:
-            toks = set(tokenize(mech))
-        best_idx = None
-        best_score = 0.0
-        for idx, cluster in enumerate(clusters):
-            denom = len(toks | cluster["tokens"]) or 1
-            score = len(toks & cluster["tokens"]) / denom
-            if score > best_score:
-                best_idx = idx
-                best_score = score
-        if best_idx is None or (best_score < 0.18 and len(clusters) < 8):
-            clusters.append({"tokens": set(toks), "items": [mech]})
-        else:
-            clusters[best_idx]["tokens"].update(toks)
-            clusters[best_idx]["items"].append(mech)
-
-    for cluster in clusters:
-        counts = {}
-        for item in cluster["items"]:
-            for tok in tokenize(item):
-                if tok not in topic_tokens:
-                    counts[tok] = counts.get(tok, 0) + 1
-        ranked = sorted(counts, key=lambda t: (-counts[t], t))
-        label = _label_from_tokens(ranked)
-        for item in cluster["items"]:
-            mech_to_cluster[item] = label
-
-    if metrics:
-        metrics.inc("cluster_fallbacks")
-        metrics.set("cluster_mode", "local_token_overlap")
-        metrics.set("cluster_fallback_cluster_count", len(clusters))
-    return mech_to_cluster
-
-
-def _cluster_mechanisms(doc_summaries: list, topic: str, metrics=None) -> dict:
-    """
-    Cluster mechanisms into themes.
-
-    Uses the LLM clusterer first, then falls back to deterministic token-overlap
-    clusters so a clustering failure does not restart the whole pipeline.
-    """
-    mech_to_docs = {}
-    for doc in doc_summaries:
-        did = doc.get("doc_id", "")
-        for m in doc.get("mechanisms", []):
-            m = (m or "").strip()
-            if m:
-                if m not in mech_to_docs:
-                    mech_to_docs[m] = []
-                mech_to_docs[m].append(did)
-    
-    if not mech_to_docs:
-        if metrics:
-            metrics.set("cluster_mode", "none")
-        return {}
-    
-    all_mechs = list(mech_to_docs.keys())
-    n_mechs = len(all_mechs)
-    
-    if n_mechs <= 3:
-        if metrics:
-            metrics.set("cluster_mode", "identity")
-        return {m: m[:60] for m in all_mechs}
-    
-    cluster_prompt = (
-        "You are a historian organizing a literature review.\n\n"
-        f"Topic: {topic}\n\n"
-        f"Below are {n_mechs} mechanism claims. Group them into thematic clusters.\n\n"
-        "RULES:\n"
-        "- Use between 4 and 8 clusters.\n"
-        "- Cluster labels: SHORT (3-6 words).\n"
-        f"- Valid indices are 1 to {n_mechs} only.\n"
-        "- Every index must appear exactly once.\n"
-        "- Output ONLY a JSON object, no other text.\n\n"
-        "MECHANISMS:\n"
-    )
-    for i, m in enumerate(all_mechs, 1):
-        m_short = m[:100] + "..." if len(m) > 100 else m
-        cluster_prompt += f"{i}. {m_short}\n"
-    
-    cluster_prompt += (
-        f"\nReturn ONLY valid JSON. Indices must be 1-{n_mechs}.\n"
-        'Example: {"Theme A": [1, 2, 5], "Theme B": [3, 4]}\n'
-        "JSON:\n"
-    )
-    
-    MAX_RETRIES = 5
-    mech_to_cluster = None
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            import ollama
-            start = time.perf_counter()
-            res = ollama.chat(
-                model=_MODEL,
-                messages=[{"role": "user", "content": cluster_prompt}],
-                options=_OPTIONS_CLUSTER,
-                keep_alive=_KEEP_ALIVE,
-                stream=False
-            )
-            raw = res["message"]["content"].strip()
-            if metrics:
-                metrics.record_llm("cluster", _MODEL, options=_OPTIONS_CLUSTER,
-                                   duration_s=time.perf_counter() - start,
-                                   prompt_chars=len(cluster_prompt),
-                                   response_chars=len(raw))
-            
-            ensure_dir(str(logs_path()))
-            with open(logs_path(f"cluster_raw_attempt{attempt+1}.txt"), "w", encoding="utf-8") as f:
-                f.write(raw)
-            
-            mech_to_cluster = _try_parse_cluster_json(raw, n_mechs, all_mechs)
-            
-            if mech_to_cluster is not None:
-                break
-            
-            print(f"[Clustering] Attempt {attempt+1}/{MAX_RETRIES} failed to parse JSON, retrying...")
-            
-        except Exception as e:
-            print(f"[Clustering] Attempt {attempt+1}/{MAX_RETRIES} error: {e}")
-            if metrics:
-                metrics.record_llm("cluster", _MODEL, options=_OPTIONS_CLUSTER,
-                                   success=False, error=e)
-            continue
-    
-    if mech_to_cluster is None:
-        print(f"[Clustering] LLM clustering failed after {MAX_RETRIES} attempts; using deterministic fallback")
-        mech_to_cluster = _fallback_cluster_mechanisms(all_mechs, topic, metrics=metrics)
-    elif metrics:
-        metrics.set("cluster_mode", "llm")
-    
-    for m in all_mechs:
-        if m not in mech_to_cluster:
-            mech_to_cluster[m] = "Other"
-    
-    n_clusters = len(set(mech_to_cluster.values()))
-    n_assigned = sum(1 for m in all_mechs if mech_to_cluster.get(m) != "Other")
-    print(f"[Clustering] {n_mechs} mechanisms -> {n_clusters} clusters ({n_assigned} assigned, {n_mechs - n_assigned} to Other)")
-    return mech_to_cluster
 
 # v13: _build_author_year_lookup and _collect_cited_docs promoted to
 # render.py; both modules import them from there now.
@@ -912,13 +56,13 @@ def _cite_harvard(row):
     def s(x):
         val = str(x).strip() if x is not None else ""
         return "" if val.lower() == "nan" else val
-    
+
     def clean_num(x):
         val = s(x)
         if val.endswith('.0'):
             return val[:-2]
         return val
-    
+
     author_full = _clean_latex(s(row.get("author_full")))
     authors_short = _clean_latex(s(row.get("authors")))
     title = _clean_latex(s(row.get("title")))
@@ -927,7 +71,7 @@ def _cite_harvard(row):
     volume = clean_num(row.get("volume"))
     number = clean_num(row.get("number"))
     pages = s(row.get("pages"))
-    
+
     if author_full:
         author_parts = [p.strip() for p in author_full.split(";") if p.strip()]
         formatted_authors = []
@@ -938,7 +82,7 @@ def _cite_harvard(row):
                 formatted_authors.append(f"{surname.strip()}, {initials}")
             else:
                 formatted_authors.append(ap)
-        
+
         if len(formatted_authors) == 1:
             author_str = formatted_authors[0]
         elif len(formatted_authors) == 2:
@@ -947,12 +91,12 @@ def _cite_harvard(row):
             author_str = ", ".join(formatted_authors[:-1]) + f" and {formatted_authors[-1]}"
     else:
         author_str = authors_short or "[Unknown]"
-    
+
     cite = f"{author_str} ({year})" if year else author_str
-    
+
     if title:
         cite += f" '{title}'"
-    
+
     if venue:
         cite += f", {venue}"
         if volume:
@@ -961,7 +105,7 @@ def _cite_harvard(row):
                 cite += f"({number})"
         if pages:
             cite += f", pp. {pages.replace('--', '-')}"
-    
+
     cite += "."
     return cite
 
@@ -992,14 +136,6 @@ def _doc_admit_cache_path(sig: str):
     # v15.16: workspace-level (was runs_path("cache", ...) — per-run
     # under the v15.9 minted-run-id layout, so replay never worked).
     return stage_cache_path("doc_admit", f"{sig}.json")
-
-
-def _load_doc_admit_cache(sig: str):
-    obj = _load_doc_admit_cache_obj(sig)
-    if not obj:
-        return None
-    docs = obj.get("docs", [])
-    return docs if isinstance(docs, list) else None
 
 
 def _load_doc_admit_cache_obj(sig: str):
@@ -1208,7 +344,7 @@ def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int,
     return ranked[:max(1, topk)]
 
 
-def _layered_t2_inner(args, meta_path, restart_attempt=0):
+def _layered_t2_inner(args, meta_path):
     """
     Inner implementation of layered_t2.
     """
@@ -1221,7 +357,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
     topic = args.topic
     metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
-    metrics.set("restart_attempt", restart_attempt)
 
     # v15.11: language routing. CLI sets these before importing us; we
     # surface them on metrics for observability. Absence means the pipeline
@@ -1402,7 +537,7 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         meta_path,
         _MODEL,
         plan=plan_obj,
-        extra={"admit_settings": admit_settings, "restart_attempt": restart_attempt},
+        extra={"admit_settings": admit_settings},
     )
 
     MAX_WORKERS = env_int("RRR_CONCURRENCY", 4)
@@ -1570,15 +705,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         enriched["claim"] = paper_claim
         enriched["claim_source"] = claim_info.get("source", "")
         return enriched
-
-    # v15.7: _v14_enrich_doc_legacy retired. The v9-v14 fused stance + mechanism
-    # path is no longer in the production pipeline (v15 enrich_doc above produces
-    # the only enrichment the writer sees). The helpers it depended on
-    # (_fused_signature, _build_fused_prompt, _validate_fused_result,
-    # _load_fused_cache, _save_fused_cache, _fused_stance_and_mechanism,
-    # _mechanism_signature, _load_mechanism_cache, _save_mechanism_cache,
-    # classify_evidence_stance) remain in the module for cross-version cache
-    # forensics, but no production call site references them.
 
     admitted_docs = None
     if DOC_ADMIT_CACHE and DOC_ADMIT_REPLAY:
@@ -2171,7 +1297,6 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
         # "stance::cluster_label" — clusters are top-level, not nested under
         # discrete stance buckets.
         "outline_plan": outline_plan,
-        "restarts_required": restart_attempt
     }
     with metrics.stage("write_ledger"):
         # v15.14: atomic via save_json — the ledger is the writer's input; a
@@ -2340,15 +1465,15 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
                 return
 
             raw_ref_lines = [(did, refs.get(did, did)) for did in cited_docids]
-            
+
             def sort_key(item):
                 did = item[0]
                 clean = did.replace("EtAl", "").replace("&", "")
                 parts = clean.split("_")
                 return parts[0].lower() if parts else did.lower()
-            
+
             raw_ref_lines = sorted(raw_ref_lines, key=sort_key)
-            
+
             seen_refs = set()
             ref_lines = []
             for did, rline in raw_ref_lines:
@@ -2421,28 +1546,5 @@ def _layered_t2_inner(args, meta_path, restart_attempt=0):
 
 
 def layered_t2(args, meta_path):
-    """
-    Main entry point for layered T2 with automatic restart on clustering failure.
-    """
-    MAX_RESTARTS = 5
-    
-    for restart_attempt in range(MAX_RESTARTS):
-        try:
-            if restart_attempt > 0:
-                print(f"[Layered-T2] === RESTART {restart_attempt}/{MAX_RESTARTS} ===")
-            
-            _layered_t2_inner(args, meta_path, restart_attempt)
-            return
-            
-        except ClusteringFailedError as e:
-            print(f"[Layered-T2] {e}")
-            if restart_attempt < MAX_RESTARTS - 1:
-                print(f"[Layered-T2] Restarting full pipeline...")
-                import shutil
-                cache_path = str(stage_cache_path("mechanisms"))
-                if os.path.isdir(cache_path):
-                    shutil.rmtree(cache_path)
-                continue
-            else:
-                raise RuntimeError(f"Pipeline failed after {MAX_RESTARTS} full restarts due to clustering failures")
-
+    """Run the current layered T2 pipeline once."""
+    return _layered_t2_inner(args, meta_path)

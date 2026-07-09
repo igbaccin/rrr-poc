@@ -38,7 +38,6 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -205,7 +204,6 @@ def ocr_known_errors(text: str) -> str:
 # Step 4: strip running headers / footers (per-paper cross-page repetition)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_HEADER_FOOTER_CANDIDATE_RE = re.compile(r"^[ \t]*([^\n]{4,80})[ \t]*$", re.MULTILINE)
 _PAGENUM_ONLY_RE = re.compile(r"^[ \t]*\d{1,4}[ \t]*$", re.MULTILINE)
 
 
