@@ -36,6 +36,39 @@ DISPLAY_PAREN_CITE_RE = re.compile(
     r"\((" + _DISPLAY_LABEL + r")(?:,?\s+)(\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(\d+)\)"
 )
 
+# A grouped parenthetical shares one pair of outer parentheses across two or
+# more citation members, for example ``(Austin 2008, p.1; North 1989, p.2)``.
+# The standalone patterns above deliberately retain their historical contract:
+# they match a complete citation with its own parentheses.  Group parsing is a
+# separate, conservative path so callers that use those public regexes directly
+# keep seeing exactly the same matches.
+_GROUPED_PAREN_RE = re.compile(r"\((?P<body>[^();]*(?:;[^();]*)+)\)")
+_GROUPED_SURNAME = (
+    r"(?:(?:(?i:van|von|de|del|der)\s+)?"
+    r"[A-Z][A-Za-z'\u2019\-]+)"
+)
+_GROUPED_DISPLAY_LABEL = (
+    _GROUPED_SURNAME
+    + r"(?:\s+(?:(?:and|&)\s+" + _GROUPED_SURNAME
+    + r"|et\s+al\.?))?"
+)
+_GROUPED_CANONICAL_ITEM_RE = re.compile(
+    r"(?P<doc_id>[A-Za-z0-9_&.\-]+)\s*:\s*p\.\s*(?P<page>\d+)"
+)
+_GROUPED_DISPLAY_ITEM_RE = re.compile(
+    r"(?P<label>" + _GROUPED_DISPLAY_LABEL + r")(?:,?\s+)"
+    r"(?P<year>\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(?P<page>\d+)"
+)
+_GROUPED_NARRATIVE_FIRST_RE = re.compile(
+    r"(?P<year>\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(?P<page>\d+)"
+)
+_GROUPED_NARRATIVE_LABEL_RE = re.compile(
+    r"(?<!\w)(?P<label>" + _GROUPED_DISPLAY_LABEL + r")\s*$"
+)
+_GROUPED_CITATION_SHAPED_RE = re.compile(
+    r"(?:\bp{1,2}\.\s*\d+|\b\d{4}[a-z]?\b)", re.IGNORECASE
+)
+
 
 # v15.9 (#1): metadata-driven author label lookup.
 #
@@ -264,8 +297,7 @@ def _build_display_lookup(allowed_doc_ids):
 
 
 def parse_citations(text: str, display_lookup: dict = None):
-    """Iterate citations across all three production surfaces, with optional
-    doc_id resolution for display forms.
+    """Iterate citations across all production surfaces in source order.
 
     Yields {doc_id, label, year, page, start, end, raw, surface}.
 
@@ -279,9 +311,130 @@ def parse_citations(text: str, display_lookup: dict = None):
     Validators that need (doc_id, page) tuples across all surfaces
     (coverage audit, redundancy drop, invalid-cite removal) should pass
     the display_lookup so display surfaces resolve consistently.
+
+    A semicolon group is accepted when it contains at least one complete
+    canonical or display citation and every remaining member is citation
+    shaped.  Malformed members remain untouched and complete members are
+    yielded independently.  A narrative first member is also accepted, as in
+    ``Austin (2008, p.1; North 1989, p.2)``.  Each complete member receives its
+    own exact source span.  Shared parentheses and semicolon delimiters remain
+    outside those spans so provenance linkification can wrap members cleanly.
     """
-    for match in CITE_RE.finditer(text or ""):
-        yield {
+    source = text or ""
+    hits = []
+    grouped_spans = []
+
+    def _resolve_display(label, year):
+        if not display_lookup:
+            return None
+        return display_lookup.get((label.lower(), year))
+
+    # Parse grouped parentheticals first.  Splitting on semicolons is safe only
+    # after the outer matcher has ruled out nested parentheses.  At least one
+    # member must match an anchored citation pattern, and any malformed member
+    # must still be citation shaped.  This keeps ordinary prose parentheticals
+    # outside the citation parser while preserving valid neighbours of errors.
+    for group_match in _GROUPED_PAREN_RE.finditer(source):
+        body = group_match.group("body")
+        body_start = group_match.start("body")
+        pieces = body.split(";")
+        if len(pieces) < 2:
+            continue
+
+        parsed = []
+        cursor = 0
+        narrative_label_match = None
+        citation_shaped_group = True
+        for index, piece in enumerate(pieces):
+            left_trim = len(piece) - len(piece.lstrip())
+            right_trim = len(piece.rstrip())
+            item_start = body_start + cursor + left_trim
+            item_end = body_start + cursor + right_trim
+            item_raw = source[item_start:item_end]
+
+            canonical = _GROUPED_CANONICAL_ITEM_RE.fullmatch(item_raw)
+            if canonical:
+                parsed.append({
+                    "doc_id": canonical.group("doc_id"),
+                    "label": None,
+                    "year": None,
+                    "page": int(canonical.group("page")),
+                    "start": item_start,
+                    "end": item_end,
+                    "raw": item_raw,
+                    "surface": "canonical",
+                })
+                cursor += len(piece) + 1
+                continue
+
+            display = _GROUPED_DISPLAY_ITEM_RE.fullmatch(item_raw)
+            if display:
+                label = display.group("label").strip()
+                year = display.group("year")
+                parsed.append({
+                    "doc_id": _resolve_display(label, year),
+                    "label": label,
+                    "year": year,
+                    "page": int(display.group("page")),
+                    "start": item_start,
+                    "end": item_end,
+                    "raw": item_raw,
+                    "surface": "display_paren",
+                })
+                cursor += len(piece) + 1
+                continue
+
+            narrative = (
+                _GROUPED_NARRATIVE_FIRST_RE.fullmatch(item_raw)
+                if index == 0 else None
+            )
+            if narrative:
+                prefix = source[:group_match.start()]
+                narrative_label_match = _GROUPED_NARRATIVE_LABEL_RE.search(prefix)
+            if narrative and narrative_label_match:
+                label = narrative_label_match.group("label").strip()
+                year = narrative.group("year")
+                parsed.append({
+                    "doc_id": _resolve_display(label, year),
+                    "label": label,
+                    "year": year,
+                    "page": int(narrative.group("page")),
+                    "start": item_start,
+                    "end": item_end,
+                    "raw": item_raw,
+                    "surface": "display_narrative",
+                })
+                cursor += len(piece) + 1
+                continue
+
+            # A malformed citation-shaped neighbour must not hide complete
+            # members from provenance and validation.  Leave the malformed
+            # text untouched and keep scanning.  Ordinary prose marks the
+            # parenthetical as non-citation content, so reject that container
+            # wholesale to retain the conservative classification boundary.
+            if not item_raw or _GROUPED_CITATION_SHAPED_RE.search(item_raw):
+                cursor += len(piece) + 1
+                continue
+            citation_shaped_group = False
+            break
+
+        if not citation_shaped_group or not parsed:
+            continue
+        group_start = (
+            narrative_label_match.start("label")
+            if narrative_label_match else group_match.start()
+        )
+        grouped_spans.append((group_start, group_match.end()))
+        hits.extend(parsed)
+
+    def _overlaps_group(start, end):
+        return any(start < group_end and group_start < end
+                   for group_start, group_end in grouped_spans)
+
+    for match in CITE_RE.finditer(source):
+        if _overlaps_group(match.start(), match.end()):
+            continue
+        hits.append({
             "doc_id": match.group(1),
             "label": None,
             "year": None,
@@ -290,15 +443,14 @@ def parse_citations(text: str, display_lookup: dict = None):
             "end": match.end(),
             "raw": match.group(0),
             "surface": "canonical",
-        }
-    for match in DISPLAY_CITE_RE.finditer(text or ""):
+        })
+    for match in DISPLAY_CITE_RE.finditer(source):
+        if _overlaps_group(match.start(), match.end()):
+            continue
         label = match.group(1).strip()
         year = match.group(2)
-        did = None
-        if display_lookup:
-            did = display_lookup.get((label.lower(), year))
-        yield {
-            "doc_id": did,
+        hits.append({
+            "doc_id": _resolve_display(label, year),
             "label": label,
             "year": year,
             "page": int(match.group(3)),
@@ -306,15 +458,14 @@ def parse_citations(text: str, display_lookup: dict = None):
             "end": match.end(),
             "raw": match.group(0),
             "surface": "display_narrative",
-        }
-    for match in DISPLAY_PAREN_CITE_RE.finditer(text or ""):
+        })
+    for match in DISPLAY_PAREN_CITE_RE.finditer(source):
+        if _overlaps_group(match.start(), match.end()):
+            continue
         label = match.group(1).strip()
         year = match.group(2)
-        did = None
-        if display_lookup:
-            did = display_lookup.get((label.lower(), year))
-        yield {
-            "doc_id": did,
+        hits.append({
+            "doc_id": _resolve_display(label, year),
             "label": label,
             "year": year,
             "page": int(match.group(3)),
@@ -322,7 +473,10 @@ def parse_citations(text: str, display_lookup: dict = None):
             "end": match.end(),
             "raw": match.group(0),
             "surface": "display_paren",
-        }
+        })
+
+    hits.sort(key=lambda citation: (citation["start"], citation["end"]))
+    yield from hits
 
 
 # Citation rendering now has one active path. The writer emits evidence IDs,
