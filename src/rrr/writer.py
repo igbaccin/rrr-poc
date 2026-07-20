@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from rrr.utils import ensure_dir, env_int
@@ -289,6 +290,11 @@ def _clip(s: str, n=260) -> str:
     return (s[:n] + "...") if len(s) > n else s
 
 
+def _writer_passage_text(q) -> str:
+    """Return the complete normalized passage supplied to the writer."""
+    return re.sub(r"\s+", " ", str(q.get("text", "") or "")).strip()
+
+
 def _format_quote(q) -> str:
     # v15.7: removed trailing render_citation. The display surface
     # 'Author (Year, p.N)' shown here was the model's training set for
@@ -298,27 +304,57 @@ def _format_quote(q) -> str:
     # seeing the surface it is forbidden to emit.
     did = str(q.get("doc_id", "")).strip()
     pg = int(q.get("page", 0) or 0)
-    tx = _clip(q.get("text", ""), n=260)
+    tx = _writer_passage_text(q)
     eid = str(q.get("evidence_id", "")).strip()
     prefix = f"[{eid}] " if eid else ""
     suffix = f" (from {did}, p.{pg})" if did and pg else ""
     return f'{prefix}"{tx}"{suffix}'
 
 
-def _format_doc_entry(d) -> str:
-    """v15: per-doc evidence block for the writer. The header carries doc id
-    + display citation surface; the body carries the paper's CLAIM (from
-    Stage 0 claim extraction) plus 1-2 evidence quotes.
+def _writer_quotes_per_doc() -> int:
+    """Return the retained-passage limit applied to one writer call."""
+    return max(1, env_int("RRR_WRITER_QUOTES_PER_DOC", 2))
+
+
+def _select_call_evidence(docs, quotes_per_doc=None):
+    """Build the authoritative evidence packet for one writer call.
+
+    The ledger remains unchanged. Each returned document is a shallow copy
+    whose ``quotes`` list contains only the passages supplied to this call.
     """
+    limit = max(1, int(quotes_per_doc or _writer_quotes_per_doc()))
+    packet = []
+    for source_doc in docs or []:
+        d = dict(source_doc)
+        selected = list(source_doc.get("quotes") or [])[:limit]
+        if not selected:
+            raise ValueError(
+                f"writer call document {source_doc.get('doc_id')!r} has no evidence passages"
+            )
+        for q in selected:
+            eid = str(q.get("evidence_id", "")).strip()
+            did = str(q.get("doc_id", source_doc.get("doc_id", ""))).strip()
+            page = int(q.get("page", 0) or 0)
+            if not eid or not did or page <= 0:
+                raise ValueError(
+                    f"writer call document {source_doc.get('doc_id')!r} contains "
+                    "a selected passage without evidence_id, doc_id, or page"
+                )
+        d["quotes"] = selected
+        packet.append(d)
+    return packet
+
+
+def _format_doc_entry(d) -> str:
+    """Format every passage in an already bounded writer-call packet."""
     did = str(d.get("doc_id", "")).strip()
     author_label = _doc_id_to_author_label(did)
     lines = [f"[{did}] cite as {author_label!s}"]
     claim = str(d.get("claim", "") or "").strip()
     if claim:
         lines.append(f"  Paper's central claim: {_clip(claim, n=240)}")
-    quotes_per_doc = env_int("RRR_WRITER_QUOTES_PER_DOC", 2)
     qs = d.get("quotes") or []
-    for q in qs[:max(1, quotes_per_doc)]:
+    for q in qs:
         lines.append(f"  {_format_quote(q)}")
     return "\n".join(lines)
 
@@ -350,7 +386,7 @@ def _list_allowed_citations(docs, allowed_pages_by_doc) -> str:
             page_str = ", ".join(f"p.{p}" for p in pages[:6])
             lines.append(f"  - (paper {did}, pages {page_str}; author surname: {surnames})")
     if evidence_lines:
-        return "\n".join(evidence_lines[:32])
+        return "\n".join(evidence_lines)
     return "\n".join(lines)
 
 
@@ -364,6 +400,90 @@ def _build_evidence_id_map(docs):
             if eid and did and page:
                 evidence[eid] = {"doc_id": did, "page": page}
     return evidence
+
+
+def _group_evidence_ids_by_doc(docs):
+    """Group only the evidence IDs present in one bounded call packet."""
+    grouped = defaultdict(list)
+    for eid, ev in _build_evidence_id_map(docs).items():
+        did = str(ev.get("doc_id", "") or "").strip()
+        if did:
+            grouped[did].append(eid)
+    return {
+        did: sorted(eids)
+        for did, eids in grouped.items()
+    }
+
+
+def _build_call_contract(stage: str, docs, allowed_list: str, prompt: str) -> dict:
+    """Describe and verify the evidence interface for one generation call."""
+    evidence_map = _build_evidence_id_map(docs)
+    allowed_pairs, allowed_docs, _ = _build_allowed_citations(docs)
+    displayed_ids = set(evidence_map)
+    listed_ids = set(re.findall(r"\[(E\d{4})\]", allowed_list or ""))
+    prompt_ids = set(re.findall(r"\[(E\d{4})\]", prompt or ""))
+
+    if displayed_ids != listed_ids:
+        raise AssertionError(
+            f"{stage}: displayed evidence IDs differ from the allowed citation list"
+        )
+    if not prompt_ids.issubset(displayed_ids):
+        extra = sorted(prompt_ids - displayed_ids)
+        raise AssertionError(
+            f"{stage}: prompt contains evidence IDs outside the call packet: {extra}"
+        )
+
+    passages = []
+    for d in docs:
+        source_did = str(d.get("doc_id", "")).strip()
+        for q in d.get("quotes", []) or []:
+            eid = str(q.get("evidence_id", "")).strip()
+            did = str(q.get("doc_id", source_did)).strip() or source_did
+            page = int(q.get("page", 0) or 0)
+            source_text = str(q.get("text", "") or "")
+            display_text = _writer_passage_text(q)
+            passages.append({
+                "evidence_id": eid,
+                "doc_id": did,
+                "page": page,
+                "display_text": display_text,
+                "display_text_sha256": hashlib.sha256(
+                    display_text.encode("utf-8")
+                ).hexdigest(),
+                "source_text_sha256": hashlib.sha256(
+                    source_text.encode("utf-8")
+                ).hexdigest(),
+            })
+
+    displayed_texts_present = all(
+        passage["display_text"] in (prompt or "") for passage in passages
+    )
+    if not displayed_texts_present:
+        raise AssertionError(
+            f"{stage}: a selected passage is absent or truncated in the prompt"
+        )
+
+    return {
+        "stage": stage,
+        "document_ids": sorted(allowed_docs),
+        "evidence_ids": sorted(displayed_ids),
+        "allowed_doc_page_pairs": [
+            {"doc_id": did, "page": page}
+            for did, page in sorted(allowed_pairs)
+        ],
+        "prompt_sha256": hashlib.sha256((prompt or "").encode("utf-8")).hexdigest(),
+        "prompt_chars": len(prompt or ""),
+        "passages": passages,
+        "invariants": {
+            "displayed_ids_equal_listed_ids": displayed_ids == listed_ids,
+            "displayed_passage_texts_present": displayed_texts_present,
+            "prompt_ids_within_call_packet": prompt_ids.issubset(displayed_ids),
+            "renderer_ids_equal_displayed_ids": set(evidence_map) == displayed_ids,
+            "validator_pairs_equal_displayed_pairs": set(allowed_pairs) == {
+                (v["doc_id"], int(v["page"])) for v in evidence_map.values()
+            },
+        },
+    }
 
 
 def _author_surnames_only(label: str) -> str:
@@ -461,10 +581,10 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
                 lo = max(0, match.start() - 60)
                 hi = min(len(text), match.end() + 60)
                 stats["unknown_eid_snippets"].append(text[lo:hi].replace("\n", " "))
-            # Leave the bare [E####] marker in place — downstream
-            # _drop_zero_citation_paragraphs treats it as a recognised
-            # cite (v15.7) so the LLM's prose around an unknown marker
-            # is not silently lost.
+            # Remove the unknown marker. The surrounding prose remains
+            # available to the coverage audit, which can request a retry.
+            out_parts.append(text[last_end:match.start()])
+            last_end = match.end()
             continue
         doc_id = ev["doc_id"]
         page = int(ev["page"])
@@ -2106,7 +2226,7 @@ STRICT RULES:
 Continue:"""
 
 
-def _dump_writer_prompt(stage: str, system: str, user: str) -> None:
+def _dump_writer_prompt(stage: str, system: str, user: str):
     """v10: when RRR_DEBUG_WRITER_PROMPTS=1 (or an explicit dir), write the
     exact system+user pair sent to the model into runs/prompts/. One file per
     stage call; later calls of the same stage suffix with a counter.
@@ -2132,8 +2252,24 @@ def _dump_writer_prompt(stage: str, system: str, user: str) -> None:
         )
         with open(fn, "w", encoding="utf-8") as f:
             f.write(payload)
+        return fn
     except Exception:
         # debug dump must never break a writer call
+        return None
+
+
+def _dump_writer_response(prompt_path, response: str = "", error=None) -> None:
+    """Store the exact response paired with a dumped writer prompt."""
+    if not prompt_path:
+        return
+    try:
+        response_path = os.path.splitext(prompt_path)[0] + "_response.txt"
+        payload = response or ""
+        if error is not None:
+            payload += f"\n\n===== ERROR =====\n{error}\n"
+        with open(response_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+    except Exception:
         pass
 
 
@@ -2141,7 +2277,7 @@ def _ollama_chat(prompt: str, metrics=None, stage="writer"):
     import ollama
     import time
     _system = _writer_system_prompt()
-    _dump_writer_prompt(stage, _system, prompt)
+    prompt_path = _dump_writer_prompt(stage, _system, prompt)
     start = time.perf_counter()
     try:
         res = ollama.chat(
@@ -2155,12 +2291,14 @@ def _ollama_chat(prompt: str, metrics=None, stage="writer"):
             stream=False,
         )
     except Exception as e:
+        _dump_writer_response(prompt_path, error=e)
         if metrics:
             metrics.record_llm(stage, _MODEL, options=_DEFAULT_CHAT_OPTIONS,
                                success=False, duration_s=time.perf_counter() - start,
                                prompt_chars=len(prompt), error=e)
         raise
     out = (res.get("message", {}).get("content") or "").strip()
+    _dump_writer_response(prompt_path, response=out)
     if metrics:
         metrics.record_llm(stage, _MODEL, options=_DEFAULT_CHAT_OPTIONS,
                            duration_s=time.perf_counter() - start,
@@ -2491,6 +2629,7 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     try:
         import ollama
         start = time.perf_counter()
+        prompt_path = _dump_writer_prompt("cross_section_stitch", "", prompt)
         # v13: RRR_WRITER_STITCH_T/CTX/PRED retired; tuning frozen.
         res = ollama.chat(
             model=_MODEL,
@@ -2501,11 +2640,14 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
             stream=False,
         )
         raw = (res.get("message", {}).get("content") or "").strip()
+        _dump_writer_response(prompt_path, response=raw)
         if metrics:
             metrics.record_llm("cross_section_stitch", _MODEL,
                                duration_s=time.perf_counter() - start,
                                prompt_chars=len(prompt), response_chars=len(raw))
     except Exception as e:
+        if "prompt_path" in locals():
+            _dump_writer_response(prompt_path, error=e)
         if metrics:
             metrics.record_llm("cross_section_stitch", _MODEL,
                                success=False, error=e)
@@ -2695,12 +2837,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     pdf_page_offsets = data.get("pdf_page_offsets", {}) or {}
     dois_by_docid = data.get("dois_by_docid", {}) or {}
 
-    allowed_pairs, allowed_docs, allowed_pages_by_doc = _build_allowed_citations(docs)
-    if not allowed_pairs:
+    ledger_allowed_pairs, ledger_allowed_docs, _ = _build_allowed_citations(docs)
+    if not ledger_allowed_pairs:
         raise SystemExit("No allowed citations found in ledger.")
-
-    author_year_to_docid = _build_author_year_lookup(allowed_docs)
-    evidence_id_map = _build_evidence_id_map(docs)
 
     # v15: read the corpus-level OUTLINE PLAN instead of stance-bucketed
     # cluster_syntheses. Each cluster is top-level (no nested-under-stance
@@ -2715,16 +2854,6 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         outline_plan.get("ordered_cluster_ids")
         or list(clusters_by_id.keys())
     )
-
-    # Reverse lookup: doc_id -> evidence_ids (used by outline blocks for
-    # multi-citation parentheticals).
-    doc_to_evidence_ids = defaultdict(list)
-    for eid, ev in evidence_id_map.items():
-        did = (ev.get("doc_id") or "").strip()
-        if did:
-            doc_to_evidence_ids[did].append(eid)
-    for did in list(doc_to_evidence_ids.keys()):
-        doc_to_evidence_ids[did] = sorted(doc_to_evidence_ids[did])
 
     docs_by_id = {d.get("doc_id"): d for d in docs}
 
@@ -2780,7 +2909,6 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         cluster_docs = [docs_by_id[did] for did in c["doc_ids"] if did in docs_by_id]
         if not cluster_docs:
             continue
-        outline_block = _format_outline_block(c, doc_to_evidence_ids)
         this_lead = cluster_lead_surnames.get(cid, "")
         forbidden = sorted(s for s in all_lead_surnames if s and s != this_lead)
         builder = partial(_build_stream_prompt,
@@ -2796,7 +2924,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             c.get("shared_thread") or cid,
             cluster_docs,
             builder,
-            outline_block,
+            c,
         ))
 
     if not chunk_plan:
@@ -2831,6 +2959,36 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     unknown_eid_snippets: list = []
     attribution_mismatch_snippets: list = []
     section_coverage = []
+    call_contracts = []
+    call_allowed_pairs = set()
+    call_allowed_docs = set()
+    call_evidence_id_map = {}
+
+    def register_call(stage, call_docs, allowed_list, prompt):
+        contract = _build_call_contract(stage, call_docs, allowed_list, prompt)
+        contract["call_index"] = len(call_contracts)
+        call_contracts.append(contract)
+        pairs, doc_ids, _ = _build_allowed_citations(call_docs)
+        call_allowed_pairs.update(pairs)
+        call_allowed_docs.update(doc_ids)
+        call_evidence_id_map.update(_build_evidence_id_map(call_docs))
+        ensure_dir(str(runs_path()))
+        with open(runs_path("writer_call_contracts.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "schema_version": "corrected-writer-v17",
+                    "quotes_per_doc": _writer_quotes_per_doc(),
+                    "calls": call_contracts,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    def register_retry_call(stage, call_docs, prompt):
+        _, _, pages_by_doc = _build_allowed_citations(call_docs)
+        retry_allowed_list = _list_allowed_citations(call_docs, pages_by_doc)
+        register_call(stage, call_docs, retry_allowed_list, prompt)
 
     # v10: display->canonical lookup built once per run. The writer is asked
     # for display surface 'Author (Year, p.N)' but the existing per-section
@@ -2838,7 +2996,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # speak canonical '(Doc_Year: p.N)'. We rewrite display->canonical at the
     # START of postprocess_chunk so the canonical machinery keeps working
     # unchanged; the FINAL assembly converts everything back to display.
-    chunk_display_lookup = _build_display_lookup(allowed_docs)
+    chunk_display_lookup = _build_display_lookup(ledger_allowed_docs)
 
     def _chunk_display_to_canonical(text):
         def repl(m):
@@ -2872,7 +3030,10 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # v15.7: renderer now also acts as attribution gate — returns stats
         # dict with attribution_mismatches that finalize_covered_chunk uses
         # to decide whether to trigger a coverage retry.
-        chunk, render_stats = _render_evidence_id_citations(chunk, evidence_id_map)
+        chunk_evidence_id_map = _build_evidence_id_map(chunk_docs)
+        chunk, render_stats = _render_evidence_id_citations(
+            chunk, chunk_evidence_id_map
+        )
         total_evidence_id_renders += render_stats["replacements"]
         total_unknown_eids += render_stats["unknown_eids"]
         unknown_eid_snippets.extend(render_stats["unknown_eid_snippets"])
@@ -2883,7 +3044,16 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # model invents when it confuses bracket-evidence-id syntax with the
         # canonical doc_id.
         chunk, bracket_rewrites = _render_bracketed_doc_ids(
-            chunk, allowed_docs, doc_to_evidence_ids,
+            chunk,
+            {ev["doc_id"] for ev in chunk_evidence_id_map.values()},
+            {
+                did: sorted(
+                    eid
+                    for eid, ev in chunk_evidence_id_map.items()
+                    if ev["doc_id"] == did
+                )
+                for did in {ev["doc_id"] for ev in chunk_evidence_id_map.values()}
+            },
         )
         total_bracket_id_rewrites += bracket_rewrites
 
@@ -2956,6 +3126,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             retry_prompt = _coverage_retry_prompt(
                 prompt, chunk, audit["required_cited_docs"],
             )
+            register_retry_call(
+                f"{stage}_attribution_retry", chunk_docs, retry_prompt
+            )
             raw_retry = _ollama_chat(
                 retry_prompt, metrics=metrics, stage=f"{stage}_attribution_retry",
             )
@@ -3017,6 +3190,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             if metrics:
                 metrics.inc("writer_section_coverage_retries")
             retry_prompt = _coverage_retry_prompt(prompt, chunk, audit["required_cited_docs"])
+            register_retry_call(
+                f"{stage}_coverage_retry", chunk_docs, retry_prompt
+            )
             raw = _ollama_chat(retry_prompt, metrics=metrics, stage=f"{stage}_coverage_retry")
             chunk, repairs2, placeholders2, ajr2, style_removed2, _retry_stats = postprocess_chunk(raw, chunk_docs)
             audit = _audit_section_coverage(chunk, chunk_docs, section_kind)
@@ -3058,15 +3234,22 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # v15: opening docs draw the top-2 by score from EACH cluster in the
     # chunk plan, then the top 6 overall. This keeps the opening's evidence
     # diversified across streams without referencing any stance bucket.
-    opening_docs = []
+    opening_docs_unbounded = []
     for relation, cluster_label, cluster_docs, _builder, _block in chunk_plan:
-        opening_docs.extend(sorted(cluster_docs, key=_score_doc, reverse=True)[:2])
-    opening_docs = sorted(opening_docs, key=_score_doc, reverse=True)[:6]
+        opening_docs_unbounded.extend(
+            sorted(cluster_docs, key=_score_doc, reverse=True)[:2]
+        )
+    opening_docs_unbounded = sorted(
+        opening_docs_unbounded, key=_score_doc, reverse=True
+    )[:6]
+    opening_docs = _select_call_evidence(opening_docs_unbounded)
 
-    allowed_list = _list_allowed_citations(opening_docs, allowed_pages_by_doc)
+    _, _, opening_pages_by_doc = _build_allowed_citations(opening_docs)
+    allowed_list = _list_allowed_citations(opening_docs, opening_pages_by_doc)
     evidence = "\n\n".join(_format_doc_entry(d) for d in opening_docs)
 
     prompt = _build_opening_prompt(topic, stance_summary, evidence, allowed_list)
+    register_call("writer_opening", opening_docs, allowed_list, prompt)
 
     try:
         chunk, repairs, placeholders, ajr, style_removed, audit = generate_covered_chunk(
@@ -3089,20 +3272,30 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # Generate stance sections
     stance_jobs = []
     parallel_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
-    for i, (stance, cluster, cluster_docs, prompt_builder, synthesis_block) in enumerate(chunk_plan):
-        cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
-        allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
+    for i, (stance, cluster, cluster_docs, prompt_builder, cluster_plan) in enumerate(chunk_plan):
+        cluster_docs_sorted = _select_call_evidence(
+            sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
+        )
+        _, _, cluster_pages_by_doc = _build_allowed_citations(cluster_docs_sorted)
+        allowed_list = _list_allowed_citations(
+            cluster_docs_sorted, cluster_pages_by_doc
+        )
         evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
+        synthesis_block = _format_outline_block(
+            cluster_plan, _group_evidence_ids_by_doc(cluster_docs_sorted)
+        )
         prompt = prompt_builder(topic, cluster, evidence, allowed_list, parallel_tail,
                                 synthesis_block)
-        stance_jobs.append({
+        job = {
             "index": i,
             "stance": stance,
             "cluster": cluster,
             "docs": cluster_docs_sorted,
             "prompt": prompt,
             "stage": f"writer_{stance}",
-        })
+            "allowed_list": allowed_list,
+        }
+        stance_jobs.append(job)
 
     def record_stance_chunk(job, chunk, word_count):
         top_mechs = []
@@ -3146,6 +3339,10 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     if parallel_workers > 1:
         print(f"[Writer] Parallel stance chunks: workers={parallel_workers}")
         raw_by_index = {}
+        for job in stance_jobs:
+            register_call(
+                job["stage"], job["docs"], job["allowed_list"], job["prompt"]
+            )
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
             futures = {
                 pool.submit(_ollama_chat, job["prompt"], metrics=metrics, stage=job["stage"]): job["index"]
@@ -3186,10 +3383,18 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         # argued. Empty for the first stance section (only the opening exists),
         # then grows as each section completes.
         print(f"[Writer] Sequential stance chunks: claims-so-far context enabled")
-        for i, (stance, cluster, cluster_docs, prompt_builder, synthesis_block) in enumerate(chunk_plan):
-            cluster_docs_sorted = sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
-            allowed_list = _list_allowed_citations(cluster_docs_sorted, allowed_pages_by_doc)
+        for i, (stance, cluster, cluster_docs, prompt_builder, cluster_plan) in enumerate(chunk_plan):
+            cluster_docs_sorted = _select_call_evidence(
+                sorted(cluster_docs, key=_score_doc, reverse=True)[:6]
+            )
+            _, _, cluster_pages_by_doc = _build_allowed_citations(cluster_docs_sorted)
+            allowed_list = _list_allowed_citations(
+                cluster_docs_sorted, cluster_pages_by_doc
+            )
             evidence = "\n\n".join(_format_doc_entry(d) for d in cluster_docs_sorted)
+            synthesis_block = _format_outline_block(
+                cluster_plan, _group_evidence_ids_by_doc(cluster_docs_sorted)
+            )
             previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
             claims_so_far = _format_claims_so_far(section_claims)
             prompt = prompt_builder(topic, cluster, evidence, allowed_list, previous_tail,
@@ -3202,6 +3407,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
                 "prompt": prompt,
                 "stage": f"writer_{stance}",
             }
+            register_call(job["stage"], job["docs"], allowed_list, prompt)
             try:
                 chunk, repairs, placeholders, ajr, style_removed, audit = generate_covered_chunk(
                     job["prompt"],
@@ -3226,10 +3432,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         for did in claim.get("docs", []):
             if did and did not in used_doc_ids:
                 used_doc_ids.append(did)
-    closing_docs = [d for d in docs if d.get("doc_id") in set(used_doc_ids)]
-    closing_docs = sorted(closing_docs, key=_score_doc, reverse=True)[:6]
+    closing_docs_unbounded = [
+        d for d in docs if d.get("doc_id") in set(used_doc_ids)
+    ]
+    closing_docs = _select_call_evidence(
+        sorted(closing_docs_unbounded, key=_score_doc, reverse=True)[:6]
+    )
 
-    allowed_list = _list_allowed_citations(closing_docs, allowed_pages_by_doc)
+    _, _, closing_pages_by_doc = _build_allowed_citations(closing_docs)
+    allowed_list = _list_allowed_citations(closing_docs, closing_pages_by_doc)
     if not allowed_list:
         allowed_list = "(Use only citations already present in the preceding text.)"
     claim_lines = []
@@ -3247,6 +3458,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
 
     previous_tail = chunks[-1][-_TAIL_CHARS:] if chunks else ""
     prompt = _build_closing_prompt(topic, evidence, allowed_list, previous_tail)
+    register_call("writer_closing", closing_docs, allowed_list, prompt)
 
     try:
         chunk, repairs, placeholders, ajr, style_removed, audit = generate_covered_chunk(
@@ -3293,7 +3505,10 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # v15.7: final-assembly renderer is a safety net (per-chunk pass already
     # ran). Any new mismatches detected here are surfaced in the quality
     # manifest but cannot retry — at this point the writer LLM has finished.
-    full_text, final_render_stats = _render_evidence_id_citations(full_text, evidence_id_map)
+    # Each generation response has already been rendered against its
+    # call-local map. Any raw marker that appears after stitching has no
+    # call-level authority and is removed as an unknown ID.
+    full_text, final_render_stats = _render_evidence_id_citations(full_text, {})
     total_evidence_id_renders += final_render_stats["replacements"]
     total_unknown_eids += final_render_stats["unknown_eids"]
     unknown_eid_snippets.extend(final_render_stats["unknown_eid_snippets"])
@@ -3304,7 +3519,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # that survived per-chunk postprocess (rare but possible if a chunk join
     # introduced new bracketed-doc-id text in stitch fallback paths).
     full_text, final_bracket_rewrites = _render_bracketed_doc_ids(
-        full_text, allowed_docs, doc_to_evidence_ids,
+        full_text, call_allowed_docs, call_evidence_id_map,
     )
     total_bracket_id_rewrites += final_bracket_rewrites
 
@@ -3313,6 +3528,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     # end-to-end. Downstream validators consume display surfaces natively via
     # parse_citations + display_lookup. The display_lookup itself is still
     # built here because validators want it for doc_id resolution.
+    allowed_pairs = call_allowed_pairs
+    allowed_docs = call_allowed_docs
+    author_year_to_docid = _build_author_year_lookup(allowed_docs)
     display_lookup = _build_display_lookup(allowed_docs)
 
     # v14.2 fix #1: quote verification. Scan every '"..."' span >=20 chars,
