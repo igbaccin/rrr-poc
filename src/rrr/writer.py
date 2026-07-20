@@ -1189,7 +1189,9 @@ def _rewrite_style_violations(sentences, violations, metrics=None):
     new_sentences = list(sentences)
     rewrites_applied = 0
     for (idx, original, _reasons), new_text in zip(violations, rewritten):
-        new_text = (new_text or "").strip()
+        if not isinstance(new_text, str):
+            continue
+        new_text = new_text.strip()
         if not new_text:
             continue
         # Refuse a rewrite that REINTRODUCES the same violation (model loop).
