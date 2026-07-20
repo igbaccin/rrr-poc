@@ -1120,6 +1120,8 @@ def _rewrite_style_violations(sentences, violations, metrics=None):
     if not violations:
         return sentences, 0, "no_violations"
     prompt = _build_style_rewrite_prompt(violations)
+    system = "You revise academic prose. Be concise. Return JSON only."
+    prompt_path = _dump_writer_prompt("style_rewrite", system, prompt)
     try:
         import ollama
         import time
@@ -1127,8 +1129,7 @@ def _rewrite_style_violations(sentences, violations, metrics=None):
         res = ollama.chat(
             model=_MODEL,
             messages=[
-                {"role": "system",
-                 "content": "You revise academic prose. Be concise. Return JSON only."},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             options=_OPTIONS_STYLE_REWRITE,
@@ -1137,12 +1138,14 @@ def _rewrite_style_violations(sentences, violations, metrics=None):
             stream=False,
         )
         raw = (res.get("message", {}).get("content") or "").strip()
+        _dump_writer_response(prompt_path, response=raw)
         if metrics:
             metrics.record_llm("style_rewrite", _MODEL, options=_OPTIONS_STYLE_REWRITE,
                                duration_s=time.perf_counter() - start,
                                prompt_chars=len(prompt),
                                response_chars=len(raw))
     except Exception as e:
+        _dump_writer_response(prompt_path, error=e)
         if metrics:
             metrics.record_llm("style_rewrite", _MODEL, options=_OPTIONS_STYLE_REWRITE,
                                success=False, error=e)
