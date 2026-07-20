@@ -1111,6 +1111,28 @@ def _build_style_rewrite_prompt(violations) -> str:
     return "\n".join(parts)
 
 
+_EVIDENCE_ID_TOKEN_RE = re.compile(r"\[E\d{4,5}\]")
+
+
+def _citation_fingerprints(text: str):
+    """Return a surface-agnostic citation multiset for rewrite guards."""
+    fingerprints = []
+    for citation in parse_citations(text or ""):
+        label = (
+            citation.get("label") or citation.get("doc_id") or ""
+        ).strip().lower()
+        fingerprints.append((
+            label,
+            str(citation.get("year") or ""),
+            int(citation.get("page") or 0),
+        ))
+    fingerprints.extend(
+        ("__eid__", token, 0)
+        for token in _EVIDENCE_ID_TOKEN_RE.findall(text or "")
+    )
+    return sorted(fingerprints)
+
+
 def _rewrite_style_violations(sentences, violations, metrics=None):
     """Run one batched LLM call to rewrite all flagged sentences.
 
@@ -1172,10 +1194,13 @@ def _rewrite_style_violations(sentences, violations, metrics=None):
         # Refuse a rewrite that REINTRODUCES the same violation (model loop).
         if _classify_sentence_violations(new_text):
             continue
-        # Refuse a rewrite that drops or changes any citation token. We compare
-        # the set of '(Year, p.N)' tuples present before and after.
-        original_cites = set(re.findall(r"\((\d{4})[a-z]?,\s*p\.\s*(\d+)\)", original))
-        new_cites = set(re.findall(r"\((\d{4})[a-z]?,\s*p\.\s*(\d+)\)", new_text))
+        # Refuse a rewrite that drops, duplicates, or changes any citation.
+        # The previous guard inspected only narrative '(Year, p.N)' tokens.
+        # Parenthetical '(Author Year, p.N)' citations therefore compared as
+        # two empty sets, allowing the style model to change a cited paper or
+        # page. Fingerprint every production surface and evidence-ID marker.
+        original_cites = _citation_fingerprints(original)
+        new_cites = _citation_fingerprints(new_text)
         if original_cites != new_cites:
             continue
         new_sentences[idx] = new_text
@@ -2683,16 +2708,6 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
     # the stitch LLM drop or invent citations undetected. Fingerprint across
     # all three surfaces via parse_citations, plus any unrendered [E####]
     # markers, and require an exact multiset match.
-    _eid_token_re = re.compile(r"\[E\d{4,5}\]")
-
-    def _cite_fingerprints(block: str):
-        fps = []
-        for c in parse_citations(block or ""):
-            label = (c.get("label") or c.get("doc_id") or "").strip().lower()
-            fps.append((label, str(c.get("year") or ""), int(c.get("page") or 0)))
-        fps.extend(("__eid__", t, 0) for t in _eid_token_re.findall(block or ""))
-        return sorted(fps)
-
     # v11.1: topic-paraphrase guard. Compute the topic's content-token set once,
     # then reject any stitch rewrite that pulls back to a near-restatement of
     # the topic line. Closes the v11 failure on section 4 where the LLM
@@ -2740,8 +2755,8 @@ def _apply_cross_section_stitch(chunks, topic: str, metrics=None):
         n_open = opener_sent_count_by_index.get(idx, 1)
         n_open = min(n_open, len(sents))
         orig_opener_block = " ".join(s.strip() for s in sents[:n_open])
-        orig_cites = _cite_fingerprints(orig_opener_block)
-        new_cites = _cite_fingerprints(rewritten)
+        orig_cites = _citation_fingerprints(orig_opener_block)
+        new_cites = _citation_fingerprints(rewritten)
         if orig_cites != new_cites:
             skipped_citation += 1
             continue
