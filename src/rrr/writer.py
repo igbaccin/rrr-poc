@@ -1112,6 +1112,7 @@ def _build_style_rewrite_prompt(violations) -> str:
 
 
 _EVIDENCE_ID_TOKEN_RE = re.compile(r"\[E\d{4,5}\]")
+_STYLE_CITATION_GUARD_VERSION = "all-surfaces-v1"
 
 
 def _citation_fingerprints(text: str):
@@ -1253,7 +1254,9 @@ def _apply_style_enforcement(text: str, metrics=None):
     if not text:
         return text, {"trailing_stripped": 0, "violations": 0,
                       "rewrites_applied": 0, "fallback_reason": "empty",
-                      "mechanical_dashes_replaced": 0}
+                      "mechanical_dashes_replaced": 0,
+                      "citation_fingerprint_guard":
+                          _STYLE_CITATION_GUARD_VERSION}
 
     text, trailing_stripped = _strip_trailing_significance(text)
 
@@ -1265,7 +1268,9 @@ def _apply_style_enforcement(text: str, metrics=None):
         text, mechanical_replaced = _mechanical_dash_replace(text)
         return text, {"trailing_stripped": trailing_stripped, "violations": 0,
                       "rewrites_applied": 0, "fallback_reason": "no_violations",
-                      "mechanical_dashes_replaced": mechanical_replaced}
+                      "mechanical_dashes_replaced": mechanical_replaced,
+                      "citation_fingerprint_guard":
+                          _STYLE_CITATION_GUARD_VERSION}
 
     new_sentences, applied, reason = _rewrite_style_violations(
         sentences, violations, metrics=metrics,
@@ -1279,7 +1284,9 @@ def _apply_style_enforcement(text: str, metrics=None):
                       "violations": len(violations),
                       "rewrites_applied": 0,
                       "fallback_reason": reason,
-                      "mechanical_dashes_replaced": mechanical_replaced}
+                      "mechanical_dashes_replaced": mechanical_replaced,
+                      "citation_fingerprint_guard":
+                          _STYLE_CITATION_GUARD_VERSION}
     rewritten_text = _splice_sentences_back(text, new_sentences)
     # v13: post-LLM-rewrite mechanical sweep. Sentences whose rewrites were
     # individually rejected (citation drift) still hold their em-dashes.
@@ -1288,7 +1295,9 @@ def _apply_style_enforcement(text: str, metrics=None):
                             "violations": len(violations),
                             "rewrites_applied": applied,
                             "fallback_reason": reason,
-                            "mechanical_dashes_replaced": mechanical_replaced}
+                            "mechanical_dashes_replaced": mechanical_replaced,
+                            "citation_fingerprint_guard":
+                                _STYLE_CITATION_GUARD_VERSION}
 
 
 # v9 (R6): word-level content tokens for "shares >=K content tokens with an
