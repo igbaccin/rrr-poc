@@ -133,10 +133,8 @@ class Workspace:
         run_id: Optional[str] = None,
     ) -> "Workspace":
         """Build a workspace anchored on an arbitrary corpus folder.
-        The workdir defaults to `~/.rrr/corpora/<hash>` (per productisation
-        plan) — but if the caller passes an explicit workdir we use that.
-        For the initial v15.9, we default workdir to the corpus's parent
-        so existing users keep D:\\RRR-style layouts working.
+        The workdir defaults to the corpus's parent so derived artifacts stay
+        adjacent to the source collection. An explicit workdir takes priority.
         """
         corpus_dir = Path(corpus_dir).expanduser().resolve()
         if workdir is None:

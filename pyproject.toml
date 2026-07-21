@@ -4,13 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rrr-poc"
-version = "15.16.0"
-description = "Retrieval Restricted Reasoning — a literature-review pipeline that reasons only over retrieved, page-anchored evidence."
+version = "0.1.0"
+description = "A corpus-bounded literature-review pipeline with page-verified evidence and auditable citations."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE.txt" }
-authors = [{ name = "Igor Baccin", email = "igbaccin@gmail.com" }]
-keywords = ["retrieval", "rag", "literature-review", "economic-history", "llm"]
+authors = [{ name = "Igor B. Martins" }]
+keywords = ["retrieval", "rag", "literature-review", "citations", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
 
 # Runtime deps. The `ollama` client is required even in RRR_RUNTIME=api mode
 # (the api_backend shim patches ollama.chat), but the ollama *server* is not
@@ -28,12 +37,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# `pip install rrr-poc[api]` for the frontier-API desktop runtime.
+# `pip install rrr-poc[api]` for the Anthropic or OpenAI runtime.
 api = ["anthropic>=0.40.0", "openai>=1.40.0"]
-# `pip install rrr-poc[pod]` adds the RunPod remote-exec helper.
-pod = ["paramiko>=3.5.0"]
-# Everything.
-all = ["anthropic>=0.40.0", "openai>=1.40.0", "paramiko>=3.5.0"]
 
 [project.scripts]
 # One-command CLI: `rrr t2 --metadata metadata.csv --topic "..."`
@@ -42,6 +47,7 @@ rrr = "rrr.cli:main"
 [project.urls]
 Homepage = "https://github.com/igbaccin/rrr-poc"
 Repository = "https://github.com/igbaccin/rrr-poc"
+Issues = "https://github.com/igbaccin/rrr-poc/issues"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

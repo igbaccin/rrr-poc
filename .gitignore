@@ -1,0 +1,49 @@
+# Python environments and build products
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# User corpora and derived artifacts
+corpus/
+data/
+indices/
+runs/
+cache/
+claim_cache/
+logs/
+tmp/
+metadata.csv
+metadata.pending.csv
+ingest_report.json
+bibliography.bib
+*.pdf
+
+# Development and paper-specific material
+private/
+revision_notes/
+paper_artifacts/
+replays/
+pod_outputs/
+arm_outputs/
+tests/battery_*/
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
