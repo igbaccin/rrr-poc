@@ -1458,6 +1458,7 @@ def _split_sentences_for_cleanup(line: str):
 
     protected = re.sub(r"\bet\s+al\.", protect, line, flags=re.IGNORECASE)
     protected = re.sub(r"\b(?:e\.g|i\.e|cf)\.", protect, protected, flags=re.IGNORECASE)
+    protected = re.sub(r"\bpp?\.(?=\s*\d)", protect, protected, flags=re.IGNORECASE)
     parts = re.split(r'(?<=[.!?])\s+', protected)
     return [p.replace(sentinel, ".") for p in parts if p.strip()]
 
