@@ -481,4 +481,3 @@ def parse_citations(text: str, display_lookup: dict = None):
 
 # Citation rendering now has one active path. The writer emits evidence IDs,
 # and its context-aware renderer converts them directly to display citations.
-

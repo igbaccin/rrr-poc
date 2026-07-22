@@ -1,4 +1,4 @@
-"""v15.12: central ollama.chat shim to disable hybrid-thinking models.
+"""v15.17: central runtime router behind the ollama.chat interface.
 
 qwen3 (our non-Latin routing tier) ships with "thinking" ON by default: the
 model emits a long `<think>…</think>` reasoning trace into a separate channel
@@ -89,18 +89,32 @@ def install():
             _base_chat = _original  # older client without timeout kwarg
 
     def _patched(*args, **kwargs):
-        # v15.13: frontier-API runtime. When RRR_RUNTIME=api, route every
-        # ollama.chat call to the Anthropic/OpenAI backend instead of a local
-        # model. Positional args map to ollama.chat's (model, messages).
-        if os.environ.get("RRR_RUNTIME", "").strip().lower() == "api":
+        # API and host runtimes preserve the ollama.chat call contract while
+        # changing only the model transport. Positional args map to
+        # ollama.chat's (model, messages).
+        runtime = os.environ.get("RRR_RUNTIME", "").strip().lower()
+        if runtime == "api":
             from rrr.api_backend import api_chat
             if args:
                 kwargs.setdefault("model", args[0] if len(args) > 0 else "")
                 if len(args) > 1:
                     kwargs.setdefault("messages", args[1])
             return api_chat(**kwargs)
+        if runtime == "host":
+            from rrr.host_backend import host_chat
+            if args:
+                kwargs.setdefault("model", args[0] if len(args) > 0 else "")
+                if len(args) > 1:
+                    kwargs.setdefault("messages", args[1])
+            return host_chat(**kwargs)
+        if runtime not in {"", "local", "ollama"}:
+            raise RuntimeError(
+                "RRR_RUNTIME must be unset, 'local', 'ollama', 'api', or "
+                f"'host'; received {runtime!r}"
+            )
 
         model = kwargs.get("model") or (args[0] if args else "")
+        kwargs.pop("_rrr_stage", None)
         if _is_thinking_model(model) and "think" not in kwargs:
             try:
                 return _base_chat(*args, think=False, **kwargs)

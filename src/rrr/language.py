@@ -7,13 +7,9 @@ Two responsibilities:
    the same topic always resolves the same way (langdetect's Bayesian
    detector is otherwise non-deterministic per-process).
 
-2. select_model(lang) — returns the ollama model name to use for the
-   whole pipeline given a topic language. Latin European languages route
-   to RRR_MODEL_LATIN (default mistral-small:24b). Non-Latin languages
-   (CJK, Arabic, Cyrillic, Devanagari, etc.) route to RRR_MODEL_NONLATIN
-   (default qwen3:14b — chosen for size-parity with mistral-small:24b,
-   NOT the premium qwen3:32b, so users in non-Latin languages get
-   equivalent-tier quality rather than an upgrade).
+2. select_model(lang) returns the configured runtime model. Local Ollama uses
+   language-aware Mistral or Qwen routing. Provider API and subscription-host
+   modes return their explicitly configured model without consulting Ollama.
 
 Both env vars are overridable so operators without the qwen model
 installed can point RRR_MODEL_NONLATIN back at RRR_MODEL_LATIN. When the
@@ -63,8 +59,8 @@ from typing import Optional
 #                           qwen3:32b (5090) instead.
 #
 # All qwen3 variants are covered by the thinking-mode shim (rrr/llm.py,
-# "qwen3" substring). On RRR_RUNTIME=api this whole table is bypassed — one
-# frontier model handles every language (see api_backend.py).
+# "qwen3" substring). API and subscription-host runtimes bypass this table
+# because one configured model handles every language.
 # ---------------------------------------------------------------------------
 MODEL_LATIN_DEFAULT = "mistral-small:24b"
 MODEL_NONLATIN_DEFAULT = "qwen3:14b"          # dense, RTX 4090, shipped default
@@ -146,15 +142,17 @@ def select_model(topic_lang: str) -> str:
     RRR_MODEL / 'mistral' chain so the caller can still boot and produce
     a clear ollama error rather than a mysterious import-time failure.
     """
-    # v15.13: frontier-API runtime. A single API model handles every
-    # language, so language-based local routing is bypassed entirely — return
-    # the configured API model and let the api_backend shim serve every call.
-    if os.environ.get("RRR_RUNTIME", "").strip().lower() == "api":
-        try:
-            from rrr.api_backend import api_model_name
-            return api_model_name()
-        except Exception:
-            pass
+    # API and subscription-host runtimes use one configured model for every
+    # language, so neither path should inspect the local Ollama registry.
+    runtime = os.environ.get("RRR_RUNTIME", "").strip().lower()
+    if runtime == "api":
+        from rrr.api_backend import api_model_name
+
+        return api_model_name()
+    if runtime == "host":
+        from rrr.host_backend import host_model_name
+
+        return host_model_name()
 
     latin = os.environ.get("RRR_MODEL_LATIN", MODEL_LATIN_DEFAULT)
     nonlatin = os.environ.get("RRR_MODEL_NONLATIN", MODEL_NONLATIN_DEFAULT)

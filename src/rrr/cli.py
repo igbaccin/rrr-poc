@@ -146,6 +146,16 @@ def ingest_main(argv):
 
     approved = [m for m in results if not _needs_review(m)]
     pending = [m for m in results if _needs_review(m)]
+    unusable = [m for m in results if not m.doc_id or not m.pdf_path]
+
+    def _row_status(m):
+        if m in unusable:
+            return "correction_required"
+        if m in approved:
+            return "approved"
+        if args.accept_low_confidence:
+            return "accepted_by_flag"
+        return "pending_review"
 
     report = {
         "corpus": str(corpus_dir),
@@ -158,15 +168,30 @@ def ingest_main(argv):
              "authors": m.authors_short, "year": m.year,
              "confidence": m.confidence, "source": m.source,
              "lang": m.lang, "notes": m.notes,
-             "status": ("approved" if m in approved else
-                        "accepted_by_flag" if args.accept_low_confidence else
-                        "pending_review")}
+             "status": _row_status(m)}
             for m in results
         ],
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+
+    if args.accept_low_confidence and unusable:
+        _write_metadata_csv(approved, out_path)
+        pending_path = out_path.with_suffix(".pending.csv")
+        _write_metadata_csv(pending, pending_path)
+        print(
+            f"[ingest] {len(unusable)} row(s) still lack the metadata needed "
+            "for indexing. Approval alone cannot admit them."
+        )
+        for m in unusable:
+            print(
+                f"  CORRECT: {m.pdf_path}  doc_id={m.doc_id!r} "
+                f"source={m.source}"
+            )
+        print(f"[ingest] Correct the rows in {pending_path} and rerun.")
+        print(f"[ingest] report: {report_path}")
+        raise SystemExit(3)
 
     if pending and not args.accept_low_confidence:
         _write_metadata_csv(approved, out_path)
@@ -189,6 +214,154 @@ def ingest_main(argv):
     print(f"[ingest] report: {report_path}")
 
 
+def host_doctor_main(argv):
+    """Verify that native host mode will use a product subscription."""
+    ap = argparse.ArgumentParser(
+        prog="rrr host-doctor",
+        description="Verify Codex or Claude subscription-backed host mode.",
+    )
+    ap.add_argument("--host", choices=["codex", "claude"], default=None)
+    ap.add_argument("--model", default=None)
+    ap.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run one subscription-backed inference call after the auth check.",
+    )
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args(argv)
+
+    if args.host:
+        os.environ["RRR_HOST"] = args.host
+    if args.model:
+        os.environ["RRR_HOST_MODEL"] = args.model
+
+    from rrr.host_backend import (
+        HostBackendError,
+        host_diagnostics,
+        host_smoke_test,
+    )
+
+    try:
+        status = host_diagnostics()
+        if args.smoke:
+            status.update(host_smoke_test())
+    except HostBackendError as exc:
+        sys.stderr.write(f"[RRR] host doctor failed: {exc}\n")
+        raise SystemExit(2)
+
+    if args.as_json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return
+    auth = status["authentication"]
+    subscription = auth.get("subscription_type")
+    suffix = f" ({subscription})" if subscription else ""
+    print(
+        f"[RRR] authentication ready: {status['host']} {status['model']} via "
+        f"{auth['method']} subscription{suffix}"
+    )
+    print(f"[RRR] executable: {status['executable']}")
+    if status.get("inference_ready"):
+        print("[RRR] inference smoke test: passed")
+    else:
+        print(
+            "[RRR] inference was not tested. Add --smoke to spend one "
+            "subscription call on a JSON contract check."
+        )
+
+
+def prepare_main(argv):
+    """Prepare a managed RRR workspace from a folder containing PDFs."""
+    ap = argparse.ArgumentParser(
+        prog="rrr prepare",
+        description=(
+            "Find or select a folder of PDFs, then create a reusable RRR "
+            "metadata catalog and page index."
+        ),
+    )
+    ap.add_argument(
+        "corpus",
+        nargs="?",
+        help="Folder containing PDFs. When omitted, inspect the current folder.",
+    )
+    ap.add_argument("--workspace", default=None)
+    ap.add_argument("--bib", default=None, help="Optional BibTeX sidecar")
+    ap.add_argument("--with-llm-metadata", action="store_true")
+    ap.add_argument("--accept-low-confidence", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args(argv)
+
+    from pathlib import Path
+    from rrr.product_workspace import (
+        CorpusDiscoveryError,
+        discover_corpus_dir,
+        prepare_workspace,
+    )
+
+    try:
+        corpus_dir = (
+            Path(args.corpus).expanduser().resolve()
+            if args.corpus
+            else discover_corpus_dir(Path.cwd())
+        )
+        bibliography = Path(args.bib) if args.bib else None
+        if bibliography is None:
+            for candidate in (
+                corpus_dir / "bibliography.bib",
+                corpus_dir.parent / "bibliography.bib",
+            ):
+                if candidate.is_file():
+                    bibliography = candidate
+                    break
+        prepared = prepare_workspace(
+            corpus_dir=corpus_dir,
+            workspace_dir=Path(args.workspace) if args.workspace else None,
+            bibliography=bibliography,
+            use_llm=args.with_llm_metadata,
+            accept_low_confidence=args.accept_low_confidence,
+            force=args.force,
+            quiet=args.as_json,
+        )
+    except CorpusDiscoveryError as exc:
+        error = {
+            "error": str(exc),
+            "candidates": [str(path) for path in exc.candidates],
+        }
+        if args.as_json:
+            print(json.dumps(error, ensure_ascii=False))
+        else:
+            sys.stderr.write(f"[RRR] {error['error']}\n")
+            for candidate in error["candidates"]:
+                sys.stderr.write(f"  {candidate}\n")
+        raise SystemExit(2)
+
+    result = prepared.as_dict()
+    if args.as_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        action = "reused" if prepared.reused else "prepared"
+        print(
+            f"[RRR] {action} {prepared.pdf_count} PDFs in "
+            f"{prepared.workspace_dir}"
+        )
+        print(f"[RRR] metadata: {prepared.metadata_path}")
+
+
+def _select_topic_runtime(topic):
+    """Detect the topic language, then validate the configured runtime."""
+    from rrr.language import detect_topic_language, select_model
+
+    try:
+        topic_lang = detect_topic_language(topic)
+    except Exception as lang_e:
+        topic_lang = "en"
+        sys.stderr.write(
+            f"[RRR] language detector unavailable ({lang_e}); "
+            "falling back to topic_lang=en\n"
+        )
+    return topic_lang, select_model(topic_lang)
+
+
 def main():
     # v15.12: force UTF-8 on stdout/stderr so multilingual output (accented
     # Latin, CJK, Arabic, Cyrillic) prints correctly regardless of the host
@@ -205,6 +378,12 @@ def main():
     # t1/t2 parser (whose --metadata/--topic are required) sees the argv.
     if len(sys.argv) > 1 and sys.argv[1] == "ingest":
         ingest_main(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "host-doctor":
+        host_doctor_main(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "prepare":
+        prepare_main(sys.argv[2:])
         return
 
     ap = argparse.ArgumentParser(
@@ -234,24 +413,10 @@ def main():
     if args.linkify:
         os.environ["RRR_LINKIFY"] = "1"
 
-    # v15.11: detect topic language + select model BEFORE importing reasoner.
-    # Modules read _MODEL at import time, so setting env vars here binds the
-    # whole pipeline to the language-appropriate tier. Falls back to
-    # RRR_MODEL / mistral if the language detector is unavailable.
-    # v15.14: the fallback the comment above promised now actually exists —
-    # the import was unguarded, so a missing/broken rrr.language (or absent
-    # langdetect dependency) crashed the CLI instead of degrading.
-    try:
-        from rrr.language import detect_topic_language, select_model
-        topic_lang = detect_topic_language(args.topic)
-        selected_model = select_model(topic_lang)
-    except Exception as lang_e:
-        topic_lang = "en"
-        selected_model = os.environ.get("RRR_MODEL", "mistral-small:24b")
-        sys.stderr.write(
-            f"[RRR] language detector unavailable ({lang_e}); "
-            f"falling back to topic_lang=en model={selected_model}\n"
-        )
+    # Resolve the model before importing the reasoner, whose modules bind the
+    # selection at import time. Language-detection failures can use English as
+    # a fallback. Runtime and provider configuration errors remain fatal.
+    topic_lang, selected_model = _select_topic_runtime(args.topic)
     os.environ["RRR_TOPIC_LANG"] = topic_lang
     os.environ["RRR_MODEL"] = selected_model
     sys.stderr.write(

@@ -4,27 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rrr-poc"
-version = "0.1.0"
-description = "A corpus-bounded literature-review pipeline with page-verified evidence and auditable citations."
+version = "15.17.0"
+description = "Retrieval-Restricted Reasoning, a literature-review pipeline that reasons only over retrieved, page-anchored evidence."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE.txt" }
 authors = [{ name = "Igor B. Martins" }]
-keywords = ["retrieval", "rag", "literature-review", "citations", "llm"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Information Analysis",
-]
+keywords = ["retrieval", "rag", "literature-review", "economic-history", "llm"]
 
-# Runtime deps. The `ollama` client is required even in RRR_RUNTIME=api mode
-# (the api_backend shim patches ollama.chat), but the ollama *server* is not
-# needed there. langdetect powers multilingual routing; anthropic/openai are
-# optional extras pulled in by the `api` extra below.
+# Runtime deps. The `ollama` client is required in every runtime because the
+# central shim preserves the ollama.chat call contract. The Ollama server is
+# needed only for local inference. langdetect powers multilingual routing;
+# anthropic/openai are optional extras pulled in by the `api` extra below.
 dependencies = [
     "pymupdf>=1.28.0",
     "rank_bm25>=0.2.2",
@@ -37,8 +28,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# `pip install rrr-poc[api]` for the Anthropic or OpenAI runtime.
-api = ["anthropic>=0.40.0", "openai>=1.40.0"]
+# `pip install rrr-poc[api]` for the provider API runtime.
+api = ["anthropic>=0.40.0", "openai>=2.44.0"]
+# `pip install rrr-poc[pod]` adds the RunPod remote-exec helper.
+pod = ["paramiko>=3.5.0"]
+# Everything.
+all = ["anthropic>=0.40.0", "openai>=2.44.0", "paramiko>=3.5.0"]
 
 [project.scripts]
 # One-command CLI: `rrr t2 --metadata metadata.csv --topic "..."`
@@ -47,7 +42,6 @@ rrr = "rrr.cli:main"
 [project.urls]
 Homepage = "https://github.com/igbaccin/rrr-poc"
 Repository = "https://github.com/igbaccin/rrr-poc"
-Issues = "https://github.com/igbaccin/rrr-poc/issues"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

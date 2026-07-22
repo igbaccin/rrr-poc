@@ -1,0 +1,6 @@
+interface:
+  display_name: "RRR"
+  short_description: "Page-cited reviews from your own PDFs"
+  default_prompt: "Use $rrr t2 followed by a topic to review a folder of PDFs I select."
+policy:
+  allow_implicit_invocation: false

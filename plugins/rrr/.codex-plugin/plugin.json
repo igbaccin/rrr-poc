@@ -1,0 +1,35 @@
+{
+  "name": "rrr",
+  "version": "0.2.0+codex.20260722221548",
+  "description": "Create page-cited reviews and claim evaluations from a selected PDF collection.",
+  "author": {
+    "name": "Igor Martins",
+    "email": "igbaccin@gmail.com",
+    "url": "https://github.com/igbaccin"
+  },
+  "homepage": "https://github.com/igbaccin/rrr-poc",
+  "repository": "https://github.com/igbaccin/rrr-poc",
+  "license": "MIT",
+  "keywords": [
+    "literature-review",
+    "retrieval",
+    "citations",
+    "historical-methods"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "RRR",
+    "shortDescription": "Page-cited reviews from your own PDFs",
+    "longDescription": "Select a folder of PDFs and ask RRR for a literature review or claim evaluation with page-level evidence and audit artifacts.",
+    "developerName": "Igor Martins",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $rrr t2 followed by a topic to review my PDFs.",
+      "Use $rrr t1 followed by a claim to evaluate it against my PDFs."
+    ]
+  }
+}

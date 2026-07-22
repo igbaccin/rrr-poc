@@ -1,202 +1,116 @@
 # Retrieval-Restricted Reasoning (RRR)
 
-RRR is a research pipeline for producing corpus-bounded, page-cited literature reviews with language models. It retrieves evidence from a user-supplied PDF collection, verifies quotations and page references, records the evidence admitted to generation, and refuses topics that the corpus cannot support.
+**About RRR** · [Installation modes](docs/product_installation.md) · [Before running](docs/before_running.md)
 
-The repository contains the reusable RRR implementation. The frozen materials used to reproduce the accompanying paper belong in the separate [`rrr-replication`](https://github.com/igbaccin/rrr-replication) repository.
+RRR produces page-cited literature reviews and claim evaluations from a
+collection of PDFs supplied by the user. It is designed to preserve a
+checkable path from the released prose to the source page.
 
-## What RRR contributes
+## What RRR does
 
-Retrieval-augmented generation usually retrieves passages and places them in a model's context. RRR adds a controlled evidence process suited to scholarly synthesis:
+RRR supports two tasks.
 
-- a closed corpus defines the admissible source boundary;
-- retrieval operates at page level and preserves document identity;
-- evidence is filtered, deduplicated, and checked before generation;
-- generated citations must resolve to admitted document-page pairs;
-- corpus-fit and evidence-coverage gates can refuse unsupported requests;
-- each run records manifests, evidence ledgers, citation data, and quality checks.
+- **T1 evaluates a claim.** It compares a statement with the evidence found in
+  the declared PDF collection.
+- **T2 writes a literature review.** It retrieves relevant pages, composes a
+  review, and renders author, year, and page citations.
 
-RRR serves a narrower purpose than general question-answering systems. Its value lies in traceability, bounded claims, and inspectable failure. Conventional RAG remains useful when broad coverage, conversational retrieval, or open-ended assistance is the primary objective.
-
-## Pipeline
+The compact commands are:
 
 ```text
-PDF corpus
-    -> confidence-gated metadata
-    -> page extraction and reference-section exclusion
-    -> BM25 page index
-    -> query planning and retrieval
-    -> evidence filtering and validation
-    -> corpus-level outline and document posture
-    -> evidence-constrained composition
-    -> citation and provenance artifacts
+$rrr t1 <claim>       Codex
+$rrr t2 <topic>       Codex
+/rrr t1 <claim>       Claude Code
+/rrr t2 <topic>       Claude Code
 ```
 
-RRR exposes two tasks:
+RRR can also be run directly from a terminal.
 
-- `t1` evaluates how the corpus bears on a claim and stops before review composition.
-- `t2` produces a literature review from admitted evidence.
+## One pipeline with several ways to run it
 
-## Requirements
+The user chooses how to start RRR and which model performs its language-model
+calls. The retrieval, source checks, citation validation, and run records use
+the same RRR code in every mode.
 
-- Python 3.10 or newer
-- a folder of text-readable PDF files
-- one of the following model runtimes:
-  - [Ollama](https://ollama.com/) for local inference;
-  - an Anthropic or OpenAI API account for API inference.
+| Setup | Model used | Where to begin |
+| --- | --- | --- |
+| Codex with `$rrr` | GPT through the user's Codex subscription | [Install the Codex plugin](docs/product_installation.md#option-1-codex-with-the-codex-subscription) |
+| Claude Code with `/rrr` | Claude through the user's Claude subscription | [Install the Claude skill](docs/product_installation.md#option-2-claude-code-with-the-claude-subscription) |
+| Terminal | Mistral or Qwen through Ollama | [Install the local command-line setup](docs/product_installation.md#option-3-local-command-line-use-with-ollama) |
+| Codex or Claude with local inference | Mistral or Qwen through Ollama | [Combine a skill with Ollama](docs/product_installation.md#option-4-codex-or-claude-with-local-ollama-inference) |
+| Provider API | OpenAI or Anthropic API model | [Configure API mode](docs/product_installation.md#option-5-provider-api-mode) |
 
-The default local model is `mistral-small:24b` for Latin-script topics. You can select another installed Ollama model through `RRR_MODEL_LATIN`.
+The [installation guide](docs/product_installation.md) explains the software,
+account, and hardware requirements for each route.
 
-## Installation
+## From PDFs to a released review
 
-```bash
-git clone https://github.com/igbaccin/rrr-poc.git
-cd rrr-poc
-python -m venv .venv
-```
+Every run follows the same broad path.
 
-Activate the environment on Linux or macOS:
+1. The user declares a folder of PDFs.
+2. RRR checks that the files contain usable text and builds a bibliographic
+   catalogue called `metadata.csv`.
+3. RRR extracts and indexes the corpus page by page.
+4. The selected model works only with passages admitted from that corpus.
+5. RRR validates the citations and releases the review with its audit records.
 
-```bash
-source .venv/bin/activate
-```
+The metadata stage provides the connection between a PDF, its bibliographic
+identity, and every page later cited in the review. The [before-running
+guide](docs/before_running.md) explains the corpus requirements, automatic
+metadata sources, optional `bibliography.bib` file, and human review process.
 
-Activate it on Windows PowerShell:
+## What remains local
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+| Component | Local Ollama | Native Codex or Claude | Provider API |
+| --- | --- | --- | --- |
+| Original PDFs | Local | Local | Local |
+| Extracted page text and search index | Local | Local | Local |
+| Retrieval and source admission | Local | Local | Local |
+| Citation validation and run records | Local | Local | Local |
+| Language-model calls | Local Ollama | Codex or Claude subscription | OpenAI or Anthropic API |
+| Evidence passages sent to a provider | No | Yes | Yes |
 
-Install the local package:
+Native mode uses the model supplied through the signed-in Codex or Claude
+product. The RRR engine, corpus index, validation stages, and audit records
+continue to run on the user's computer.
 
-```bash
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
+## Evidence
 
-Install API support when needed:
+In the reported evaluation, full RRR produced 100 clean reviews in 100 runs.
+The released reviews contained no E1 through E5 citation failures under the
+automated checker.
 
-```bash
-python -m pip install -e ".[api]"
-```
+| Code | Failure checked |
+| --- | --- |
+| E1 | A citation points outside the declared corpus. |
+| E2 | A citation points to a page that does not exist. |
+| E3 | A citation does not follow the required format. |
+| E4 | A quotation cannot be verified on the cited page. |
+| E5 | A quotation is attributed to the wrong source. |
 
-## Quick start with a local model
+The accompanying paper describes the architecture, comparisons, evaluation,
+and limitations in detail. The deposited records and reproduction procedure
+are available in the separate
+[`rrr-replication`](https://github.com/igbaccin/rrr-replication) repository.
 
-Pull a model and place your PDFs under `corpus/`:
+## Repository contents
 
-```bash
-ollama pull mistral-small:24b
-mkdir corpus
-```
+| Path | Contents |
+| --- | --- |
+| `src/rrr/` | RRR source code |
+| `plugins/rrr/` | Installable Codex plugin |
+| `skills/rrr/` | Portable Codex and Claude skill bundle |
+| `dist/` | Installable Python wheel and SHA-256 checksum |
+| `docs/` | Installation and corpus-preparation guides |
+| `tests/unit/` | Automated tests for the pipeline and runtime modes |
 
-Build the metadata catalog. Supplying a BibTeX file improves metadata confidence when one is available.
+Evaluation records and generated exhibits remain in the
+[`rrr-replication`](https://github.com/igbaccin/rrr-replication) repository.
 
-```bash
-rrr ingest --corpus corpus --output metadata.csv
-# With a BibTeX sidecar:
-# rrr ingest --corpus corpus --output metadata.csv --bib bibliography.bib
-```
+## Citation and licence
 
-The ingest gate writes uncertain records to `metadata.pending.csv` and exits with status `3`. Review those records before admitting them. The `--accept-low-confidence` option records an explicit decision to retain them.
+The source code is distributed under the terms in `LICENSE.txt`. Please cite
+the accompanying paper when using RRR in published research.
 
-Extract the PDFs and build the page index:
-
-```bash
-python -m rrr.preprocess --metadata metadata.csv
-python -m rrr.index --metadata metadata.csv
-```
-
-Run a literature review:
-
-```bash
-rrr t2 --multi --metadata metadata.csv \
-  --topic "How did institutions shape long-run economic development?"
-```
-
-Run the claim-evaluation mode:
-
-```bash
-rrr t1 --metadata metadata.csv \
-  --topic "Colonial institutions reduced later economic growth."
-```
-
-## API runtime
-
-Install the `api` extra, set the runtime and provider, and expose the provider credential through its standard environment variable.
-
-Linux or macOS:
-
-```bash
-export RRR_RUNTIME=api
-export RRR_API_PROVIDER=openai
-export RRR_API_MODEL=<model-id>
-export OPENAI_API_KEY=<key>
-```
-
-Windows PowerShell:
-
-```powershell
-$env:RRR_RUNTIME = "api"
-$env:RRR_API_PROVIDER = "openai"
-$env:RRR_API_MODEL = "<model-id>"
-$env:OPENAI_API_KEY = "<key>"
-```
-
-Use `RRR_API_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` for Anthropic models. RRR does not write credential values to run manifests or metrics.
-
-## Outputs
-
-Each invocation receives a run directory under `runs/`. A completed `t2` run normally includes:
-
-| Artifact | Purpose |
-|---|---|
-| `review_composed.md` | Final page-cited review |
-| `review_ledger.json` | Evidence admitted to the writer |
-| `citations.json` | Parsed citations and source provenance |
-| `topic_fit.json` | Corpus-fit decision and warnings |
-| `quality_manifest.json` | Deterministic output checks |
-| `run_manifest.json` | Code, model, corpus, and environment provenance |
-| `run_metrics.json` | Stage timings and model-call statistics |
-
-The optional `--linkify` flag adds local links from citations to PDF pages. Generated corpus data, indices, run outputs, caches, PDFs, metadata, and credentials are excluded from Git by default.
-
-## Configuration
-
-The main user-facing settings are environment variables:
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `RRR_MODEL_LATIN` | `mistral-small:24b` | Local model for Latin-script topics |
-| `RRR_MODEL_NONLATIN` | `qwen3:14b` | Local model for non-Latin-script topics |
-| `RRR_PROJECT_ROOT` | repository root | Workspace containing corpus artifacts |
-| `RRR_CONCURRENCY` | `4` | Concurrent local model calls |
-| `RRR_DOC_BUDGET` | `24` | Maximum admitted documents passed to later stages |
-| `RRR_OLLAMA_TIMEOUT` | `600` | Per-request timeout in seconds |
-| `RRR_RUNTIME` | local Ollama | Set to `api` for the API backend |
-| `RRR_API_PROVIDER` | `anthropic` | API provider, `anthropic` or `openai` |
-| `RRR_API_MODEL` | provider default | API model identifier |
-
-Additional research controls remain available in the source. Validation bypasses are intended for controlled evaluation and should stay disabled during ordinary use.
-
-## Agent skill
-
-[`skills/rrr/SKILL.md`](skills/rrr/SKILL.md) provides an agent workflow for installing the current checkout, processing a user corpus, running RRR, and returning the audited output. The skill is available in Claude Code as `/rrr` and preserves the same refusal and validation contract as the command-line pipeline.
-
-## Tests
-
-```bash
-python -m unittest discover -s tests/unit -p "test_*.py"
-```
-
-The selected public tests cover citation parsing, citation verification, provenance generation, and the writer's evidence contract. The paper's complete battery and reference outputs remain in the replication repository.
-
-## Project status
-
-RRR is research software and a proof of concept. Its audit artifacts make claims and failures inspectable, while output quality still depends on corpus composition, PDF extraction quality, model behavior, and the research question.
-
-## License and citation
-
-The code is released under the MIT License. See [`LICENSE.txt`](LICENSE.txt).
-
-If you use RRR in scholarly work, please cite:
-
-> Martins, Igor B. "Retrieval-Restricted Reasoning: A Proof of Concept for Adapting Language Models to Economic History." *Historical Methods* (forthcoming).
+Questions about RRR can be directed to Igor Martins at
+`igor.martins@ekh.lu.se`.

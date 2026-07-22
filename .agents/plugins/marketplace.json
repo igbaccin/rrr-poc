@@ -1,0 +1,20 @@
+{
+  "name": "rrr-poc",
+  "interface": {
+    "displayName": "RRR"
+  },
+  "plugins": [
+    {
+      "name": "rrr",
+      "source": {
+        "source": "local",
+        "path": "./plugins/rrr"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

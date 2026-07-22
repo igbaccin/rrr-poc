@@ -33,6 +33,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from rrr.llm import install as _install_llm_shim
+
+
+# ``rrr ingest`` is dispatched before the review reasoner is imported. Install
+# the shared runtime router here so metadata extraction follows local, API, and
+# subscription-host configuration as well.
+_install_llm_shim()
+
 
 # ---------------------------------------------------------------------------
 # Data

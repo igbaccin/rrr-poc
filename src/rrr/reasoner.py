@@ -401,10 +401,16 @@ def _layered_t2_inner(args, meta_path):
             )
         except Exception:
             pass
-    try:
-        threading.Thread(target=_prewarm_ollama, name="rrr-ollama-prewarm", daemon=True).start()
-    except Exception:
-        pass
+    runtime = os.environ.get("RRR_RUNTIME", "").strip().lower()
+    if runtime not in {"api", "host"}:
+        try:
+            threading.Thread(
+                target=_prewarm_ollama,
+                name="rrr-ollama-prewarm",
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
 
     with metrics.stage("load_metadata"):
         df = pd.read_csv(meta_path)

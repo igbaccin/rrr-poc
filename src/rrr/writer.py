@@ -22,7 +22,7 @@ from rrr.render import (
 # v15.14: install the central ollama.chat shim here too (idempotent). The
 # reasoner installs it at pipeline entry, but the writer can also be driven
 # standalone (__main__ / compose_review from a script), in which case the
-# thinking-mode suppression, RRR_RUNTIME=api routing, and request timeout
+# thinking-mode suppression, API and host routing, and request timeout
 # would silently not apply without this call.
 from rrr.llm import install as _install_llm_shim
 _install_llm_shim()
