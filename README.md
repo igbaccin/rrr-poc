@@ -179,7 +179,7 @@ Additional research controls remain available in the source. Validation bypasses
 
 ## Agent skill
 
-[`skills/rrr-review/SKILL.md`](skills/rrr-review/SKILL.md) provides an agent workflow for installing the current checkout, processing a user corpus, running RRR, and returning the audited output. The skill preserves the same refusal and validation contract as the command-line pipeline.
+[`skills/rrr/SKILL.md`](skills/rrr/SKILL.md) provides an agent workflow for installing the current checkout, processing a user corpus, running RRR, and returning the audited output. The skill is available in Claude Code as `/rrr` and preserves the same refusal and validation contract as the command-line pipeline.
 
 ## Tests
 
