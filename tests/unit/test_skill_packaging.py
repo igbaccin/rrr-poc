@@ -75,7 +75,15 @@ class SkillPackagingTests(unittest.TestCase):
         self.assertIn("rrr/product_workspace.py", names)
         self.assertIn("rrr/cli.py", names)
 
-    def test_portable_claude_skill_bundles_the_same_runtime(self):
+    def test_hosted_profiles_are_separately_versioned_artifacts(self):
+        """vcx (Codex) and vcl (Claude) must be independently replaceable.
+
+        They ship the same tested runtime today, which is the intended
+        starting point: Claude begins from the Codex contract. But they are
+        separate files with separate manifests, so a Claude-specific change
+        rebuilds only vcl and cannot silently alter the runtime Codex was
+        accepted with.
+        """
         plugin_runtime = json.loads(
             (PLUGIN_ROOT / "runtime" / "runtime.json").read_text(encoding="utf-8")
         )
@@ -83,27 +91,55 @@ class SkillPackagingTests(unittest.TestCase):
         claude_runtime = json.loads(
             (claude_root / "runtime" / "runtime.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(claude_runtime, plugin_runtime)
-        self.assertEqual(
-            (claude_root / "runtime" / claude_runtime["wheel"]).read_bytes(),
-            (PLUGIN_ROOT / "runtime" / plugin_runtime["wheel"]).read_bytes(),
-        )
+        self.assertEqual("cx", plugin_runtime["profile"])
+        self.assertEqual("cl", claude_runtime["profile"])
+        self.assertEqual("vcx.2.0", plugin_runtime["profile_version"])
+        self.assertEqual("vcl.2.0", claude_runtime["profile_version"])
+
+        plugin_wheel = PLUGIN_ROOT / "runtime" / plugin_runtime["wheel"]
+        claude_wheel = claude_root / "runtime" / claude_runtime["wheel"]
+        # Distinct files, so one can be rebuilt without the other.
+        self.assertNotEqual(plugin_wheel.resolve(), claude_wheel.resolve())
+        # Byte-identical today. When the Claude modifications land this
+        # assertion is the one to update, together with a bump to vcl.2.1 --
+        # never by editing a shared wheel in place.
+        self.assertEqual(claude_wheel.read_bytes(), plugin_wheel.read_bytes())
+        for manifest, wheel in (
+            (plugin_runtime, plugin_wheel),
+            (claude_runtime, claude_wheel),
+        ):
+            self.assertEqual(
+                hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                manifest["sha256"],
+            )
         self.assertEqual(
             (claude_root / "scripts" / "bootstrap_rrr.py").read_bytes(),
             (PLUGIN_ROOT / "scripts" / "bootstrap_rrr.py").read_bytes(),
         )
 
-    def test_website_wheel_matches_the_plugin_bundle(self):
-        runtime = json.loads(
+    def test_local_distribution_is_versioned_independently_from_hosted(self):
+        """The local product and the hosted runtimes are separate profiles.
+
+        They were once the same wheel, synced from dist/ into the plugin. They
+        are now versioned independently -- vlm for local models, vcx and vcl
+        for the hosted agents -- because they are different writers with
+        different prose contracts, not successive versions of one thing.
+        """
+        local_wheels = sorted((ROOT / "dist").glob("rrr_poc-*.whl"))
+        self.assertEqual(1, len(local_wheels), "expected exactly one local wheel")
+        local_wheel = local_wheels[0]
+        local_hash = hashlib.sha256(local_wheel.read_bytes()).hexdigest()
+        checksum = (
+            ROOT / "dist" / f"{local_wheel.name}.sha256"
+        ).read_text(encoding="ascii")
+        self.assertEqual(checksum, f"{local_hash}  {local_wheel.name}\n")
+
+        hosted = json.loads(
             (PLUGIN_ROOT / "runtime" / "runtime.json").read_text(encoding="utf-8")
         )
-        plugin_wheel = PLUGIN_ROOT / "runtime" / runtime["wheel"]
-        website_wheel = ROOT / "dist" / runtime["wheel"]
-        self.assertEqual(website_wheel.read_bytes(), plugin_wheel.read_bytes())
-        checksum = (ROOT / "dist" / f"{runtime['wheel']}.sha256").read_text(
-            encoding="ascii"
-        )
-        self.assertEqual(checksum, f"{runtime['sha256']}  {runtime['wheel']}\n")
+        # The local wheel must not be silently republished as the hosted
+        # runtime: that is how a local-only fix would reach Codex untested.
+        self.assertNotEqual(local_wheel.name, hosted["wheel"])
 
     def test_bootstrap_reinstalls_a_changed_wheel_with_the_same_version(self):
         bootstrap_path = PLUGIN_ROOT / "scripts" / "bootstrap_rrr.py"
