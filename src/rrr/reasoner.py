@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from rrr.utils import ensure_dir, env_int
 # v15.12: patch ollama.chat to disable qwen3 thinking mode BEFORE any stage
 # runs. Every `import ollama` in the package resolves to the same module
@@ -31,24 +32,39 @@ def _clean_latex(s: str) -> str:
     """Clean LaTeX artifacts from BibTeX strings."""
     if not s:
         return s
+
+    # BibTeX commonly protects an accented letter with braces. Convert the
+    # commands while their arguments are present, then remove grouping braces.
+    # One or more backslashes also covers metadata that passed through an
+    # additional escaping layer.
+    combining_marks = {
+        "'": "\N{COMBINING ACUTE ACCENT}",
+        "`": "\N{COMBINING GRAVE ACCENT}",
+        '"': "\N{COMBINING DIAERESIS}",
+        "^": "\N{COMBINING CIRCUMFLEX ACCENT}",
+        "~": "\N{COMBINING TILDE}",
+        "c": "\N{COMBINING CEDILLA}",
+        "v": "\N{COMBINING CARON}",
+    }
+
+    def replace_accent(match: re.Match) -> str:
+        letter = match.group("braced") or match.group("bare")
+        return unicodedata.normalize(
+            "NFC", letter + combining_marks[match.group("command")]
+        )
+
+    accent_pattern = re.compile(
+        r"\\+(?P<command>['`\"^~cv])\s*"
+        r"(?:\{\s*(?P<braced>[A-Za-z])\s*\}|(?P<bare>[A-Za-z]))"
+    )
+    s = accent_pattern.sub(replace_accent, s)
+    s = re.sub(r"\\+ss\b", "ß", s)
     s = s.replace('{', '').replace('}', '')
-    replacements = [
-        (r"\\'e", 'é'), (r"\\`e", 'è'), (r'\\"e', 'ë'), (r'\\^e', 'ê'),
-        (r"\\'a", 'á'), (r"\\`a", 'à'), (r'\\"a', 'ä'), (r'\\^a', 'â'),
-        (r"\\'o", 'ó'), (r"\\`o", 'ò'), (r'\\"o', 'ö'), (r'\\^o', 'ô'),
-        (r"\\'u", 'ú'), (r"\\`u", 'ù'), (r'\\"u', 'ü'), (r'\\^u', 'û'),
-        (r"\\'i", 'í'), (r"\\`i", 'ì'), (r'\\"i', 'ï'), (r'\\^i', 'î'),
-        (r'\\c{c}', 'ç'), (r'\\c{C}', 'Ç'),
-        (r'\\c{s}', 'ş'), (r'\\c{S}', 'Ş'),
-        (r'\\v{s}', 'š'), (r'\\v{S}', 'Š'),
-        (r'\\~n', 'ñ'), (r'\\~N', 'Ñ'),
-        (r'\\ss', 'ß'),
-        (r"\\'", ''), (r'\\`', ''), (r'\\"', ''), (r'\\^', ''),
-        (r'\\c', ''), (r'\\v', ''), (r'\\~', ''),
-    ]
-    for latex, char in replacements:
-        s = s.replace(latex, char)
-    s = re.sub(r'\\([a-zA-Z])', r'\1', s)
+
+    # Preserve the former fallback for unsupported alphabetic commands and
+    # stray accent markers after converting recognized commands.
+    s = re.sub(r"\\+['`\"^~cv]", "", s)
+    s = re.sub(r'\\+([a-zA-Z])', r'\1', s)
     return s.strip()
 
 def _cite_harvard(row):

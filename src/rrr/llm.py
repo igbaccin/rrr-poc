@@ -116,6 +116,18 @@ def install():
         model = kwargs.get("model") or (args[0] if args else "")
         kwargs.pop("_rrr_stage", None)
         if _is_thinking_model(model) and "think" not in kwargs:
+            # Some qwen3/Ollama combinations accept ``think=False`` yet still
+            # emit a reasoning trace in the content channel. Apply qwen3's
+            # in-band control as well as the transport flag. Copy both the
+            # kwargs and messages so callers never observe prompt mutation.
+            if "qwen3" in str(model).lower():
+                kwargs = dict(kwargs)
+                if "messages" in kwargs:
+                    kwargs["messages"] = _inject_no_think(kwargs["messages"])
+                elif len(args) > 1:
+                    positional = list(args)
+                    positional[1] = _inject_no_think(positional[1])
+                    args = tuple(positional)
             try:
                 return _base_chat(*args, think=False, **kwargs)
             except TypeError:

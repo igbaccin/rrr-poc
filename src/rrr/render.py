@@ -384,11 +384,8 @@ def parse_citations(text: str, display_lookup: dict = None):
                 cursor += len(piece) + 1
                 continue
 
-            narrative = (
-                _GROUPED_NARRATIVE_FIRST_RE.fullmatch(item_raw)
-                if index == 0 else None
-            )
-            if narrative:
+            narrative = _GROUPED_NARRATIVE_FIRST_RE.fullmatch(item_raw)
+            if narrative and index == 0:
                 prefix = source[:group_match.start()]
                 narrative_label_match = _GROUPED_NARRATIVE_LABEL_RE.search(prefix)
             if narrative and narrative_label_match:
@@ -481,3 +478,4 @@ def parse_citations(text: str, display_lookup: dict = None):
 
 # Citation rendering now has one active path. The writer emits evidence IDs,
 # and its context-aware renderer converts them directly to display citations.
+

@@ -455,7 +455,7 @@ def _parse_citation_units(text):
                         "year": display.group("year"),
                         "page": int(display.group("page")),
                     }
-                elif member_index == 0 and narrative_label:
+                elif narrative_label:
                     narrative = _GROUP_NARRATIVE_FIRST_RE.fullmatch(raw)
                     if narrative:
                         parsed = {
@@ -465,7 +465,8 @@ def _parse_citation_units(text):
                             "year": narrative.group("year"),
                             "page": int(narrative.group("page")),
                         }
-                        member_start = narrative_start
+                        if member_index == 0:
+                            member_start = narrative_start
 
             if parsed is not None:
                 parsed.update({
