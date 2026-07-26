@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rrr-poc"
-version = "2.0.0+lm"
+version = "2.0.1+lm"
 description = "Retrieval-Restricted Reasoning, a literature-review pipeline that reasons only over retrieved, page-anchored evidence."
 readme = "README.md"
 requires-python = ">=3.10"

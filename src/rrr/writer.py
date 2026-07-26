@@ -1051,6 +1051,98 @@ def _render_bracketed_doc_ids(text: str, allowed_docs, doc_to_eids) -> tuple:
     return rendered, count
 
 
+_DOC_ID_TOKEN = r"[A-Za-z][A-Za-z0-9&.\-]*_\d{4}[a-z]?"
+
+
+def _docid_paren_label(doc_id: str) -> str:
+    """'Nunn&Wantchekon_2011' -> 'Nunn and Wantchekon 2011' (page-free, ready
+    to sit inside parentheses)."""
+    label = _doc_id_to_author_label(doc_id)          # 'Nunn and Wantchekon (2011)'
+    if not label:
+        return doc_id
+    return re.sub(r"\((\d{4}[a-z]?)\)", r"\1", label).strip()
+
+
+def _normalize_leaked_doc_id_citations(text: str, allowed_docs) -> tuple:
+    """Final-assembly cleanup of internal doc_ids that leaked into prose in
+    NON-bracketed form.
+
+    ``_render_bracketed_doc_ids`` handles the ``[Doc_Year]`` residue; weak
+    models also emit the internal id inside parentheses — ``(Doc_Year)``,
+    ``(paper Doc_Year, page N)``, ``(Doc_Year (Author Year, p.N))`` — which the
+    citation checker flags as a hard ``doc_without_page`` E3. This pass is the
+    parenthesised analogue: it runs downstream of every model call and every
+    section retry, so it can only change the citation surface, never generation.
+
+    Two integrity-preserving transforms, both gated to docs allowed for this
+    run so a citation is never laundered in from outside the packet:
+
+      * when a marker-grounded ``(Author Year, p.N)`` cite is adjacent (nested
+        or beside), the doc_id is a redundant echo and is dropped, keeping the
+        grounded cite;
+      * otherwise the leaked doc_id is rewritten to its page-free author-year
+        surface (a legitimate E3-soft prose mention). No page is invented.
+
+    The narrative bare form (``Nunn_2008 notes that...``, no parentheses) is
+    intentionally left untouched: the checker does not flag it, so rewriting it
+    would alter prose for no integrity gain.
+    """
+    if not text:
+        return text or "", 0
+    allowed = set(allowed_docs or ())
+    count = 0
+
+    def known(token: str) -> bool:
+        return token in allowed
+
+    grounded = r"\([^()]*?\d{4}[a-z]?,\s*p\.?\s*\d+[^()]*?\)"
+
+    # A. nested: (DOCID (Author Year, p.N))  ->  (Author Year, p.N)
+    def a_repl(m):
+        nonlocal count
+        if not known(m.group(1)):
+            return m.group(0)
+        count += 1
+        return m.group(2)
+    text = re.sub(rf"\(\s*({_DOC_ID_TOKEN})\s*({grounded})\s*\)", a_repl, text)
+
+    # B. junk doc_id paren next to a grounded cite -> drop the junk paren
+    junk = rf"\((?:paper\s+|from\s+)?{_DOC_ID_TOKEN}[^()]*\)"
+
+    def b_repl_after(m):
+        nonlocal count
+        tok = re.search(_DOC_ID_TOKEN, m.group(0))
+        if not tok or not known(tok.group(0)):
+            return m.group(0)
+        count += 1
+        return m.group(1)
+    text = re.sub(rf"({grounded})\s*{junk}", b_repl_after, text)
+    text = re.sub(rf"{junk}\s*({grounded})", b_repl_after, text)
+
+    # C. any remaining paren the checker would flag (contains a doc_id, no
+    #    ': p.') -> rebuild as a page-free author-year list. Only when every
+    #    doc_id in the group is allowed; a mangled/foreign id is left to fail.
+    def c_repl(m):
+        nonlocal count
+        inner = m.group(0)[1:-1]
+        dids = re.findall(_DOC_ID_TOKEN, inner)
+        if not dids or not all(known(d) for d in dids):
+            return m.group(0)
+        labels = []
+        for d in dids:
+            lab = _docid_paren_label(d)
+            if lab not in labels:
+                labels.append(lab)
+        count += 1
+        return "(" + "; ".join(labels) + ")"
+    text = re.sub(
+        rf"\((?=[^)]*{_DOC_ID_TOKEN})(?![^)]*:\s*p\.)[^)]*\)", c_repl, text
+    )
+
+    text = re.sub(r"\(\(([^()]*)\)\)", r"(\1)", text)
+    return text, count
+
+
 def _strip_wrapping(text: str) -> str:
     t = (text or "").strip()
     # Certain qwen3 builds leak the reasoning channel into content and leave a
@@ -5704,6 +5796,20 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         full_text, call_allowed_docs, call_evidence_id_map,
     )
     total_bracket_id_rewrites += final_bracket_rewrites
+
+    # Parenthesised analogue of the bracket rewrite: strip internal doc_ids that
+    # leaked into prose as '(Doc_Year)', '(paper Doc_Year, page N)' or
+    # '(Doc_Year (Author Year, p.N))'. Runs downstream of all model calls, so it
+    # only canonicalises the citation surface; it drops a redundant echo when a
+    # grounded cite is adjacent and otherwise emits the page-free author-year
+    # form, never inventing a page. Gated to this run's allowed docs.
+    full_text, leaked_docid_normalizations = _normalize_leaked_doc_id_citations(
+        full_text, call_allowed_docs,
+    )
+    if metrics:
+        metrics.set(
+            "writer_leaked_docid_normalizations", leaked_docid_normalizations,
+        )
 
     # v15.7: _display_to_canonical retired at final assembly. The user-facing
     # surface is now display ('Author (Year, p.N)' / '(Author Year, p.N)')
