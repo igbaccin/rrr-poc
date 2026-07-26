@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use RRR in research, please cite both the software and the accompanying paper."
+title: "Retrieval-Restricted Reasoning (RRR)"
+type: software
+version: "2.0.1+lm"
+authors:
+  - given-names: "Igor B."
+    family-names: "Martins"
+license: MIT
+repository-code: "https://github.com/igbaccin/rrr-poc"
+
+preferred-citation:
+  type: article
+  title: "Retrieval-Restricted Reasoning: A Proof of Concept for Adapting Language Models to Economic History"
+  authors:
+    - given-names: "Igor"
+      family-names: "Martins"
+  journal: "Historical Methods"
+  status: submitted
