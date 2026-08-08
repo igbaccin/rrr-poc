@@ -1,6 +1,6 @@
 ---
 name: rrr
-description: Turn a folder of PDFs into a page-cited literature review, or test a single claim against them. Retrieval-Restricted Reasoning stays inside your corpus: it cites the exact page, refuses when the evidence isn't there, and leaves a full audit trail. Runs on local Ollama, Anthropic or OpenAI APIs, or a Codex or Claude subscription.
+description: "Turn a folder of PDFs into a page-cited literature review, or test a single claim against them. Retrieval-Restricted Reasoning stays inside your corpus: it cites the exact page, refuses when the evidence isn't there, and leaves a full audit trail. Runs on local Ollama, Anthropic or OpenAI APIs, or a Codex or Claude subscription."
 ---
 
 # RRR literature review

@@ -57,6 +57,16 @@ class SkillPackagingTests(unittest.TestCase):
         )
         self.assertEqual(manifest["name"], "rrr")
         self.assertEqual(manifest["skills"], "./skills/")
+        self.assertEqual(manifest["interface"]["category"], "Education & Research")
+        self.assertLessEqual(len(manifest["interface"]["shortDescription"]), 30)
+        self.assertEqual(
+            manifest["interface"]["websiteURL"],
+            "https://github.com/igbaccin/rrr-poc",
+        )
+        self.assertEqual(
+            manifest["interface"]["capabilities"],
+            ["Literature reviews", "Claim evaluation", "Page-cited evidence"],
+        )
         self.assertTrue((PLUGIN_ROOT / manifest["skills"]).is_dir())
         prompts = manifest["interface"]["defaultPrompt"]
         self.assertTrue(any("$rrr" in prompt for prompt in prompts))
@@ -172,6 +182,7 @@ class SkillPackagingTests(unittest.TestCase):
         )
         self.assertEqual("./plugins/rrr", entry["source"]["path"])
         self.assertEqual("AVAILABLE", entry["policy"]["installation"])
+        self.assertEqual("Education & Research", entry["category"])
         self.assertTrue((ROOT / "plugins" / "rrr").is_dir())
 
 

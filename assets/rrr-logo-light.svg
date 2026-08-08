@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 30 460 180" role="img" aria-labelledby="title description">
+  <title id="title">RRR citation monogram</title>
+  <desc id="description">Three STIX Two Text letter Rs enclosed by close, square citation brackets.</desc>
+  <metadata>Letterforms derived from STIX Two Text, licensed under the SIL Open Font License 1.1.</metadata>
+
+  <defs>
+    <path id="rrr-letter-r" d="M340.42 0H40.47V34.11Q78.47 34.11 97.79 40.11Q117.11 46.11 123.92 66.11Q130.74 86.11 130.74 127.79V547.63Q130.74 576.26 124.92 592.58Q119.11 608.89 99.79 615.89Q80.47 622.89 40.47 622.89V657H311.74Q385.16 657 443.98 642.18Q502.79 627.37 536.9 591.55Q571 555.74 571 491.74Q571 436.05 546.61 401.37Q522.21 366.68 484.5 347.34Q446.79 328 405.48 318V313.68Q422.16 303.68 442.55 279.82Q462.95 255.95 496 209.55Q529.05 163.16 583.74 85.11Q607.42 52.11 630.55 43.11Q653.69 34.11 687.69 34.11V0H503.11Q464.32 61.37 438.55 102.08Q412.79 142.79 394.9 170.34Q377 197.89 362.79 219.58Q348.58 241.26 333.58 263.89Q319.21 286.89 306.4 292.21Q293.58 297.53 266.9 297.53H241.42V127.47Q241.42 86.79 248.42 66.45Q255.42 46.11 276.42 40.11Q297.42 34.11 340.42 34.11ZM241.42 339.68 279.42 338.68Q332.84 341.68 371.63 356.05Q410.42 370.42 431.68 401.95Q452.95 433.47 452.95 486.79Q452.95 545.84 418 580.34Q383.05 614.84 305.53 614.84Q289.53 614.84 273.16 614.34Q256.79 613.84 241.42 611.84Z"/>
+  </defs>
+
+  <path d="M181 48H154V198H181" fill="none" stroke="#315ee8" stroke-width="10" stroke-linecap="square" stroke-linejoin="miter"/>
+  <path d="M479 48H506V198H479" fill="none" stroke="#315ee8" stroke-width="10" stroke-linecap="square" stroke-linejoin="miter"/>
+
+  <g fill="#172033" transform="translate(169.04 174) scale(.154 -.154)">
+    <use href="#rrr-letter-r"/>
+    <use href="#rrr-letter-r" transform="translate(681.11)"/>
+    <use href="#rrr-letter-r" transform="translate(1362.21)"/>
+  </g>
+</svg>
