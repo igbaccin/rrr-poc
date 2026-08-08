@@ -46,13 +46,13 @@ RRR can also run directly from a terminal.
 flowchart TB
     subgraph first[" "]
         direction LR
-        A["Your PDF collection"] --> B["Page-level index"] --> C["Evidence admission"]
+        A["1 · Your PDF collection"] --> B["2 · Page-level index"] --> C["3 · Evidence admission"]
     end
     subgraph second[" "]
         direction LR
-        D["Model synthesis"] --> E["Citation validation"] --> F["Review and audit records"]
+        D["4 · Model synthesis"] --> E["5 · Citation validation"] --> F["6 · Review and audit records"]
     end
-    C --> D
+    C ~~~ D
     style first fill:none,stroke:none
     style second fill:none,stroke:none
 ```
