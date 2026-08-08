@@ -14,7 +14,7 @@ RRR turns a selected collection of scholarly PDFs into claim evaluations and
 literature reviews. Every released review keeps a checkable path from its prose
 to the source page.
 
-[**Install RRR**](docs/product_installation.md) · [Prepare your PDFs](docs/before_running.md) · [Cite RRR](CITATION.cff) · [Explore the source](src/rrr)
+[**Install RRR**](docs/product_installation.md) · [Prepare your PDFs](docs/before_running.md) · [Cite RRR](#cite-rrr) · [Explore the source](src/rrr)
 
 </div>
 
@@ -43,12 +43,18 @@ RRR can also run directly from a terminal.
 ## How RRR works
 
 ```mermaid
-flowchart LR
-    A["Your PDF collection"] --> B["Page-level index"]
-    B --> C["Evidence admission"]
-    C --> D["Model synthesis"]
-    D --> E["Citation validation"]
-    E --> F["Review and audit records"]
+flowchart TB
+    subgraph first[" "]
+        direction LR
+        A["Your PDF collection"] --> B["Page-level index"] --> C["Evidence admission"]
+    end
+    subgraph second[" "]
+        direction LR
+        D["Model synthesis"] --> E["Citation validation"] --> F["Review and audit records"]
+    end
+    C --> D
+    style first fill:none,stroke:none
+    style second fill:none,stroke:none
 ```
 
 The selected model receives admitted passages from the declared collection.
@@ -146,13 +152,38 @@ and the substantive adequacy of every synthesis.
 
 ## Cite RRR
 
-GitHub reads the root-level [CITATION.cff](CITATION.cff) and provides a
-**Cite this repository** menu with APA and BibTeX output. The citation metadata
-asks users to cite both the software and its accompanying paper:
+If RRR supports your research, please cite the accompanying article. You can
+also download the [BibLaTeX entry](CITATION.bib) or use the
+[machine-readable citation metadata](CITATION.cff).
 
-> Martins, Igor. “Retrieval-Restricted Reasoning: A Proof of Concept for
-> Adapting Language Models to Economic History.” *Historical Methods*,
-> submitted.
+### BibLaTeX
+
+```bibtex
+@article{martins_rrr_forthcoming,
+  author       = {Martins, Igor},
+  title        = {Retrieval-Restricted Reasoning: Supporting Scholarly Synthesis with Language Models},
+  journaltitle = {Historical Methods: A Journal of Quantitative and Interdisciplinary History},
+  pubstate     = {forthcoming},
+}
+```
+
+### APA 7th
+
+Martins, I. (in press). Retrieval-restricted reasoning: Supporting scholarly
+synthesis with language models. *Historical Methods: A Journal of Quantitative
+and Interdisciplinary History*.
+
+### Chicago
+
+Martins, Igor. “Retrieval-Restricted Reasoning: Supporting Scholarly Synthesis
+with Language Models.” *Historical Methods: A Journal of Quantitative and
+Interdisciplinary History*. Forthcoming.
+
+### Harvard
+
+Martins, I. (forthcoming) ‘Retrieval-Restricted Reasoning: Supporting Scholarly
+Synthesis with Language Models’, *Historical Methods: A Journal of Quantitative
+and Interdisciplinary History*.
 
 ## Licence and contact
 
