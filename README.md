@@ -119,26 +119,6 @@ The [before-running guide](docs/before_running.md) explains PDF requirements,
 metadata sources, corpus preparation, and the human review step for uncertain
 bibliographic records.
 
-## Evaluated citation integrity
-
-In the main evaluation condition, full RRR produced 99 integrity-clean reviews
-in 100 attempts. The remaining review contained a conflated author-year
-attribution that the checker rejected. Across 553 released reviews in the
-validation-enabled conditions, the automated checker found no E1 through E5
-citation failures.
-
-| Code | Failure checked |
-| --- | --- |
-| E1 | A citation points outside the declared collection. |
-| E2 | A citation points to a page that does not exist. |
-| E3 | A citation has an invalid format or exposes an internal evidence identifier. |
-| E4 | A quotation cannot be verified on the cited page. |
-| E5 | A quotation is attributed to the wrong source. |
-
-RRR is research software under active development. These controls evaluate
-citation integrity. Users should still assess interpretation, source coverage,
-and the substantive adequacy of every synthesis.
-
 ## Repository map
 
 | Path | Contents |
@@ -152,38 +132,9 @@ and the substantive adequacy of every synthesis.
 
 ## Cite RRR
 
-If RRR supports your research, please cite the accompanying article. You can
-also download the [BibLaTeX entry](CITATION.bib) or use the
-[machine-readable citation metadata](CITATION.cff).
-
-### BibLaTeX
-
-```bibtex
-@article{martins_rrr_forthcoming,
-  author       = {Martins, Igor},
-  title        = {Retrieval-Restricted Reasoning: Supporting Scholarly Synthesis with Language Models},
-  journaltitle = {Historical Methods: A Journal of Quantitative and Interdisciplinary History},
-  pubstate     = {forthcoming},
-}
-```
-
-### APA 7th
-
-Martins, I. (in press). Retrieval-restricted reasoning: Supporting scholarly
-synthesis with language models. *Historical Methods: A Journal of Quantitative
-and Interdisciplinary History*.
-
-### Chicago
-
-Martins, Igor. “Retrieval-Restricted Reasoning: Supporting Scholarly Synthesis
-with Language Models.” *Historical Methods: A Journal of Quantitative and
-Interdisciplinary History*. Forthcoming.
-
-### Harvard
-
-Martins, I. (forthcoming) ‘Retrieval-Restricted Reasoning: Supporting Scholarly
-Synthesis with Language Models’, *Historical Methods: A Journal of Quantitative
-and Interdisciplinary History*.
+Citation files are available in [BibLaTeX](CITATION.bib) and
+[Citation File Format](CITATION.cff). Publication details and a direct article
+link will be added when they become available.
 
 ## Licence and contact
 
