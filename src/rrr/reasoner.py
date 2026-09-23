@@ -24,9 +24,22 @@ _MODEL = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistr
 _KEEP_ALIVE = "30m"
 
 
-# v13: _build_author_year_lookup and _collect_cited_docs promoted to
-# render.py; both modules import them from there now.
 from rrr.render import _build_author_year_lookup, _collect_cited_docs  # noqa: E402
+
+
+def _reference_docids(
+    review_text, allowed_docs, author_year_to_docid,
+    writer_docids=(), citations_manifest=None,
+):
+    """Reconcile the review text with the writer's citation artifacts."""
+    cited = _collect_cited_docs(review_text, allowed_docs, author_year_to_docid)
+    cited.update(did for did in writer_docids if did in allowed_docs)
+    for citation in (citations_manifest or {}).get("citations", []):
+        did = citation.get("doc_id")
+        if did in allowed_docs:
+            cited.add(did)
+    return sorted(cited)
+
 
 def _clean_latex(s: str) -> str:
     """Clean LaTeX artifacts from BibTeX strings."""
@@ -1455,14 +1468,21 @@ def _layered_t2_inner(args, meta_path):
                         allowed_docs.add(qdid)
                         allowed_pages_by_doc.setdefault(qdid, set()).add(pg)
 
+            author_year_to_docid = _build_author_year_lookup(allowed_docs)
             cited_docs_path = str(runs_path("review_cited_docs.json"))
+            writer_docids = []
             if os.path.isfile(cited_docs_path):
                 with open(cited_docs_path, "r", encoding="utf-8") as f:
-                    cited_docids = json.load(f)
-            else:
-                author_year_to_docid = _build_author_year_lookup(allowed_docs)
-                cited_docs = _collect_cited_docs(long_form, allowed_docs, author_year_to_docid)
-                cited_docids = list(cited_docs)
+                    writer_docids = json.load(f)
+            citations_path = str(runs_path("citations.json"))
+            citations_manifest = None
+            if os.path.isfile(citations_path):
+                with open(citations_path, "r", encoding="utf-8") as f:
+                    citations_manifest = json.load(f)
+            cited_docids = _reference_docids(
+                long_form, allowed_docs, author_year_to_docid,
+                writer_docids, citations_manifest,
+            )
 
             if not cited_docids:
                 ensure_dir(str(runs_path()))

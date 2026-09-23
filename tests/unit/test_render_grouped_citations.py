@@ -8,8 +8,9 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rrr.render import parse_citations
-from rrr.writer import _emit_citations_manifest
+from rrr.reasoner import _reference_docids
+from rrr.render import _build_author_year_lookup, parse_citations
+from rrr.writer import _collect_cited_docs, _emit_citations_manifest
 
 
 DISPLAY_LOOKUP = {
@@ -23,6 +24,36 @@ DISPLAY_LOOKUP = {
 
 
 class GroupedCitationParserTests(unittest.TestCase):
+    def test_group_only_members_reach_writer_and_reference_collectors(self):
+        allowed = {"Austin_2008", "North_1989"}
+        text = "Claim (Austin 2008, p.1; North 1989, p.2)."
+        author_year = _build_author_year_lookup(allowed)
+
+        self.assertEqual(_collect_cited_docs(text, allowed, author_year), allowed)
+        self.assertEqual(
+            _reference_docids(
+                text, allowed, author_year, ["Austin_2008"],
+            ),
+            sorted(allowed),
+        )
+
+    def test_references_reconcile_linkified_groups_with_manifest(self):
+        allowed = {"Austin_2008", "North_1989"}
+        text = "Claim ([Austin 2008, p.1](file:///a.pdf); [North 1989, p.2](file:///n.pdf))."
+        manifest = {"citations": [
+            {"doc_id": "Austin_2008"},
+            {"doc_id": "North_1989"},
+            {"doc_id": "NotAdmitted_2000"},
+        ]}
+
+        self.assertEqual(
+            _reference_docids(
+                text, allowed, _build_author_year_lookup(allowed),
+                ["Austin_2008"], manifest,
+            ),
+            sorted(allowed),
+        )
+
     def test_display_group_is_memberwise_and_source_ordered(self):
         text = (
             "North (1989, p.9) opens. "

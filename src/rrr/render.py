@@ -237,12 +237,18 @@ def _build_author_year_lookup(allowed_docs):
 
 
 def _collect_cited_docs(text: str, allowed_docs, author_year_to_docid):
-    """Collect cited doc_ids from canonical, bare-canonical, and legacy
-    author-year forms. v13: promoted from writer.py + reasoner.py. The writer
-    also extends the display-form scan (DISPLAY_CITE_RE / DISPLAY_PAREN_CITE_RE);
-    that branch lives in writer.py and adds to the set this function returns.
+    """Collect allowed doc_ids from every parsed citation and legacy forms.
+
+    The citation parser handles individual members of semicolon groups, which
+    the standalone display-form regular expressions cannot match.
     """
     cited_docs = set()
+
+    display_lookup = _build_display_lookup(allowed_docs)
+    for citation in parse_citations(text, display_lookup=display_lookup):
+        did = citation.get("doc_id")
+        if did in allowed_docs:
+            cited_docs.add(did)
 
     for m in CITE_RE.finditer(text or ""):
         did = m.group(1)
@@ -478,4 +484,3 @@ def parse_citations(text: str, display_lookup: dict = None):
 
 # Citation rendering now has one active path. The writer emits evidence IDs,
 # and its context-aware renderer converts them directly to display citations.
-
