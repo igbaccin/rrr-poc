@@ -65,9 +65,14 @@ class SkillPackagingTests(unittest.TestCase):
         )
         self.assertEqual(
             manifest["interface"]["capabilities"],
-            ["Literature reviews", "Claim evaluation", "Page-cited evidence"],
+            ["Literature reviews", "Claim evaluation", "Citation traceability"],
         )
         self.assertTrue((PLUGIN_ROOT / manifest["skills"]).is_dir())
+        for icon in ("composerIcon", "logo", "logoDark"):
+            self.assertTrue((PLUGIN_ROOT / manifest["interface"][icon]).is_file())
+        self.assertTrue(
+            (PLUGIN_SKILL.parent / "assets" / "rrr-icon.svg").is_file()
+        )
         prompts = manifest["interface"]["defaultPrompt"]
         self.assertTrue(any("$rrr" in prompt for prompt in prompts))
         self.assertTrue(any("my PDFs" in prompt for prompt in prompts))

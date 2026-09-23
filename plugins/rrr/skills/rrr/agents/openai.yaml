@@ -1,6 +1,9 @@
 interface:
-  display_name: "RRR"
+  display_name: "Retrieval-Restricted Reasoning"
   short_description: "Page-cited reviews from your own PDFs"
+  icon_small: "./assets/rrr-icon.svg"
+  icon_large: "./assets/rrr-icon.svg"
+  brand_color: "#315EE8"
   default_prompt: "Use $rrr t2 followed by a topic to review a folder of PDFs I select."
 policy:
   allow_implicit_invocation: false
