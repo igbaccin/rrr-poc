@@ -48,33 +48,48 @@ def _hash_tree(root: Path, suffixes=(".txt", ".json", ".csv")):
 
 
 def _run_git(args):
+    """Return git's raw stdout, or None when git cannot answer."""
     try:
         res = subprocess.run(
             ["git", *args],
             cwd=str(repo_path()),
-            text=True,
             capture_output=True,
             timeout=20,
             check=False,
         )
         if res.returncode == 0:
-            return res.stdout.strip()
+            return res.stdout
     except Exception:
         pass
     return None
 
 
+def _git_text(args, strip=True):
+    out = _run_git(args)
+    if out is None:
+        return None
+    text = out.decode("utf-8", "replace")
+    return text.strip() if strip else text
+
+
 def _git_info():
-    status = _run_git(["status", "--short"]) or ""
-    diff = _run_git(["diff", "--no-ext-diff", "--binary"]) or ""
-    untracked = "\n".join(line for line in status.splitlines() if line.startswith("?? "))
+    # Git output is read as bytes because the Windows locale (cp1252) cannot
+    # decode every UTF-8 diff, and a failed decode used to record the hash of
+    # an empty diff. The diff hash covers `git diff --no-ext-diff --binary`
+    # exactly as git prints it. Fields git cannot report are None.
+    status = _git_text(["status", "--short"], strip=False)
+    diff = _run_git(["diff", "--no-ext-diff", "--binary"])
+    status_lines = status.splitlines() if status is not None else []
+    untracked = "\n".join(line for line in status_lines if line.startswith("?? "))
     return {
-        "commit": _run_git(["rev-parse", "HEAD"]),
-        "branch": _run_git(["branch", "--show-current"]),
-        "dirty": bool(status.strip()),
-        "status_short": status.splitlines(),
-        "tracked_diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
-        "untracked_list_sha256": hashlib.sha256(untracked.encode("utf-8")).hexdigest(),
+        "commit": _git_text(["rev-parse", "HEAD"]),
+        "branch": _git_text(["branch", "--show-current"]),
+        "dirty": bool(status.strip()) if status is not None else None,
+        "status_short": status_lines,
+        "tracked_diff_sha256": hashlib.sha256(diff).hexdigest() if diff is not None else None,
+        "untracked_list_sha256": (
+            hashlib.sha256(untracked.encode("utf-8")).hexdigest() if status is not None else None
+        ),
     }
 
 
