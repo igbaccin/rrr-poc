@@ -108,15 +108,15 @@ class SkillPackagingTests(unittest.TestCase):
         )
         self.assertEqual("cx", plugin_runtime["profile"])
         self.assertEqual("cl", claude_runtime["profile"])
-        self.assertEqual("vcx.2.0", plugin_runtime["profile_version"])
-        self.assertEqual("vcl.2.0", claude_runtime["profile_version"])
+        self.assertEqual("vcx.2.1", plugin_runtime["profile_version"])
+        self.assertEqual("vcl.2.1", claude_runtime["profile_version"])
 
         plugin_wheel = PLUGIN_ROOT / "runtime" / plugin_runtime["wheel"]
         claude_wheel = claude_root / "runtime" / claude_runtime["wheel"]
         # Distinct files, so one can be rebuilt without the other.
         self.assertNotEqual(plugin_wheel.resolve(), claude_wheel.resolve())
         # Byte-identical today. When the Claude modifications land this
-        # assertion is the one to update, together with a bump to vcl.2.1 --
+        # assertion is the one to update, together with a vcl-only bump --
         # never by editing a shared wheel in place.
         self.assertEqual(claude_wheel.read_bytes(), plugin_wheel.read_bytes())
         for manifest, wheel in (
