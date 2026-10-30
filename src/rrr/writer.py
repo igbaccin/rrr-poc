@@ -2969,6 +2969,10 @@ def _drop_would_strand_surname(prev_text: str, sent: str, allowed_docs,
     sent_doc_ids = _sentence_doc_ids(sent, display_lookup=display_lookup)
     if not sent_doc_ids:
         return False
+    # vlm.2.4: a surname whose work is already cited in the preceding prose
+    # keeps its cover when `sent` is dropped, so only an uncited surname
+    # counts as stranded.
+    covered_doc_ids = _sentence_doc_ids(prev_text, display_lookup=display_lookup)
     # Build surname -> doc_ids index for the allowed corpus.
     surname_to_docids: dict = {}
     for did in (allowed_docs or set()):
@@ -2978,7 +2982,7 @@ def _drop_would_strand_surname(prev_text: str, sent: str, allowed_docs,
     # Check tail for any surname whose doc set overlaps sent's cites.
     tail_lower = tail.lower()
     for surnames, dids in surname_to_docids.items():
-        if surnames in tail_lower and (dids & sent_doc_ids):
+        if surnames in tail_lower and (dids & sent_doc_ids) and not (dids & covered_doc_ids):
             return True
     return False
 
@@ -4483,7 +4487,10 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
       fabricated_kept_page_not_readable, fabrications[], duration_s.
 
     The `fabrications` list records (quote, doc_id, page, action) for each
-    strip so the metric is auditable.
+    strip so the metric is auditable. When stripping a sentence would strand
+    an uncited surname in the preceding prose (strand_guard_kept), the
+    sentence is kept and the failed quotation loses its quotation marks
+    instead (strand_guard_dequoted, action quotation_marks_removed).
 
     Disabled when RRR_QUOTE_VERIFY=0 (default 1). Defensive: any unexpected
     error returns the original text unchanged with fallback_reason set.
@@ -4531,6 +4538,7 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
         return None
 
     spans_to_strip = []
+    spans_to_dequote = []
     for qm in _FABRICATED_QUOTE_RE.finditer(full_text):
         stats["checked_quotes"] += 1
         quote = qm.group(1)
@@ -4606,23 +4614,43 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
         if _drop_would_strand_surname(
             prev_text, sent_text, allowed_doc_set, display_lookup=display_lookup,
         ):
+            # vlm.2.4: the sentence stays for its attribution, but the failed
+            # quotation never ships as a quotation. Its marks are removed and
+            # the words remain as attributed prose.
             stats.setdefault("strand_guard_kept", 0)
             stats["strand_guard_kept"] += 1
+            spans_to_dequote.append((q_start, q_end, quote, doc_id, page))
             continue
         spans_to_strip.append((sent_start, sent_end, quote, doc_id, page))
 
-    if spans_to_strip:
-        # Strip in reverse order so earlier strips do not shift later spans.
-        spans_to_strip.sort(key=lambda x: -x[0])
+    edits = []
+    seen_strips = set()
+    for sent_start, sent_end, quote, doc_id, page in spans_to_strip:
+        if (sent_start, sent_end) in seen_strips:
+            continue
+        seen_strips.add((sent_start, sent_end))
+        edits.append((sent_start, sent_end, "sentence_stripped", quote, doc_id, page))
+    for q_start, q_end, quote, doc_id, page in spans_to_dequote:
+        if any(s <= q_start < e for s, e in seen_strips):
+            continue
+        edits.append((q_start, q_end, "quotation_marks_removed", quote, doc_id, page))
+    if edits:
+        # Apply in reverse order so earlier edits do not shift later spans.
+        edits.sort(key=lambda x: -x[0])
         out = full_text
-        for sent_start, sent_end, quote, doc_id, page in spans_to_strip:
-            out = out[:sent_start] + out[sent_end:]
-            stats["fabricated_stripped"] += 1
+        for start, end, action, quote, doc_id, page in edits:
+            if action == "sentence_stripped":
+                out = out[:start] + out[end:]
+                stats["fabricated_stripped"] += 1
+            else:
+                out = out[:start] + out[start + 1:end - 1] + out[end:]
+                stats.setdefault("strand_guard_dequoted", 0)
+                stats["strand_guard_dequoted"] += 1
             stats["fabrications"].append({
                 "quote": quote[:240],
                 "doc_id": doc_id,
                 "page": page,
-                "action": "sentence_stripped",
+                "action": action,
             })
         out = re.sub(r"  +", " ", out)
         out = re.sub(r"\s+\.", ".", out)
@@ -6389,6 +6417,7 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             "verified_real": quote_verify_stats.get("verified_real", 0),
             "fabricated_stripped": quote_verify_stats.get("fabricated_stripped", 0),
             "strand_guard_kept": quote_verify_stats.get("strand_guard_kept", 0),
+            "strand_guard_dequoted": quote_verify_stats.get("strand_guard_dequoted", 0),
         },
         # Outline (carried up from Stage 0/1/2 for one-stop quality view)
         "outline": {

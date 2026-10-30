@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use RRR in research, please cite the accompanying article."
 title: "Retrieval-Restricted Reasoning (RRR)"
 type: software
-version: "2.0.3+lm"
+version: "2.0.4+lm"
 authors:
   - given-names: "Igor"
     family-names: "Martins"
