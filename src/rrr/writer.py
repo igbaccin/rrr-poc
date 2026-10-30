@@ -4401,7 +4401,14 @@ def _ollama_chat(prompt: str, metrics=None, stage="writer"):
     return out
 
 
-_FABRICATED_QUOTE_RE = re.compile(r'"([^"\n]{20,})"')
+_FABRICATED_QUOTE_RE = re.compile(
+    r'"([^"\u201c\u201d\n]{20,})"|\u201c([^"\u201c\u201d\n]{20,})\u201d'
+)
+# vlm.2.5: a coverage quotation is introduced by its own citation and a
+# reporting verb (see the coverage patch template). It was verified when it
+# was inserted, so the verifier leaves it alone; the sentinel marks it while
+# the review is still being assembled, and the template marks it afterwards.
+_COVERAGE_QUOTE_INTRODUCER_RE = re.compile(r"\(\d{4}, p\.\d+\) reports?, $")
 
 
 def _is_period_inside_paren(text: str, idx: int) -> bool:
@@ -4467,9 +4474,24 @@ def _normalise_for_quote_match(s: str) -> str:
     return s.strip()
 
 
+def _quote_is_coverage_patch(full_text: str, q_start: int) -> bool:
+    """True when the quotation opening at ``q_start`` is a coverage quotation."""
+    line_start = full_text.rfind("\n", 0, q_start) + 1
+    sentence_start = line_start
+    for idx in range(q_start - 1, line_start - 1, -1):
+        if full_text[idx] in ".?!" and not _is_period_inside_paren(full_text, idx):
+            sentence_start = idx + 1
+            break
+    sentence_head = full_text[sentence_start:q_start]
+    if _COVERAGE_PATCH_SENTINEL.strip() in sentence_head:
+        return True
+    return bool(_COVERAGE_QUOTE_INTRODUCER_RE.search(sentence_head))
+
+
 def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
                               display_lookup=None):
-    """v14.2 fix #1: scan the assembled essay for every '"..."' span >=20 chars,
+    """v14.2 fix #1: scan the assembled essay for every '"..."' span >=20 chars
+    (vlm.2.5: curly marks too, skipping code-generated coverage quotations),
     locate the nearest canonical (doc_id: p.N) citation within +/-200 chars,
     and verify the normalised quoted text is a substring of
     data/page_text/{doc_id}_page_{N}.txt. Sentences containing an
@@ -4501,6 +4523,7 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
     stats = {
         "enabled": True,
         "checked_quotes": 0,
+        "coverage_quotes_skipped": 0,
         "verified_real": 0,
         "fabricated_stripped": 0,
         "fabricated_kept_no_citation": 0,
@@ -4540,9 +4563,12 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
     spans_to_strip = []
     spans_to_dequote = []
     for qm in _FABRICATED_QUOTE_RE.finditer(full_text):
-        stats["checked_quotes"] += 1
-        quote = qm.group(1)
+        quote = qm.group(1) or qm.group(2)
         q_start, q_end = qm.span()
+        if _quote_is_coverage_patch(full_text, q_start):
+            stats["coverage_quotes_skipped"] += 1
+            continue
+        stats["checked_quotes"] += 1
 
         win_start = max(0, q_start - 200)
         win_end = min(len(full_text), q_end + 200)
@@ -4619,7 +4645,7 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
             # the words remain as attributed prose.
             stats.setdefault("strand_guard_kept", 0)
             stats["strand_guard_kept"] += 1
-            spans_to_dequote.append((q_start, q_end, quote, doc_id, page))
+            spans_to_dequote.append((q_start, q_end, quote, doc_id, page, sent_start, sent_end))
             continue
         spans_to_strip.append((sent_start, sent_end, quote, doc_id, page))
 
@@ -4629,16 +4655,16 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
         if (sent_start, sent_end) in seen_strips:
             continue
         seen_strips.add((sent_start, sent_end))
-        edits.append((sent_start, sent_end, "sentence_stripped", quote, doc_id, page))
-    for q_start, q_end, quote, doc_id, page in spans_to_dequote:
+        edits.append((sent_start, sent_end, "sentence_stripped", quote, doc_id, page, sent_start, sent_end))
+    for q_start, q_end, quote, doc_id, page, sent_start, sent_end in spans_to_dequote:
         if any(s <= q_start < e for s, e in seen_strips):
             continue
-        edits.append((q_start, q_end, "quotation_marks_removed", quote, doc_id, page))
+        edits.append((q_start, q_end, "quotation_marks_removed", quote, doc_id, page, sent_start, sent_end))
     if edits:
         # Apply in reverse order so earlier edits do not shift later spans.
         edits.sort(key=lambda x: -x[0])
         out = full_text
-        for start, end, action, quote, doc_id, page in edits:
+        for start, end, action, quote, doc_id, page, sent_start, sent_end in edits:
             if action == "sentence_stripped":
                 out = out[:start] + out[end:]
                 stats["fabricated_stripped"] += 1
@@ -4646,6 +4672,14 @@ def _strip_fabricated_quotes(full_text: str, allowed_docs, metrics=None,
                 out = out[:start] + out[start + 1:end - 1] + out[end:]
                 stats.setdefault("strand_guard_dequoted", 0)
                 stats["strand_guard_dequoted"] += 1
+                # vlm.2.5: a model's unbalanced quotation leaves a stray mark
+                # that would pair with the next one; clear the sentence's marks.
+                seg_end = sent_end - 2
+                seg = out[sent_start:seg_end]
+                if seg.count('"') % 2 or seg.count("\u201c") != seg.count("\u201d"):
+                    out = out[:sent_start] + re.sub(r'["\u201c\u201d]', "", seg) + out[seg_end:]
+                    stats.setdefault("strand_guard_marks_cleared", 0)
+                    stats["strand_guard_marks_cleared"] += 1
             stats["fabrications"].append({
                 "quote": quote[:240],
                 "doc_id": doc_id,
