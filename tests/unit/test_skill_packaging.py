@@ -108,8 +108,8 @@ class SkillPackagingTests(unittest.TestCase):
         )
         self.assertEqual("cx", plugin_runtime["profile"])
         self.assertEqual("cl", claude_runtime["profile"])
-        self.assertEqual("vcx.2.1", plugin_runtime["profile_version"])
-        self.assertEqual("vcl.2.1", claude_runtime["profile_version"])
+        self.assertEqual("vcx.2.2", plugin_runtime["profile_version"])
+        self.assertEqual("vcl.2.2", claude_runtime["profile_version"])
 
         plugin_wheel = PLUGIN_ROOT / "runtime" / plugin_runtime["wheel"]
         claude_wheel = claude_root / "runtime" / claude_runtime["wheel"]

@@ -477,6 +477,62 @@ def _author_label_pattern(author: str) -> str:
     return r"\s+(?:and|&)\s+".join(escaped)
 
 
+_CONJOINED_NAME_BEFORE_LABEL_RE = re.compile(
+    r"(?<![\w.])"
+    r"[A-Z][\w'\u2019\-]*(?:\s+(?:et\s+al\.?|[A-Z][\w'\u2019\-]*))*"
+    r"\s*,?\s*(?:and|&)\s*$"
+)
+
+
+def _label_preceded_by_conjoined_name(prefix: str) -> bool:
+    """True when the prose before an author label reads ``X and``.
+
+    ``Mokyr and Kuznets`` names two documents. A bare-year citation after the
+    second name would read as a two-author work, which is what run 043 of the
+    July battery released as ``Mokyr and Kuznets (1973, p.1)``. Any
+    capitalised name joined by ``and`` or ``&`` blocks the narrative form; the
+    parenthetical that replaces it keeps both the prose and the citation true.
+    """
+    return bool(_CONJOINED_NAME_BEFORE_LABEL_RE.search((prefix or "").rstrip()))
+
+
+def _repair_unresolved_display_citations(text: str, display_lookup: dict) -> tuple:
+    """Rebind ``X and Author (Year, p.N)`` to ``X and Author (Author Year, p.N)``.
+
+    Runs after every normalization pass, on the surfaces the parser cannot
+    resolve. The prose names stay; only the parenthetical is rewritten, and
+    only when the last conjoined name with that year resolves to one document.
+    """
+    if not display_lookup:
+        return text or "", 0
+    replacements = []
+    for citation in parse_citations(text or "", display_lookup=display_lookup):
+        if citation.get("doc_id") is not None:
+            continue
+        label = str(citation.get("label") or "").strip()
+        year = str(citation.get("year") or "")
+        if not label or not year or citation.get("page") is None:
+            continue
+        units = [u.strip() for u in re.split(r"\s+(?:and|&)\s+", label) if u.strip()]
+        if len(units) < 2:
+            continue
+        tail = units[-1]
+        if display_lookup.get((tail.lower(), year)) is None:
+            continue
+        raw = citation.get("raw") or ""
+        tail_match = re.search(
+            r"\(\s*" + re.escape(year) + r"[a-z]?(?:,\s*|\s+)p\.\s*(\d+)\)\s*$", raw,
+        )
+        if not tail_match:
+            continue
+        rebound = raw[:tail_match.start()] + f"({tail} {year}, p.{tail_match.group(1)})"
+        replacements.append((citation["start"], citation["end"], rebound))
+    out = text or ""
+    for start, end, rebound in sorted(replacements, reverse=True):
+        out = out[:start] + rebound + out[end:]
+    return out, len(replacements)
+
+
 def _apply_observed_capitalisation(canonical: str, observed: str) -> str:
     """Keep the document's capitalisation, normalise only the connector.
 
@@ -779,6 +835,7 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
         "unknown_eid_snippets": [],
         "attribution_mismatches": 0,
         "attribution_mismatch_snippets": [],
+        "conjoined_subject_parentheticals": 0,
     }
     if not text:
         return text or "", stats
@@ -900,6 +957,14 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
                     or bool(adjacency_re.search(immediate))
                 )
             )
+            if author_immediately_before and _label_preceded_by_conjoined_name(
+                immediate[:len(immediate) - len(surnames)]
+            ):
+                # "Mokyr and Kuznets [E0081]": the surname is adjacent, but the
+                # prose names a second author, so a bare year would read as a
+                # two-author work. Keep the parenthetical with the author.
+                author_immediately_before = False
+                stats["conjoined_subject_parentheticals"] += 1
             # v15.7 attribution gate: if THIS doc's surname is not
             # adjacent, check whether some OTHER known author surname is.
             # If yes, that is a prose-vs-cite mismatch — record and force
@@ -1390,6 +1455,8 @@ def _collapse_redundant_narrative_labels(text: str) -> tuple:
             )
             if not label_match:
                 continue
+            if _label_preceded_by_conjoined_name(prefix[:label_match.start(1)]):
+                break
             replacement = (
                 f"{inner_label} ({match.group(2)}, p.{match.group(3)})"
             )
@@ -1822,6 +1889,27 @@ def _realize_leading_author_chains(text: str, display_lookup: dict) -> tuple:
             )
             if not members or any(not member.get("label") for member in members):
                 continue
+            # Adjacent parentheticals belong to one subject chain. In
+            # "Mokyr and Kuznets (Kuznets 1973, p.1) (Mokyr 2005, p.49) argue"
+            # the second citation supports the first name, so the chain is
+            # read as a whole before any name is judged unsupported.
+            chain_end = container.end()
+            while True:
+                separator = re.match(r"(?:\s*;\s*|\s+)", sentence[chain_end:])
+                if not separator:
+                    break
+                following = DISPLAY_PAREN_CITE_RE.match(
+                    sentence, chain_end + separator.end(),
+                )
+                if not following:
+                    break
+                more = list(parse_citations(
+                    following.group(0), display_lookup=display_lookup,
+                ))
+                if not more or any(not member.get("label") for member in more):
+                    break
+                members.extend(more)
+                chain_end = following.end()
             prefix = sentence[:container.start()].strip()
             occurrences = _known_label_occurrences(prefix, display_lookup)
             if not occurrences:
@@ -1861,11 +1949,11 @@ def _realize_leading_author_chains(text: str, display_lookup: dict) -> tuple:
                 )
                 realized_subjects.append(f"{label} ({compact})")
             replacement = " and ".join(realized_subjects)
-            original = sentence[:container.end()]
+            original = sentence[:chain_end]
             if original == replacement:
                 continue
-            replacement_end = sentence_start + container.end()
-            if sentence[container.end():].startswith(","):
+            replacement_end = sentence_start + chain_end
+            if sentence[chain_end:].startswith(","):
                 replacement_end += 1
             replacements.append((
                 sentence_start,
@@ -1892,7 +1980,10 @@ def _realize_leading_author_chains(text: str, display_lookup: dict) -> tuple:
 # them with a cited multi-paragraph closing and zero incomplete prose — and
 # would have rejected 817 of the 941 accepted v17 reviews (86.8%). Cosmetic
 # surfaces are recorded in the quality manifest and left for the checker.
-_BLOCKING_CITATION_SURFACE_FAULTS = frozenset({"unrendered_evidence_marker"})
+_BLOCKING_CITATION_SURFACE_FAULTS = frozenset({
+    "unrendered_evidence_marker",
+    "unresolved_display_citation",
+})
 
 
 def _find_citation_surface_faults(text: str, display_lookup: dict) -> list:
@@ -1904,6 +1995,19 @@ def _find_citation_surface_faults(text: str, display_lookup: dict) -> list:
             "type": "unrendered_evidence_marker",
             "snippet": match.group(0),
         })
+    if display_lookup:
+        for citation in parse_citations(source, display_lookup=display_lookup):
+            if (
+                citation.get("doc_id") is None
+                and citation.get("label")
+                and citation.get("page") is not None
+            ):
+                faults.append({
+                    "type": "unresolved_display_citation",
+                    "label": citation.get("label"),
+                    "year": citation.get("year"),
+                    "snippet": citation.get("raw"),
+                })
     renormalized, pending_changes = _collapse_double_parens(
         source,
         display_lookup=display_lookup,
@@ -6049,6 +6153,15 @@ def compose_from_ledger(ledger_path=None, metrics=None):
     citation_integrity_enforced = _writer_enforcement_enabled()
     zero_cite_dropped = []
     zc_kept_closing = None
+
+    # A display citation the parser cannot resolve is rebound to the author
+    # its year names before the merge and the final audit, so the shipped text
+    # and the audited text are the same text.
+    full_text, unresolved_display_repairs = _repair_unresolved_display_citations(
+        full_text, display_lookup,
+    )
+    if metrics:
+        metrics.set("writer_unresolved_display_repairs", unresolved_display_repairs)
 
     # v15.7.2: merge whitespace-adjacent paren cites into one semicolon-
     # joined parenthetical. Runs AFTER _collect_cited_docs so ref-list
