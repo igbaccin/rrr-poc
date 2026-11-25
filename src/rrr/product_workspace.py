@@ -122,7 +122,25 @@ def _manifest_path(workspace_dir: Path) -> Path:
     return workspace_dir / "workspace.json"
 
 
-def _is_reusable(workspace_dir: Path, snapshot: list[dict]) -> bool:
+WORKSPACE_SCHEMA = 2
+
+
+def bibliography_snapshot(bibliography: Optional[Path]) -> Optional[dict]:
+    if not bibliography:
+        return None
+    path = Path(bibliography).expanduser().resolve()
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _is_reusable(
+    workspace_dir: Path,
+    snapshot: list[dict],
+    bibliography: Optional[dict] = None,
+) -> bool:
     required = (
         workspace_dir / "metadata.csv",
         workspace_dir / "indices" / "bm25.pkl",
@@ -138,7 +156,11 @@ def _is_reusable(workspace_dir: Path, snapshot: list[dict]) -> bool:
         manifest = json.loads(_manifest_path(workspace_dir).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return False
-    return manifest.get("corpus_snapshot") == snapshot
+    return (
+        manifest.get("schema_version") == WORKSPACE_SCHEMA
+        and manifest.get("corpus_snapshot") == snapshot
+        and manifest.get("bibliography") == bibliography
+    )
 
 
 def _ingest_report(workspace_dir: Path) -> dict:
@@ -246,8 +268,9 @@ def prepare_workspace(
         else workspace_for_corpus(corpus_dir)
     )
     snapshot = corpus_snapshot(corpus_dir)
+    bib_snapshot = bibliography_snapshot(bibliography)
     metadata_path = workspace_dir / "metadata.csv"
-    if not force and _is_reusable(workspace_dir, snapshot):
+    if not force and _is_reusable(workspace_dir, snapshot, bib_snapshot):
         return PreparedWorkspace(
             corpus_dir=corpus_dir,
             workspace_dir=workspace_dir,
@@ -291,11 +314,12 @@ def prepare_workspace(
     )
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": WORKSPACE_SCHEMA,
         "corpus_dir": str(corpus_dir),
         "workspace_dir": str(workspace_dir),
         "metadata_path": str(metadata_path),
         "corpus_snapshot": snapshot,
+        "bibliography": bib_snapshot,
     }
     _manifest_path(workspace_dir).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",

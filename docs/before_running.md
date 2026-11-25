@@ -315,9 +315,12 @@ The default data locations are:
 | macOS | `~/Library/Application Support/RRR` |
 | Linux | `$XDG_DATA_HOME/rrr` or `~/.local/share/rrr` |
 
-RRR reuses the prepared text and indices when the PDF collection is unchanged.
-Adding, removing, or replacing a PDF causes the collection to be prepared
-again.
+RRR reuses the prepared text and indices when the PDF collection and the
+bibliography file are unchanged. Adding, removing, or replacing a PDF causes
+the collection to be prepared again, and so does any edit to the bibliography,
+such as adding a year letter or a `file` field. A workspace prepared by an
+earlier version of RRR is prepared again once. `rrr prepare --force` prepares
+the collection again in any case.
 
 ## Final checklist
 
