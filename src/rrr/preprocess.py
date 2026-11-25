@@ -5,25 +5,37 @@ from rrr.paths import data_path
 from rrr.text import normalize_text, sentence_spans
 from multiprocessing import Pool, cpu_count
 
-_REF_HEADER_END = r'\s*[:.]?\s*$'
 _REF_HEADERS = [
-    r'^\s*REFERENCES' + _REF_HEADER_END,
-    r'^\s*References' + _REF_HEADER_END,
-    r'^\s*BIBLIOGRAPHY' + _REF_HEADER_END,
-    r'^\s*Bibliography' + _REF_HEADER_END,
-    r'^\s*Works\s+Cited' + _REF_HEADER_END,
-    r'^\s*WORKS\s+CITED' + _REF_HEADER_END,
-    r'^\s*Reference\s+List' + _REF_HEADER_END,
-    r'^\s*REFERENCE\s+LIST' + _REF_HEADER_END,
-    r'^\s*Literature\s+Cited' + _REF_HEADER_END,
-    r'^\s*LITERATURE\s+CITED' + _REF_HEADER_END,
-    r'^\s*Sources' + _REF_HEADER_END,
-    r'^\s*SOURCES' + _REF_HEADER_END,
+    r'^\s*REFERENCES\s*$',
+    r'^\s*References\s*$',
+    r'^\s*BIBLIOGRAPHY\s*$',
+    r'^\s*Bibliography\s*$',
+    r'^\s*Works\s+Cited\s*$',
+    r'^\s*WORKS\s+CITED\s*$',
+    r'^\s*Reference\s+List\s*$',
+    r'^\s*REFERENCE\s+LIST\s*$',
+    r'^\s*Literature\s+Cited\s*$',
+    r'^\s*LITERATURE\s+CITED\s*$',
+    r'^\s*Sources\s*$',
+    r'^\s*SOURCES\s*$',
+]
+
+_PUNCTUATED_REF_HEADERS = [
+    r'^\s*REFERENCES\s*[:.]\s*$',
+    r'^\s*References\s*[:.]\s*$',
+    r'^\s*BIBLIOGRAPHY\s*[:.]\s*$',
+    r'^\s*Bibliography\s*[:.]\s*$',
+    r'^\s*Works\s+Cited\s*[:.]\s*$',
+    r'^\s*WORKS\s+CITED\s*[:.]\s*$',
+    r'^\s*Reference\s+List\s*[:.]\s*$',
+    r'^\s*REFERENCE\s+LIST\s*[:.]\s*$',
+    r'^\s*Literature\s+Cited\s*[:.]\s*$',
+    r'^\s*LITERATURE\s+CITED\s*[:.]\s*$',
 ]
 
 _INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)', re.IGNORECASE)
 
-_STRONG_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|[:.]|$)')
+_STRONG_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)')
 
 _JSTOR_COVER_RE = re.compile(r'Linked references are available on JSTOR', re.IGNORECASE)
 
@@ -35,6 +47,23 @@ _STANDALONE_REF_HEADER_RE = re.compile(
     r'\s*[:.]?\s*$')
 
 
+def _punctuated_ref_header(page_text: str, next_page: str = None):
+    earliest = None
+    for pattern in _PUNCTUATED_REF_HEADERS:
+        match = re.search(pattern, page_text, re.MULTILINE)
+        if match and (earliest is None or match.start() < earliest.start()):
+            earliest = match
+    if earliest is None:
+        return None
+    after = page_text[earliest.end():]
+    if len(_BIB_ENTRY_LINE_RE.findall(after)) >= 3:
+        return earliest
+    if len(after.strip()) < 200:
+        if next_page is None or len(_BIB_ENTRY_LINE_RE.findall(next_page)) >= 3:
+            return earliest
+    return None
+
+
 def _truncate_at_reference_header(page_text: str) -> tuple:
     earliest = len(page_text)
     found = False
@@ -43,11 +72,14 @@ def _truncate_at_reference_header(page_text: str) -> tuple:
         if m and m.start() < earliest:
             earliest = m.start()
             found = True
-    for inline in (_INLINE_REFERENCES_RE, _STRONG_INLINE_REFERENCES_RE):
-        m_inline = inline.search(page_text)
-        if m_inline and m_inline.start() < earliest:
-            earliest = m_inline.start()
-            found = True
+    punctuated = _punctuated_ref_header(page_text)
+    if punctuated and punctuated.start() < earliest:
+        earliest = punctuated.start()
+        found = True
+    m_inline = _INLINE_REFERENCES_RE.search(page_text)
+    if m_inline and m_inline.start() < earliest:
+        earliest = m_inline.start()
+        found = True
     if found:
         return page_text[:earliest].rstrip(), True
     return page_text, False
@@ -64,7 +96,7 @@ def _column_text_beside_reference_header(page, text_before_header: str) -> str:
     for index, block in enumerate(blocks):
         text = block[4]
         match = None
-        for pattern in _REF_HEADERS:
+        for pattern in _REF_HEADERS + _PUNCTUATED_REF_HEADERS:
             found = re.search(pattern, text, re.MULTILINE)
             if found and (match is None or found.start() < match.start()):
                 match = found
@@ -135,6 +167,8 @@ def _is_reference_start_page(pages: list, i: int) -> bool:
             return True
         return _is_reference_dense(page_text) or (
             i + 1 < n and _is_reference_dense(pages[i + 1]))
+    if _punctuated_ref_header(page_text, pages[i + 1] if i + 1 < n else None):
+        return True
     if _INLINE_REFERENCES_RE.search(page_text) and _is_reference_dense(page_text):
         return True
     return False

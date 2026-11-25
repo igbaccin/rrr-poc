@@ -8,7 +8,9 @@ from _pdf_fixtures import make_layout_pdf
 import rrr.preprocess as preprocess
 from rrr.preprocess import (
     _find_reference_start,
+    _is_reference_start_page,
     _is_strong_reference_header,
+    _punctuated_ref_header,
     _truncate_at_reference_header,
     extract_pages,
     scan_reference_leaks,
@@ -74,13 +76,38 @@ class HeadingPunctuationTests(unittest.TestCase):
         for heading in (
             "References:", "References.", "REFERENCES:", "References :",
             "Bibliography:", "BIBLIOGRAPHY.", "Works Cited:", "Reference List:",
-            "Literature Cited.", "Sources:", "References",
+            "Literature Cited.", "References",
         ):
             page = BODY + "\n" + heading + " \n" + ENTRIES_LEFT
-            self.assertTrue(_is_strong_reference_header(page), heading)
+            self.assertTrue(_is_reference_start_page([page, BODY * 3, BODY * 3], 0), heading)
+            self.assertTrue(_is_reference_start_page([BODY * 3, BODY * 3, page], 2), heading)
             kept, cut = _truncate_at_reference_header(page)
             self.assertTrue(cut, heading)
             self.assertEqual(BODY.rstrip(), kept, heading)
+
+    def test_a_punctuated_heading_needs_the_list_after_it(self):
+        note = BODY + "\nReferences:\n" + BODY * 2
+        self.assertIsNone(_punctuated_ref_header(note))
+        self.assertFalse(_is_reference_start_page([BODY * 3, BODY * 3, note], 2))
+        self.assertEqual((note, False), _truncate_at_reference_header(note))
+        foot = BODY * 3 + "\nReferences:"
+        self.assertTrue(_is_reference_start_page([BODY * 3, foot, ENTRIES_LEFT], 1))
+        self.assertFalse(_is_reference_start_page([BODY * 3, foot, BODY * 3], 1))
+
+    def test_a_sources_note_under_a_table_is_no_heading(self):
+        table_note = (
+            BODY + "\nTable A3\nFood expenditure by region, 1930 to 1960.\n"
+            "Sources: \nCardinall \n(1931) ; \nLynn \n(1937) ; \nThe \nColonial \n"
+            "Office \n(1949); Birmingham et al. (1966) ; \nNyanteng (1978) . \n"
+            "Table A4\nFarm waste and losses and seed requirements.\n" + BODY
+        )
+        pages = [BODY * 3] * 4 + [table_note] + [BODY * 3] * 3
+        self.assertFalse(_is_reference_start_page(pages, 4))
+        self.assertEqual(-1, _find_reference_start(pages))
+        self.assertEqual((table_note, False), _truncate_at_reference_header(table_note))
+        for label in ("Sources:", "SOURCES:", "Sources."):
+            page = BODY + "\n" + label + "\n" + ENTRIES_LEFT
+            self.assertIsNone(_punctuated_ref_header(page), label)
 
     def test_the_colon_form_is_seen_by_the_leak_invariant(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -110,13 +137,6 @@ class HeadingPunctuationTests(unittest.TestCase):
         pages = [BODY * 3, mention, mention, BODY * 3,
                  BODY + "\nReferences:\n" + ENTRIES_LEFT]
         self.assertEqual(4, _find_reference_start(pages))
-
-    def test_a_glued_capital_heading_with_a_colon_is_cut(self):
-        page = BODY.rstrip() + "REFERENCES:Alatas, S. (1977), The Myth of the Lazy Native."
-        self.assertTrue(_is_strong_reference_header(page))
-        kept, cut = _truncate_at_reference_header(page)
-        self.assertTrue(cut)
-        self.assertEqual(BODY.rstrip(), kept)
 
 
 class TwoColumnReferencePageTests(unittest.TestCase):
