@@ -58,13 +58,23 @@ Honor an explicit runtime request. `local` or `ollama` selects local mode.
   Set `RRR_RUNTIME=host` and `RRR_HOST=codex`. Clear `RRR_API_PROVIDER` and
   `RRR_API_MODEL`. Run `rrr host-doctor --host codex`; it checks the executable
   and refuses API-key authentication. Use `--smoke` when an end-to-end host
-  diagnostic is needed. The default host model is `gpt-5.6-sol`.
+  diagnostic is needed. A run inherits the model the user has selected in
+  Codex: the model of the thread that starts RRR, or else the model of the
+  Codex configuration. `gpt-6.2-sol` runs only when RRR finds no selection.
+  `rrr host-doctor` prints the model and where it came from; tell the user
+  which model will run. Set `RRR_HOST_MODEL` only when the user asks for a
+  specific model.
 - Native Claude mode uses the Claude Code product login and its subscription
   allowance. Set `RRR_RUNTIME=host` and `RRR_HOST=claude`. Clear
   `RRR_API_PROVIDER` and `RRR_API_MODEL`. Run
   `rrr host-doctor --host claude`; it requires Claude Code 2.1.169 or newer and
   a Claude.ai Pro, Max, Team, or Enterprise subscription. Use `--smoke` when an
-  end-to-end host diagnostic is needed. The default host model is `opus`.
+  end-to-end host diagnostic is needed. A run inherits the model the user has
+  selected in Claude Code: the model of the session that starts RRR, then
+  `ANTHROPIC_MODEL`, then the model of the user settings. `claude-opus-5-5`
+  runs only when RRR finds no selection. `rrr host-doctor` prints the model
+  and where it came from; tell the user which model will run. Set
+  `RRR_HOST_MODEL` only when the user asks for a specific model.
 
 Host mode starts a fresh tool-restricted session for each model call. An
 already indexed T2 review can require roughly 35 to 40 calls. RRR verifies

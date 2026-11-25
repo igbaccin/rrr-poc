@@ -245,6 +245,7 @@ def host_doctor_main(argv):
         f"[RRR] authentication ready: {status['host']} {status['model']} via "
         f"{auth['method']} subscription{suffix}"
     )
+    print(f"[RRR] model: {status['model']} (from {status.get('model_source', 'unknown')})")
     print(f"[RRR] executable: {status['executable']}")
     if status.get("inference_ready"):
         print("[RRR] inference smoke test: passed")

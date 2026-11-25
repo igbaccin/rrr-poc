@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import inspect
 import json
@@ -17,8 +18,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 
-_CODEX_DEFAULT_MODEL = "gpt-5.6-sol"
-_CLAUDE_DEFAULT_MODEL = "opus"
+_CODEX_DEFAULT_MODEL = "gpt-6.2-sol"
+_CLAUDE_DEFAULT_MODEL = "claude-opus-5-5"
+_SESSION_ID_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,63}")
+_TOML_TABLE_RE = re.compile(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$")
+_TOML_STRING_RE = re.compile(
+    r"""^\s*([A-Za-z0-9_-]+)\s*=\s*(?:"([^"\\]*)"|'([^']*)')\s*(?:#.*)?$"""
+)
 _HOST_LOCK = threading.Lock()
 _CODEX_DISABLED_FEATURES = (
     "shell_tool",
@@ -99,10 +105,169 @@ def _host_name() -> str:
     return host
 
 
-def _host_model(host: Optional[str] = None) -> str:
+def _codex_home() -> Path:
+    home = os.environ.get("CODEX_HOME", "").strip()
+    return Path(home) if home else Path.home() / ".codex"
+
+
+def _claude_home() -> Path:
+    home = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    return Path(home) if home else Path.home() / ".claude"
+
+
+def _json_lines(path: Path, *needles: bytes):
+    with path.open("rb") as handle:
+        for raw in handle:
+            if not any(needle in raw for needle in needles):
+                continue
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                yield row
+
+
+def _model_text(value: Any) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    return "" if text.startswith("<") else text
+
+
+def _toml_strings(text: str) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    table = data
+    for line in text.splitlines():
+        if line.lstrip().startswith("[["):
+            table = {}
+            continue
+        header = _TOML_TABLE_RE.match(line)
+        if header:
+            table = data
+            for part in header.group(1).split("."):
+                table = table.setdefault(part.strip().strip("\"'"), {})
+                if not isinstance(table, dict):
+                    table = {}
+            continue
+        pair = _TOML_STRING_RE.match(line)
+        if pair:
+            table[pair.group(1)] = pair.group(2) if pair.group(2) is not None else pair.group(3)
+    return data
+
+
+def _codex_config_model(config: Path) -> str:
+    try:
+        text = config.read_text(encoding="utf-8")
+        try:
+            import tomllib
+        except ImportError:
+            data = _toml_strings(text)
+        else:
+            data = tomllib.loads(text)
+    except (OSError, ValueError):
+        return ""
+    chosen = dict(data)
+    profiles = data.get("profiles")
+    name = data.get("profile")
+    profile = (
+        profiles.get(name) if isinstance(profiles, dict) and isinstance(name, str) else None
+    )
+    if isinstance(profile, dict):
+        chosen.update(profile)
+    if str(chosen.get("model_provider") or "openai").strip().lower() != "openai":
+        return ""
+    return _model_text(chosen.get("model"))
+
+
+@functools.lru_cache(maxsize=8)
+def _selected_codex_model(home: str, thread: str) -> Optional[tuple]:
+    root = Path(home)
+    if _SESSION_ID_RE.fullmatch(thread):
+        try:
+            records = sorted((root / "sessions").rglob(f"rollout-*-{thread}.jsonl"))
+        except OSError:
+            records = []
+        for record in records[-1:]:
+            model, provider = "", "openai"
+            try:
+                for row in _json_lines(record, b'"turn_context"', b'"session_meta"'):
+                    payload = row.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if row.get("type") == "session_meta":
+                        provider = str(payload.get("model_provider") or provider)
+                    elif row.get("type") == "turn_context":
+                        model = _model_text(payload.get("model")) or model
+            except OSError:
+                model = ""
+            if model and provider.strip().lower() == "openai":
+                return model, "this Codex thread"
+    config = root / "config.toml"
+    model = _codex_config_model(config)
+    if model:
+        return model, f"the Codex configuration, {config}"
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _selected_claude_model(home: str, session: str, env_model: str) -> Optional[tuple]:
+    root = Path(home)
+    if _SESSION_ID_RE.fullmatch(session):
+        try:
+            transcripts = sorted((root / "projects").glob(f"*/{session}.jsonl"))
+        except OSError:
+            transcripts = []
+        for transcript in transcripts[-1:]:
+            model = ""
+            try:
+                for row in _json_lines(transcript, b'"assistant"'):
+                    message = row.get("message")
+                    if (
+                        row.get("type") == "assistant"
+                        and not row.get("isSidechain")
+                        and isinstance(message, dict)
+                    ):
+                        model = _model_text(message.get("model")) or model
+            except OSError:
+                model = ""
+            if model:
+                return model, "this Claude Code session"
+    if env_model:
+        return env_model, "ANTHROPIC_MODEL"
+    settings = root / "settings.json"
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    model = _model_text(data.get("model")) if isinstance(data, dict) else ""
+    if model:
+        return model, f"the Claude Code settings, {settings}"
+    return None
+
+
+def resolve_host_model(host: Optional[str] = None) -> tuple:
     host = host or _host_name()
-    default = _CODEX_DEFAULT_MODEL if host == "codex" else _CLAUDE_DEFAULT_MODEL
-    return os.environ.get("RRR_HOST_MODEL", default).strip() or default
+    override = os.environ.get("RRR_HOST_MODEL", "").strip()
+    if override:
+        return override, "RRR_HOST_MODEL"
+    if host == "codex":
+        selected = _selected_codex_model(
+            str(_codex_home()), os.environ.get("CODEX_THREAD_ID", "").strip(),
+        )
+        label, fallback = "Codex", _CODEX_DEFAULT_MODEL
+    else:
+        selected = _selected_claude_model(
+            str(_claude_home()),
+            os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip(),
+            os.environ.get("ANTHROPIC_MODEL", "").strip(),
+        )
+        label, fallback = "Claude Code", _CLAUDE_DEFAULT_MODEL
+    if selected:
+        return selected
+    return fallback, f"RRR fallback; the model selected in {label} could not be established"
+
+
+def _host_model(host: Optional[str] = None) -> str:
+    return resolve_host_model(host)[0]
 
 
 def host_model_name() -> str:
@@ -418,9 +583,11 @@ def host_diagnostics() -> Dict[str, Any]:
         except (OSError, HostBackendError) as exc:
             last_error = exc
             continue
+        model, model_source = resolve_host_model(host)
         return {
             "host": host,
-            "model": _host_model(host),
+            "model": model,
+            "model_source": model_source,
             "executable": executable,
             "authentication": auth,
             "authentication_ready": True,
