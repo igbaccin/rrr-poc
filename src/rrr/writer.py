@@ -3403,7 +3403,8 @@ def _explanation_summary(outline_plan: dict, n_docs: int) -> str:
         n = len(c.get("doc_ids", []) or [])
         relation = c.get("relation", "")
         if relation == "explains_outcome":
-            label = (c.get("shared_cause") or c.get("shared_thread") or cid).strip()
+            label = (c.get("shared_cause") or c.get("cluster_cause_quote")
+                     or c.get("shared_thread") or cid).strip()
             explanations.append(f"{label} ({n} source(s))")
         elif relation == "documents_outcome":
             documents += n
@@ -4223,7 +4224,8 @@ def compose_from_ledger(ledger_path=None, metrics=None):
                           topic_shape=topic_shape,
                           lead_surname=this_lead,
                           forbidden_opener_surnames=forbidden,
-                          explanation=((c.get("shared_cause") or "").strip()
+                          explanation=((c.get("shared_cause")
+                                        or c.get("cluster_cause_quote") or "").strip()
                                        if topic_shape == "explanatory" else ""))
         chunk_plan.append((
             c.get("relation", "stream"),

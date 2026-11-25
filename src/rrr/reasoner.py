@@ -398,8 +398,8 @@ def _open_question_verdict(outline_plan):
         n = len(c.get("doc_ids", []) or [])
         counts[rel] = counts.get(rel, 0) + n
         if rel == "explains_outcome":
-            label = (c.get("shared_cause") or c.get("shared_thread")
-                     or c.get("cluster_id") or "").strip()
+            label = (c.get("shared_cause") or c.get("cluster_cause_quote")
+                     or c.get("shared_thread") or c.get("cluster_id") or "").strip()
             explanations.append((label, n))
     outcome = (outline_plan.get("topic_outcome") or "the outcome").strip()
     if explanations:

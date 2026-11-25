@@ -72,11 +72,15 @@ class WriterOpenQuestionTests(unittest.TestCase):
         self.assertIn("No stream among the 2 sources proposes a cause.", summary)
         self.assertNotIn("offers these explanations", summary)
 
-    def test_an_explanation_without_a_label_falls_back_to_the_stream_name(self):
-        plan = {"topic_outcome": "glacier surges", "clusters": [
+    def test_an_explanation_without_a_label_takes_the_quoted_cause_then_the_stream_name(self):
+        quoted = {"topic_outcome": "glacier surges", "clusters": [
+            {"cluster_id": "C1", "relation": "explains_outcome", "doc_ids": ["a"], "shared_cause": "",
+             "cluster_cause_quote": "meltwater raised the basal pressure", "shared_thread": "glacier hydrology"}]}
+        self.assertIn("meltwater raised the basal pressure (1 source(s))", writer._explanation_summary(quoted, 1))
+        bare = {"topic_outcome": "glacier surges", "clusters": [
             {"cluster_id": "C1", "relation": "explains_outcome", "doc_ids": ["a"],
              "shared_cause": "", "shared_thread": "basal water pressure"}]}
-        self.assertIn("basal water pressure (1 source(s))", writer._explanation_summary(plan, 1))
+        self.assertIn("basal water pressure (1 source(s))", writer._explanation_summary(bare, 1))
 
     def test_an_explaining_section_is_told_its_explanation(self):
         prompt = stream_prompt("explains_outcome", "neonicotinoid pesticide exposure")

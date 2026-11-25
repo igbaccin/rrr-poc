@@ -270,8 +270,11 @@ class Stage1Tests(StubbedStages):
         prompt = outline._build_cluster_prompt(BEES, claims, topic_shape="explanatory",
                                                topic_outcome="decline of honeybee colonies")
         self.assertIn("TOPIC OUTCOME: decline of honeybee colonies", prompt)
-        self.assertIn("Group these papers by the EXPLANATION", prompt)
+        self.assertIn("one cluster per explanation", prompt)
         self.assertIn("names no cause", prompt)
+        self.assertIn("measure, date or describe the outcome", prompt)
+        self.assertIn("Papers on a neighbouring question", prompt)
+        self.assertIn("address a genuinely different question", prompt)
         self.assertIn("do not add one of your own", prompt)
         for d in SUMMARIES:
             self.assertIn(f"[{d['doc_id']}]", prompt)

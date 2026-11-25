@@ -622,11 +622,17 @@ def _build_explanation_cluster_prompt(topic: str, doc_claims: List[Dict[str, str
         "below and names no cause)",
         f"TOPIC OUTCOME: {topic_outcome}",
         "",
-        "Group these papers by the EXPLANATION each offers for the TOPIC "
-        "OUTCOME. Each cluster is one explanation: papers that point to the "
-        "same cause or the same kind of cause. Papers that measure, date or "
-        "describe the outcome without explaining it form a cluster of their "
-        "own.",
+        "Group these papers into clusters that separate the distinct "
+        "streams of literature in this corpus, as they bear on the TOPIC "
+        "OUTCOME:",
+        "  - A paper that offers an EXPLANATION of the outcome goes with the "
+        "papers that point to the same cause or the same kind of cause: one "
+        "cluster per explanation.",
+        "  - Papers that measure, date or describe the outcome without "
+        "explaining it form a cluster of their own.",
+        "  - Papers on a neighbouring question (a consequence of the "
+        "outcome, its wider setting, the same outcome in another place) "
+        "form clusters by subject.",
         "",
         "Aim for 3-6 clusters. This is a soft target, not a quota: keep two "
         "explanations apart when the papers treat them as competing answers, "
@@ -654,8 +660,7 @@ def _build_explanation_cluster_prompt(topic: str, doc_claims: List[Dict[str, str
         "    - shared_thread: 5-10 word noun phrase summarising the cluster",
         "    - shared_cause: 5-12 word noun phrase naming the explanation "
         "this cluster offers for the TOPIC OUTCOME (in the papers' own "
-        "language); empty string for a cluster that only measures or "
-        "describes the outcome",
+        "language); empty string for a cluster that offers none",
         "  unassigned_doc_ids: array of doc_id strings",
         "",
         "Return ONLY the JSON object. No commentary.",
