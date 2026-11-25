@@ -17,10 +17,10 @@ _MODEL = os.environ.get(
 )
 _KEEP_ALIVE = "30m"
 
-_PRECHECK_PROMPT_VERSION = "2026-07-02-v15.14-precheck"
-_CLUSTER_PROMPT_VERSION = "2026-07-02-v15.14-cluster"
-_POSTURE_PROMPT_VERSION = "2026-07-02-v15.14-posture"
-_ORDER_PROMPT_VERSION = "2026-07-02-v15.14-order"
+_PRECHECK_PROMPT_VERSION = "2026-11-25-v15.19.5-precheck"
+_CLUSTER_PROMPT_VERSION = "2026-11-25-v15.19.5-cluster"
+_POSTURE_PROMPT_VERSION = "2026-11-25-v15.19.5-posture"
+_ORDER_PROMPT_VERSION = "2026-11-25-v15.19.5-order"
 
 
 def _lang_sig() -> bytes:
@@ -32,7 +32,9 @@ _OPTIONS_POSTURE = {"temperature": 0.0, "num_ctx": 8192, "num_predict": 600}
 _OPTIONS_ORDER = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 300}
 
 
-_TOPIC_SHAPES = ("causal", "comparative", "descriptive")
+_TOPIC_SHAPES = ("causal", "explanatory", "comparative", "descriptive")
+
+_OUTCOME_SHAPES = ("causal", "explanatory")
 
 _RELATIONS_BY_SHAPE: Dict[str, set] = {
     "causal": {
@@ -41,6 +43,12 @@ _RELATIONS_BY_SHAPE: Dict[str, set] = {
         "downstream_of_topic_cause",
         "rival_to_topic_cause",
         "scope_condition",
+        "adjacent",
+    },
+    "explanatory": {
+        "explains_outcome",
+        "documents_outcome",
+        "disputes_outcome",
         "adjacent",
     },
     "comparative": {
@@ -197,12 +205,20 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "What SHAPE is this topic? Pick exactly one. Examples below span "
         "different academic domains on purpose — the SHAPE is determined by "
         "what the topic ASKS, not by its subject matter.\n\n"
-        "  - causal: the topic asserts that some variable X CAUSES outcome Y, "
-        "or that X is the fundamental EXPLANATION for some phenomenon. "
-        "Hallmark: the topic names a cause and an effect.\n"
+        "  - causal: the topic NAMES a cause X and an outcome Y. It asserts "
+        "that X CAUSES or EXPLAINS Y, or asks whether or how X affects Y. "
+        "Hallmark: the topic's own words name the cause.\n"
         "      Examples: \"Sleep deprivation impairs immune function.\" "
         "\"Catalyst surface area determines reaction rate.\" "
-        "\"Phonemic awareness in early childhood predicts later reading skill.\"\n\n"
+        "\"How did the printing press change literacy in early modern Europe?\"\n\n"
+        "  - explanatory: the topic names an outcome Y and asks WHY it "
+        "happened, WHAT explains it, or HOW it came about. It names NO cause: "
+        "finding the cause is the question. Y may itself be a gap between "
+        "two cases. Hallmark: an outcome and an open why.\n"
+        "      Examples: \"Why are honeybee colonies declining?\" "
+        "\"How did the Antarctic ozone hole come about?\" "
+        "\"Why do songbirds in cities sing at a higher pitch than those in "
+        "forests?\"\n\n"
         "  - comparative: the topic asserts that A differs from / is better "
         "than / is more X than B. Hallmark: two named entities being compared "
         "on some dimension.\n"
@@ -221,8 +237,12 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "matter has well-known causal stories attached. A topic that ASKS "
         "about patterns, features, or measurements is descriptive even when "
         "its subject is something normally studied causally. Read the topic "
-        "as a QUESTION: does it ask 'what causes X?' (causal), 'is A more X "
-        "than B?' (comparative), or 'what is/are X?' (descriptive).\n\n"
+        "as a QUESTION: does it ask 'does X cause Y?' (causal), 'why Y?' or "
+        "'what causes Y?' (explanatory), 'is A more X than B?' "
+        "(comparative), or 'what is/are X?' (descriptive).\n\n"
+        "SECOND TRAP: never supply a cause yourself. If you cannot point to "
+        "the words of the topic that name the cause, the topic is "
+        "explanatory, however well known its usual explanations are.\n\n"
         "## PART 2 — CORPUS FIT\n"
         "Look at the paper TITLES above. Are these papers PLAUSIBLY useful "
         "for a literature review on the topic? Be honest. Two outcomes:\n\n"
@@ -257,18 +277,22 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "question. Do not refuse a coherent topic on weak fit; do not "
         "proceed on an incoherent topic just because the corpus is "
         "topically broad.\n\n"
-        "## PART 3 — CAUSAL SLOTS (skip if topic_shape != causal)\n"
-        "If you picked topic_shape=\"causal\", also identify the topic's "
-        "EXPLANATORY structure as two pinned slots that every downstream "
-        "stage will reference verbatim:\n\n"
-        "  - topic_cause: a SHORT noun phrase (<=80 chars) for the variable "
-        "the topic claims is doing the EXPLAINING — the explanans.\n"
+        "## PART 3 — SLOTS (skip if topic_shape is comparative or descriptive)\n"
+        "If you picked topic_shape=\"causal\" or \"explanatory\", also "
+        "identify the pinned slots that every downstream stage will "
+        "reference verbatim:\n\n"
         "  - topic_outcome: a SHORT noun phrase (<=80 chars) for the "
-        "phenomenon the topic claims is being EXPLAINED — the explanandum.\n\n"
+        "phenomenon being EXPLAINED — the explanandum. Required for causal "
+        "AND explanatory topics.\n"
+        "  - topic_cause: a SHORT noun phrase (<=80 chars) for the variable "
+        "the topic claims is doing the EXPLAINING — the explanans. Causal "
+        "topics only: copy the topic's own words. For an explanatory topic "
+        "return an EMPTY string. Do not guess a cause and do not write a "
+        "placeholder such as \"unknown factors\".\n\n"
         "These slots are the most important fields you produce. Every "
         "downstream classification of an individual paper's relation to the "
-        "topic is anchored on these two strings. Be CONCRETE and use the "
-        "topic's own wording where possible.\n\n"
+        "topic is anchored on them. Be CONCRETE and use the topic's own "
+        "wording where possible.\n\n"
         "Examples (cross-domain, on purpose):\n"
         "  Topic \"Sleep deprivation impairs immune function.\" -> "
         "topic_cause=\"sleep deprivation\", topic_outcome=\"impaired immune "
@@ -276,14 +300,17 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "  Topic \"Phonemic awareness in early childhood predicts later "
         "reading skill.\" -> topic_cause=\"phonemic awareness in early "
         "childhood\", topic_outcome=\"later reading skill\".\n"
-        "  Topic \"Mediterranean diet reduces cardiovascular disease risk.\" "
-        "-> topic_cause=\"mediterranean diet\", topic_outcome=\"reduced "
-        "cardiovascular disease risk\".\n\n"
+        "  Topic \"Why are honeybee colonies declining?\" -> "
+        "topic_cause=\"\", topic_outcome=\"decline of honeybee colonies\".\n"
+        "  Topic \"Why do songbirds in cities sing at a higher pitch than "
+        "those in forests?\" -> topic_cause=\"\", topic_outcome=\"higher-"
+        "pitched song of city songbirds\".\n\n"
         "For comparative or descriptive topics leave both fields as empty "
         "strings — they are not used.\n\n"
         "## OUTPUT\n"
         "Return ONE JSON object with EXACTLY these six keys:\n"
-        "  topic_shape: \"causal\" | \"comparative\" | \"descriptive\"\n"
+        "  topic_shape: \"causal\" | \"explanatory\" | \"comparative\" | "
+        "\"descriptive\"\n"
         "  topic_shape_rationale: one sentence (<=200 chars) defending the "
         "shape choice, quoting the topic's phrasing.\n"
         "  corpus_fit: \"PROCEED\" | \"REFUSE\"\n"
@@ -295,7 +322,97 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
     )
 
 
-def _validate_precheck(obj) -> Optional[dict]:
+_GENERIC_CAUSE_NOUNS = frozenset({
+    "factor", "factors", "driver", "drivers", "cause", "causes", "reason",
+    "reasons", "determinant", "determinants", "explanation", "explanations",
+    "source", "sources", "origin", "origins", "root", "roots", "force",
+    "forces", "influence", "influences", "mechanism", "mechanisms",
+    "factores", "causas", "razones", "determinantes", "fatores", "razões",
+    "razoes", "facteurs", "raisons", "faktoren", "ursachen", "gründe",
+    "grunde", "fattori", "ragioni", "motivos", "motivi",
+})
+_PLACEHOLDER_QUALIFIERS = frozenset({
+    "unspecified", "unknown", "unnamed", "unclear", "undetermined",
+    "unidentified", "various", "several", "multiple", "many", "numerous",
+    "underlying", "possible", "potential", "certain", "other", "some",
+    "different", "main", "key", "major", "principal", "primary", "complex",
+    "open", "debated", "contested", "competing",
+})
+_SLOT_FUNCTION_WORDS = frozenset({
+    "the", "an", "of", "in", "on", "at", "to", "for", "by", "with", "and",
+    "or", "but", "as", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its", "they", "their", "them",
+    "we", "us", "our", "you", "your", "he", "she", "his", "her", "from",
+    "into", "onto", "upon", "out", "over", "under", "between", "through",
+    "via", "than", "then", "thus", "hence", "also", "not", "no", "if",
+    "when", "where", "while", "because", "so", "more", "less", "most",
+    "least", "any", "all", "each", "every", "such", "same", "do", "does",
+    "did", "have", "has", "had", "having",
+    "how", "what", "why", "who", "whom", "whose", "which", "after", "before",
+    "during", "since", "about", "within", "across", "among", "around",
+    "against", "toward", "towards", "behind", "per", "too", "very", "there",
+    "here", "will", "would", "can", "could", "should", "may", "might",
+    "must", "shall", "both", "either", "neither", "nor", "yet",
+})
+
+
+def _slot_words(text: str) -> List[str]:
+    words = re.findall(r"[^\W\d_]+|\d+", (text or "").casefold())
+    return [w for w in words if len(w) >= 2 and w not in _SLOT_FUNCTION_WORDS]
+
+
+def _unspaced_script(text: str) -> bool:
+    for ch in text or "":
+        cp = ord(ch)
+        if (0x3040 <= cp <= 0x30FF or 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF
+                or 0x0E00 <= cp <= 0x0EFF or 0x1000 <= cp <= 0x109F or 0x1780 <= cp <= 0x17FF):
+            return True
+    return False
+
+
+def _same_word(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 4 and long_.startswith(short):
+        return True
+    return len(short) >= 5 and short[:5] == long_[:5]
+
+
+def _word_in(word: str, words) -> bool:
+    return any(_same_word(word, other) for other in words)
+
+
+def _cause_check(cause: str, topic: str, outcome: str = "") -> str:
+    cause_words = _slot_words(cause)
+    topic_words = _slot_words(topic)
+    if not topic_words or _unspaced_script(topic) or _unspaced_script(cause):
+        return ""
+    generic = _GENERIC_CAUSE_NOUNS | _PLACEHOLDER_QUALIFIERS
+    for word in cause_words:
+        if word not in generic:
+            break
+        if word in _GENERIC_CAUSE_NOUNS and not _word_in(word, topic_words):
+            return "placeholder"
+    core = [w for w in cause_words if w not in generic]
+    if not core:
+        return "placeholder"
+    named = [w for w in core if _word_in(w, topic_words)]
+    if len(named) * 2 < len(core):
+        return "not_in_topic"
+    outcome_words = _slot_words(outcome)
+    if not [w for w in named if not _word_in(w, outcome_words)]:
+        return "repeats_outcome"
+    return ""
+
+
+def _cause_words_comparable() -> bool:
+    topic_lang = (os.environ.get("RRR_TOPIC_LANG", "en") or "en").strip().lower()
+    corpus_lang = (os.environ.get("RRR_CORPUS_LANG", "en") or "en").strip().lower()
+    return topic_lang == corpus_lang
+
+
+def _validate_precheck(obj, topic: str = "", compare_words: bool = True) -> Optional[dict]:
     if not isinstance(obj, dict):
         return None
     shape = str(obj.get("topic_shape", "")).strip().lower()
@@ -306,10 +423,25 @@ def _validate_precheck(obj) -> Optional[dict]:
         return None
     topic_cause = str(obj.get("topic_cause", "") or "").strip()[:120]
     topic_outcome = str(obj.get("topic_outcome", "") or "").strip()[:120]
-    if shape == "causal" and fit == "PROCEED":
-        if not topic_cause or not topic_outcome:
+    model_shape, model_cause = shape, topic_cause
+    adjusted = ""
+    if fit == "PROCEED" and shape in _OUTCOME_SHAPES:
+        if not topic_outcome:
             return None
-    return {
+        if shape == "explanatory":
+            if topic_cause:
+                adjusted = "cause_dropped_from_open_question"
+                topic_cause = ""
+        elif not topic_cause:
+            shape = "explanatory"
+            adjusted = "causal_without_cause"
+        elif topic and compare_words:
+            refused = _cause_check(topic_cause, topic, topic_outcome)
+            if refused:
+                shape = "explanatory"
+                adjusted = f"cause_{refused}"
+                topic_cause = ""
+    result = {
         "topic_shape": shape,
         "topic_shape_rationale": str(obj.get("topic_shape_rationale", "") or "").strip()[:300],
         "corpus_fit": fit,
@@ -317,9 +449,30 @@ def _validate_precheck(obj) -> Optional[dict]:
         "topic_cause": topic_cause,
         "topic_outcome": topic_outcome,
     }
+    if adjusted:
+        result["shape_adjusted"] = adjusted
+        result["model_topic_shape"] = model_shape
+        result["model_topic_cause"] = model_cause
+    return result
 
 
-def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[dict]:
+_PRECHECK_RETRY_REMINDER = (
+    "\n\nReminder: return ONLY the JSON object with the six keys. "
+    "topic_shape must be one of the four values listed and corpus_fit must "
+    "be PROCEED or REFUSE. A causal or explanatory topic needs a "
+    "topic_outcome; an explanatory topic has an empty topic_cause."
+)
+
+
+def _precheck_failure(diagnostics: Optional[dict], kind: str, detail: str = "") -> None:
+    if diagnostics is not None:
+        diagnostics["failure"] = kind
+        diagnostics["detail"] = (detail or "")[:400]
+    return None
+
+
+def precheck(topic: str, doc_summaries: List[dict], metrics=None,
+             diagnostics: Optional[dict] = None) -> Optional[dict]:
     titles = []
     for d in doc_summaries:
         did = (d.get("doc_id") or "").strip()
@@ -329,7 +482,7 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[di
         cite = " ".join(cite.split())[:240]
         titles.append(cite)
     if not titles:
-        return None
+        return _precheck_failure(diagnostics, "no_titles")
 
     sig = _sig_precheck(topic, titles)
     cached = _load_cache("precheck", sig)
@@ -341,33 +494,56 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[di
         metrics.cache_event("outline_precheck", "misses")
 
     prompt = _build_precheck_prompt(topic, titles)
-    raw = ""
-    try:
-        import ollama
-        start = time.perf_counter()
-        res = ollama.chat(
-            model=_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options=_OPTIONS_PRECHECK,
-            keep_alive=_KEEP_ALIVE,
-            format="json",
-            stream=False,
-        )
-        raw = (res.get("message", {}).get("content") or "").strip()
-        if metrics:
-            metrics.record_llm("outline_precheck", _MODEL, options=_OPTIONS_PRECHECK,
-                               duration_s=time.perf_counter() - start,
-                               prompt_chars=len(prompt),
-                               response_chars=len(raw))
-    except Exception as e:
-        if metrics:
-            metrics.record_llm("outline_precheck", _MODEL, options=_OPTIONS_PRECHECK,
-                               success=False, error=e)
-        return None
-
-    result = _parse_and_validate(raw, _validate_precheck)
+    compare_words = _cause_words_comparable()
+    attempts = (
+        ("outline_precheck", prompt),
+        ("outline_precheck_retry", prompt + _PRECHECK_RETRY_REMINDER),
+    )
+    result = None
+    failure = ("model_call_error", "")
+    for stage_name, text in attempts:
+        raw = ""
+        try:
+            import ollama
+            start = time.perf_counter()
+            res = ollama.chat(
+                model=_MODEL,
+                messages=[{"role": "user", "content": text}],
+                options=_OPTIONS_PRECHECK,
+                keep_alive=_KEEP_ALIVE,
+                format="json",
+                stream=False,
+            )
+            raw = (res.get("message", {}).get("content") or "").strip()
+            if metrics:
+                metrics.record_llm(stage_name, _MODEL, options=_OPTIONS_PRECHECK,
+                                   duration_s=time.perf_counter() - start,
+                                   prompt_chars=len(text),
+                                   response_chars=len(raw))
+        except Exception as e:
+            if metrics:
+                metrics.record_llm(stage_name, _MODEL, options=_OPTIONS_PRECHECK,
+                                   success=False, error=e)
+            failure = ("model_call_error", f"{type(e).__name__}: {e}")
+            continue
+        if not raw:
+            failure = ("empty_reply", "")
+            continue
+        obj = _parse_json_object(raw)
+        if obj is None:
+            failure = ("malformed_json", raw[:300])
+            continue
+        try:
+            result = _validate_precheck(obj, topic, compare_words)
+        except Exception:
+            result = None
+        if result is not None:
+            break
+        failure = ("invalid_answer", raw[:300])
     if result is None:
-        return None
+        return _precheck_failure(diagnostics, *failure)
+    if result.get("shape_adjusted") and metrics:
+        metrics.set("outline_shape_adjusted", result["shape_adjusted"])
     result["model"] = _MODEL
     result["prompt_version"] = _PRECHECK_PROMPT_VERSION
     _save_cache("precheck", sig, result)
@@ -379,6 +555,8 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[di
 def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
                           topic_shape: str = "causal",
                           topic_outcome: str = "") -> str:
+    if topic_shape == "explanatory":
+        return _build_explanation_cluster_prompt(topic, doc_claims, topic_outcome)
     has_outcome = bool(topic_outcome) and topic_shape == "causal"
     outcome_line = (
         f"TOPIC OUTCOME: {topic_outcome}"
@@ -429,6 +607,55 @@ def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
         "    - shared_thread: 5-10 word noun phrase summarising the cluster",
         cause_field_doc.rstrip("\n") if cause_field_doc else
         "    - shared_cause: empty string (only used for causal topics)",
+        "  unassigned_doc_ids: array of doc_id strings",
+        "",
+        "Return ONLY the JSON object. No commentary.",
+    ]
+    return _language_prefix() + "\n".join(lines)
+
+
+def _build_explanation_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
+                                      topic_outcome: str) -> str:
+    lines = [
+        f"TOPIC: {topic}",
+        "TOPIC SHAPE: explanatory (the topic asks what explains the outcome "
+        "below and names no cause)",
+        f"TOPIC OUTCOME: {topic_outcome}",
+        "",
+        "Group these papers by the EXPLANATION each offers for the TOPIC "
+        "OUTCOME. Each cluster is one explanation: papers that point to the "
+        "same cause or the same kind of cause. Papers that measure, date or "
+        "describe the outcome without explaining it form a cluster of their "
+        "own.",
+        "",
+        "Aim for 3-6 clusters. This is a soft target, not a quota: keep two "
+        "explanations apart when the papers treat them as competing answers, "
+        "and merge papers that give the same answer in different words. Each "
+        "cluster should typically hold 3+ papers; 1-2 paper clusters are "
+        "acceptable only when a paper truly stands alone in the corpus.",
+        "",
+        "Use `unassigned_doc_ids` for papers that address a genuinely "
+        "different question. Every doc_id appears EXACTLY ONCE. Do NOT "
+        "label relations or stances — Stage 2 handles those. Take each "
+        "explanation from the papers' claims; do not add one of your own.",
+        "",
+        "PAPERS:",
+    ]
+    for entry in doc_claims:
+        did = entry.get("doc_id", "")
+        claim = (entry.get("claim") or "(no claim extracted)").strip()
+        lines.append(f"  [{did}] {claim}")
+    lines += [
+        "",
+        "Return ONE JSON object with EXACTLY these keys:",
+        "  clusters: array of {cluster_id, doc_ids, shared_thread, shared_cause}",
+        "    - cluster_id: a short tag like \"C1\", \"C2\", ...",
+        "    - doc_ids: array of doc_id strings from the list above",
+        "    - shared_thread: 5-10 word noun phrase summarising the cluster",
+        "    - shared_cause: 5-12 word noun phrase naming the explanation "
+        "this cluster offers for the TOPIC OUTCOME (in the papers' own "
+        "language); empty string for a cluster that only measures or "
+        "describes the outcome",
         "  unassigned_doc_ids: array of doc_id strings",
         "",
         "Return ONLY the JSON object. No commentary.",
@@ -639,6 +866,39 @@ def _scaffold_for_shape(topic_shape: str) -> str:
             "  If none of the tests above apply — the cluster talks about "
             "a different outcome or a different subject — -> `adjacent`."
         )
+    if topic_shape == "explanatory":
+        return (
+            "Before choosing `relation`, populate the two QUOTE fields and "
+            "then walk the tests IN ORDER. Take the FIRST test whose "
+            "condition the cluster satisfies.\n\n"
+            "QUOTES:\n"
+            "  cluster_cause_quote: a VERBATIM substring (>=4 words) from "
+            "the cluster's own claims or explanation naming the CAUSE the "
+            "cluster proposes for the TOPIC OUTCOME. Do not paraphrase. "
+            "Empty string if the cluster proposes none.\n"
+            "  cluster_outcome_quote: a VERBATIM substring (>=4 words) "
+            "from the cluster's claims naming what the cluster says about "
+            "the TOPIC OUTCOME. If you cannot find such a substring, the "
+            "cluster is `adjacent` and you may stop.\n\n"
+            "TEST E — EXPLAINS:\n"
+            "  Does the cluster name a cause and say that it produced, "
+            "shaped or sustained the TOPIC OUTCOME? Your "
+            "cluster_cause_quote must show that cause. If yes -> "
+            "`explains_outcome`.\n\n"
+            "TEST X — DISPUTES:\n"
+            "  Does the cluster deny that the TOPIC OUTCOME holds as the "
+            "topic states it, or report the opposite pattern? If yes -> "
+            "`disputes_outcome`.\n\n"
+            "TEST M — DOCUMENTS:\n"
+            "  Does the cluster measure, date or describe the TOPIC "
+            "OUTCOME (how large, since when, where, for whom) while "
+            "proposing no cause for it? If yes -> `documents_outcome`.\n\n"
+            "ADJACENT — fallback only:\n"
+            "  If none of the tests apply — the cluster is about a "
+            "different outcome or a different subject — -> `adjacent`.\n\n"
+            "Judge only what the cluster's own claims and evidence say. Do "
+            "not rank the explanations and do not add one of your own."
+        )
     if topic_shape == "comparative":
         return (
             "Before choosing `relation`, write `reasoning_trace` answering "
@@ -679,6 +939,9 @@ def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
                           cluster_evidence: Dict[str, List[str]],
                           topic_cause: str = "",
                           topic_outcome: str = "") -> str:
+    if topic_shape == "explanatory":
+        return _build_explanation_posture_prompt(topic, cluster, cluster_evidence,
+                                                 topic_outcome)
     pin_lines = []
     if topic_shape == "causal" and topic_cause:
         pin_lines.append(f"TOPIC CAUSE (explanans, pinned): {topic_cause}")
@@ -738,6 +1001,82 @@ def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
     return _language_prefix() + "\n".join(lines)
 
 
+def _build_explanation_posture_prompt(topic: str, cluster: dict,
+                                      cluster_evidence: Dict[str, List[str]],
+                                      topic_outcome: str) -> str:
+    explanation = (cluster.get("shared_cause") or "").strip()
+    lines = [
+        f"TOPIC: {topic}",
+        "TOPIC SHAPE (from Stage 0): explanatory",
+        f"TOPIC OUTCOME (explanandum, pinned): {topic_outcome}",
+        "TOPIC CAUSE: none. The topic asks what explains the outcome.",
+        "",
+        f"CLUSTER LABEL (from Stage 1): {cluster.get('shared_thread','')}",
+        f"CLUSTER'S EXPLANATION (from Stage 1): {explanation or '(none named)'}",
+        "",
+        "PAPERS IN THIS CLUSTER:",
+    ]
+    for did in cluster.get("doc_ids", []):
+        claim = cluster.get("claims_by_doc", {}).get(did, "")
+        lines.append(f"  [{did}]")
+        if claim:
+            lines.append(f"    CLAIM: {claim}")
+        for snip in (cluster_evidence.get(did) or [])[:3]:
+            lines.append(f"    EVIDENCE: {snip}")
+    lines += [
+        "",
+        _scaffold_for_shape("explanatory"),
+        "",
+        "OUTPUT — return ONE JSON object with EXACTLY these keys:",
+        "  cluster_cause_quote: VERBATIM substring (>=4 words) naming the "
+        "cause this cluster proposes for the TOPIC OUTCOME. Required when "
+        "relation = `explains_outcome`; empty string otherwise.",
+        "  cluster_outcome_quote: VERBATIM substring (>=4 words) naming "
+        "what the cluster says about the TOPIC OUTCOME. Empty string "
+        "allowed only when relation = `adjacent`.",
+        "  reasoning_trace: a few sentences walking the test order, "
+        "referring to your quotes.",
+        f"  relation: one of [{_allowed_relations_block('explanatory')}]",
+        "  elaboration: a 1-2 sentence free-text posture (<=240 chars) in the "
+        "literature's own terms — the writer renders this verbatim into the "
+        "review section that introduces this cluster, so phrase it as a "
+        "substantive claim about the world, not a meta-comment. For "
+        "`explains_outcome`, state the explanation: which cause, acting "
+        "how, produced the outcome.",
+        "  lead_doc_id: doc_id of the paper that best represents the cluster's "
+        "argument (must be in the cluster's doc_ids).",
+        "  internal_disagreement: <=200 chars or empty string. If members of "
+        "this cluster reach DIFFERENT conclusions inside the same thread, "
+        "name the disagreement; else leave empty.",
+        "",
+        "Return ONLY the JSON object.",
+    ]
+    return _language_prefix() + "\n".join(lines)
+
+
+def _explanation_grounded(quote: str, cluster: dict,
+                          cluster_evidence: Dict[str, List[str]]) -> bool:
+    own_text = " ".join(
+        [cluster.get("shared_cause") or "", cluster.get("shared_thread") or ""]
+        + [str(c or "") for c in (cluster.get("claims_by_doc") or {}).values()]
+        + [str(s or "") for snips in (cluster_evidence or {}).values() for s in (snips or [])]
+    )
+
+    def _flat(text: str) -> str:
+        return " ".join(str(text or "").casefold().split())
+
+    if not _flat(quote):
+        return False
+    if _flat(quote) in _flat(own_text):
+        return True
+    quote_stems = _content_stems(quote)
+    if not quote_stems:
+        return True
+    shared = quote_stems & _content_stems(own_text)
+    needed = min(len(quote_stems), max(2, (len(quote_stems) + 1) // 2))
+    return len(shared) >= needed
+
+
 def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dict]:
     if not isinstance(obj, dict):
         return None
@@ -758,6 +1097,12 @@ def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dic
             and relation != "adjacent"
             and (len(cluster_cause_quote) < 10 or len(cluster_outcome_quote) < 10)):
         return None
+    if topic_shape == "explanatory":
+        if relation == "explains_outcome" and len(cluster_cause_quote) < 10:
+            return None
+        if (relation in ("documents_outcome", "disputes_outcome")
+                and len(cluster_outcome_quote) < 10):
+            return None
     return {
         "relation": relation,
         "elaboration": elaboration,
@@ -872,6 +1217,15 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
             if metrics:
                 metrics.inc("outline_posture_grounding_promotions")
                 metrics.inc("outline_posture_conduit_promotions")
+
+    if (topic_shape == "explanatory"
+            and posture.get("relation") == "explains_outcome"
+            and not _explanation_grounded(posture.get("cluster_cause_quote", ""),
+                                          cluster, cluster_evidence)):
+        posture["relation"] = "adjacent"
+        posture["mechanism_grounding"] = "downgraded_explains_to_adjacent"
+        if metrics:
+            metrics.inc("outline_posture_grounding_downgrades")
 
     posture["model"] = _MODEL
     posture["prompt_version"] = _POSTURE_PROMPT_VERSION
@@ -1051,14 +1405,22 @@ def order_clusters(topic: str, cluster_summaries: List[dict],
     return parsed
 
 
-def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[dict]:
+def build_outline(topic: str, doc_summaries: List[dict], metrics=None,
+                  precheck_result: Optional[dict] = None,
+                  diagnostics: Optional[dict] = None) -> Optional[dict]:
     if metrics:
         metrics.set("outline_posture_grounding_downgrades", 0)
         metrics.set("outline_posture_grounding_promotions", 0)
         metrics.set("outline_posture_conduit_promotions", 0)
 
-    pre = precheck(topic, doc_summaries, metrics=metrics)
+    pre = precheck_result if (isinstance(precheck_result, dict)
+                              and precheck_result.get("corpus_fit")
+                              and precheck_result.get("topic_shape")) else None
+    if pre is None:
+        pre = precheck(topic, doc_summaries, metrics=metrics, diagnostics=diagnostics)
     if not pre:
+        if diagnostics is not None:
+            diagnostics["stage"] = "stage0"
         return None
 
     topic_shape = pre["topic_shape"]
@@ -1089,6 +1451,9 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
                           topic_outcome=topic_outcome,
                           metrics=metrics)
     if not plan:
+        if diagnostics is not None:
+            diagnostics["stage"] = "stage1"
+            diagnostics["failure"] = "no_valid_cluster_plan"
         return None
     summaries_by_doc = {
         d.get("doc_id"): d for d in doc_summaries if d.get("doc_id")
@@ -1166,6 +1531,8 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
         "topic_cause": topic_cause,
         "topic_outcome": topic_outcome,
         "topic_shape_rationale": pre.get("topic_shape_rationale", ""),
+        **{key: pre[key] for key in ("shape_adjusted", "model_topic_shape",
+                                     "model_topic_cause") if key in pre},
         "clusters": enriched_clusters,
         "unassigned_doc_ids": plan.get("unassigned_doc_ids") or [],
         "ordered_cluster_ids": ordered_ids,
@@ -1181,6 +1548,16 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
 
 
 def _parse_and_validate(raw: str, validate_fn):
+    obj = _parse_json_object(raw)
+    if obj is None:
+        return None
+    try:
+        return validate_fn(obj)
+    except Exception:
+        return None
+
+
+def _parse_json_object(raw: str):
     if not raw:
         return None
     from rrr.utils import extract_first_json
@@ -1197,7 +1574,4 @@ def _parse_and_validate(raw: str, validate_fn):
             obj = json.loads(payload)
         except Exception:
             return None
-    try:
-        return validate_fn(obj)
-    except Exception:
-        return None
+    return obj

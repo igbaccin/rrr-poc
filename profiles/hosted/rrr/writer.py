@@ -2959,7 +2959,58 @@ _RELATION_OPENERS = {
     "adds_nuance":
         "this stream ACCEPTS the topic's description but refines its scope, "
         "magnitude, or mechanism",
+    "explains_outcome":
+        "this stream offers an EXPLANATION of the outcome the topic asks "
+        "about: it names a cause and the mechanism through which that cause "
+        "produced the outcome. It is one of the answers the literature "
+        "gives, to be set beside the others",
+    "documents_outcome":
+        "this stream ESTABLISHES the outcome itself (how large it is, since "
+        "when, where and for whom) and proposes no cause for it; it fixes "
+        "what the explanations have to account for",
+    "disputes_outcome":
+        "this stream DENIES that the outcome holds as the topic states it, "
+        "or reports the opposite pattern; it questions the premise of the "
+        "topic's question",
 }
+
+
+def _explanation_summary(outline_plan: dict, n_docs: int) -> str:
+    outline_plan = outline_plan or {}
+    clusters = {c.get("cluster_id"): c for c in outline_plan.get("clusters", []) or []}
+    order = outline_plan.get("ordered_cluster_ids") or list(clusters.keys())
+    explanations, documents, disputes = [], 0, 0
+    for cid in order:
+        c = clusters.get(cid)
+        if not c:
+            continue
+        n = len(c.get("doc_ids", []) or [])
+        relation = c.get("relation", "")
+        if relation == "explains_outcome":
+            label = (c.get("shared_cause") or c.get("shared_thread") or cid).strip()
+            explanations.append(f"{label} ({n} source(s))")
+        elif relation == "documents_outcome":
+            documents += n
+        elif relation == "disputes_outcome":
+            disputes += n
+    outcome = (outline_plan.get("topic_outcome") or "").strip() or "the outcome it names"
+    parts = [f"Topic shape: explanatory. The topic asks what explains {outcome} "
+             f"and names no cause."]
+    if explanations:
+        parts.append(f"Across {n_docs} sources the literature offers these "
+                     f"explanations: " + "; ".join(explanations) + ".")
+        parts.append("Set them side by side as answers to the same question. "
+                     "Add no explanation that is absent from this list.")
+    else:
+        parts.append(f"No stream among the {n_docs} sources proposes a cause. "
+                     f"Report what the sources establish about the outcome.")
+    if documents:
+        parts.append(f"{documents} source(s) establish the outcome itself "
+                     f"(its size, timing or place).")
+    if disputes:
+        parts.append(f"{disputes} source(s) dispute that the outcome holds as "
+                     f"the topic states it.")
+    return " ".join(parts)
 
 
 def _format_outline_block(cluster: dict, doc_to_evidence_ids) -> str:
@@ -3020,7 +3071,8 @@ def _build_stream_prompt(topic: str, cluster_label: str, evidence: str,
                          outline_block: str = "",
                          claims_so_far: str = "",
                          relation: str = "",
-                         topic_shape: str = ""):
+                         topic_shape: str = "",
+                         explanation: str = ""):
     outline_section = (outline_block + "\n\n") if outline_block else ""
     prior_section = (claims_so_far + "\n\n") if claims_so_far else ""
     prev_block = _prev_tail_block(previous_tail)
@@ -3030,6 +3082,12 @@ def _build_stream_prompt(topic: str, cluster_label: str, evidence: str,
         f"{relation_gloss}.\n"
         if relation_gloss else ""
     )
+    if explanation and relation == "explains_outcome":
+        relation_line += (
+            f"This stream's explanation of the outcome: {explanation}. "
+            f"Present it as one answer to the topic's question, with the "
+            f"mechanism through which it works.\n"
+        )
     return f"""Continue this literature review on: {topic}
 
 {prev_block}
@@ -3923,6 +3981,8 @@ def compose_from_ledger(ledger_path=None, metrics=None):
         else f"Topic shape: {topic_shape}. {len(docs)} sources across "
              f"{len(clusters_by_id)} streams."
     )
+    if topic_shape == "explanatory":
+        stance_summary = _explanation_summary(outline_plan, len(docs))
     print(f"[Writer] topic_shape={topic_shape} clusters={len(clusters_by_id)} "
           f"relations={relation_dist}")
 
@@ -3938,7 +3998,9 @@ def compose_from_ledger(ledger_path=None, metrics=None):
             continue
         builder = partial(_build_stream_prompt,
                           relation=c.get("relation", ""),
-                          topic_shape=topic_shape)
+                          topic_shape=topic_shape,
+                          explanation=((c.get("shared_cause") or "").strip()
+                                       if topic_shape == "explanatory" else ""))
         chunk_plan.append((
             c.get("relation", "stream"),
             c.get("shared_thread") or cid,

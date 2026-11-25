@@ -339,6 +339,84 @@ def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int,
     return ranked[:max(1, topk)]
 
 
+_BREAKDOWN_EXPLANATIONS = {
+    "stage0_llm_failed": (
+        "Stage 0 (the precheck that reads the topic) produced no usable "
+        "answer after one retry. This is a fault of the run, not a finding "
+        "about the corpus. Inspect metrics.llm_calls and run it again."
+    ),
+    "stage1_clustering_failed": (
+        "Stage 1 (clustering) returned no valid plan after one retry. This "
+        "is a fault of the run, not a finding about the corpus. Inspect "
+        "metrics.llm_calls and run it again."
+    ),
+}
+
+
+def _breakdown_record(reason, diagnostics=None):
+    diagnostics = diagnostics or {}
+    detail = str(diagnostics.get("failure") or "")
+    excerpt = str(diagnostics.get("detail") or "")
+    explanation = _BREAKDOWN_EXPLANATIONS.get(
+        reason, "A stage of the pipeline broke down. This is a fault of the run.")
+    result = {
+        "refusal": False,
+        "breakdown": True,
+        "reason": reason,
+        "detail": detail,
+        "explanation": explanation,
+    }
+    if excerpt:
+        result["reply_excerpt"] = excerpt
+    return {
+        "console": f"[Layered-T2] breakdown={reason}" + (f" ({detail})" if detail else ""),
+        "result": result,
+        "values": {
+            "refusal": False,
+            "breakdown": True,
+            "breakdown_reason": reason,
+            "breakdown_detail": detail,
+        },
+        "extra": {"breakdown": reason, "breakdown_detail": detail},
+    }
+
+
+_OPEN_QUESTION_RELATIONS = (
+    ("explains_outcome", "Offer an explanation of the outcome"),
+    ("documents_outcome", "Establish the outcome (size, timing, place)"),
+    ("disputes_outcome", "Dispute the outcome"),
+)
+
+
+def _open_question_verdict(outline_plan):
+    counts = {"explains_outcome": 0, "documents_outcome": 0,
+              "disputes_outcome": 0, "adjacent": 0}
+    explanations = []
+    for c in outline_plan.get("clusters", []) or []:
+        rel = c.get("relation", "adjacent")
+        n = len(c.get("doc_ids", []) or [])
+        counts[rel] = counts.get(rel, 0) + n
+        if rel == "explains_outcome":
+            label = (c.get("shared_cause") or c.get("shared_thread")
+                     or c.get("cluster_id") or "").strip()
+            explanations.append((label, n))
+    outcome = (outline_plan.get("topic_outcome") or "the outcome").strip()
+    if explanations:
+        listed = "; ".join(f"{label} ({n} paper{'s' if n != 1 else ''})"
+                           for label, n in explanations)
+        headline = (f"Open question, no claim to weigh. The corpus offers "
+                    f"{len(explanations)} explanation{'s' if len(explanations) != 1 else ''} "
+                    f"of {outcome}: {listed}")
+    else:
+        headline = (f"Open question, no claim to weigh. No stream of the "
+                    f"corpus offers an explanation of {outcome}")
+    breakdown = (f"explains={counts['explains_outcome']}, "
+                 f"documents={counts['documents_outcome']}, "
+                 f"disputes={counts['disputes_outcome']}, "
+                 f"adjacent={counts['adjacent']}")
+    return {"headline": headline, "breakdown": breakdown}
+
+
 def _layered_t2_inner(args, meta_path):
     import os, json, threading
     import pandas as pd
@@ -728,28 +806,32 @@ def _layered_t2_inner(args, meta_path):
         for d in selected_docs if d.get("doc_id")
     ]
     print("[Layered-T2] early Stage 0 precheck (before per_document_sweep)...")
+    _stage0_diagnostics = {}
     with metrics.stage("outline_early_precheck"):
-        early_pre = _early_precheck(topic, early_doc_summaries, metrics=metrics)
+        early_pre = _early_precheck(topic, early_doc_summaries, metrics=metrics,
+                                    diagnostics=_stage0_diagnostics)
     if early_pre is None:
-        print("[Layered-T2] refusal=stage0_llm_failed (Stage 0 precheck LLM "
-              "error, malformed JSON, or invalid enum)")
+        _breakdown = _breakdown_record("stage0_llm_failed", _stage0_diagnostics)
+        print(_breakdown["console"])
         write_run("T2_LAYERED_GLOBAL", topic,
                   {"docs_seen": len(all_doc_ids), "docs_represented": 0},
-                  {"refusal": True, "reason": "stage0_llm_failed",
-                   "explanation": "Stage 0 precheck did not return a valid "
-                                  "response. Causes: Ollama connection "
-                                  "error, malformed JSON, or an invalid "
-                                  "topic_shape/corpus_fit enum. Inspect "
-                                  "metrics.llm_calls."})
-        metrics.set("refusal", True)
-        metrics.set("refusal_reason", "stage0_llm_failed")
+                  _breakdown["result"])
+        for _key, _value in _breakdown["values"].items():
+            metrics.set(_key, _value)
         write_run_manifest(
             "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
             extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
-                   "refusal": "stage0_llm_failed"},
+                   **_breakdown["extra"]},
         )
         metrics.save()
         return
+    if early_pre.get("shape_adjusted"):
+        print(f"[Layered-T2] Stage 0: the model read the topic as "
+              f"{early_pre.get('model_topic_shape')} with the cause "
+              f"{early_pre.get('model_topic_cause')!r}. The topic's own words "
+              f"do not name that cause ({early_pre['shape_adjusted']}), so the "
+              f"topic is treated as an open question about "
+              f"{early_pre.get('topic_outcome')!r}.")
     if early_pre.get("corpus_fit") == "REFUSE":
         refusal_explanation = early_pre.get("corpus_fit_rationale", "") or (
             "Stage 0 precheck determined the topic and corpus come from "
@@ -830,21 +912,27 @@ def _layered_t2_inner(args, meta_path):
     print(f"[Layered-T2] per-document sweep complete: {kept} docs summarised")
 
     print("[Layered-T2] building corpus-level outline (v15)...")
+    _outline_diagnostics = {}
     with metrics.stage("outline"):
-        outline_plan = build_outline(topic, doc_summaries, metrics=metrics)
+        outline_plan = build_outline(topic, doc_summaries, metrics=metrics,
+                                     precheck_result=early_pre,
+                                     diagnostics=_outline_diagnostics)
     if outline_plan is None:
-        print("[Layered-T2] refusal=stage1_clustering_failed (Stage 1 clustering LLM returned no valid plan)")
+        _breakdown = _breakdown_record(
+            "stage0_llm_failed" if _outline_diagnostics.get("stage") == "stage0"
+            else "stage1_clustering_failed",
+            _outline_diagnostics,
+        )
+        print(_breakdown["console"])
         write_run("T2_LAYERED_GLOBAL", topic,
                   {"docs_seen": len(all_doc_ids), "docs_represented": kept},
-                  {"refusal": True, "reason": "stage1_clustering_failed",
-                   "explanation": "Stage 1 clustering LLM returned no valid "
-                                  "plan after retry. Inspect metrics.llm_calls."})
-        metrics.set("refusal", True)
-        metrics.set("refusal_reason", "stage1_clustering_failed")
+                  _breakdown["result"])
+        for _key, _value in _breakdown["values"].items():
+            metrics.set(_key, _value)
         write_run_manifest(
             "T2_LAYERED_GLOBAL", topic, meta_path, _MODEL, plan=plan_obj,
             extra={"admit_settings": admit_settings, "topic_fit": topic_fit,
-                   "refusal": "stage1_clustering_failed"},
+                   **_breakdown["extra"]},
         )
         metrics.save()
         return
@@ -986,6 +1074,7 @@ def _layered_t2_inner(args, meta_path):
             "rival_to_topic_cause", "rival",
             "upstream_of_topic_cause", "upstream",
             "downstream_of_topic_cause", "downstream",
+            *[rel for rel, _label in _OPEN_QUESTION_RELATIONS],
             "adjacent", "unassigned",
         ]
         rel_label = {
@@ -1000,6 +1089,7 @@ def _layered_t2_inner(args, meta_path):
             "downstream_of_topic_cause": "Trace a downstream implication",
             "downstream": "Trace a downstream implication",
             "adjacent": "Adjacent (related but not addressing the claim directly)",
+            **dict(_OPEN_QUESTION_RELATIONS),
         }
         seen = set()
         ordered_relations = [r for r in rel_order if r in by_relation and not seen.add(r)]
@@ -1029,13 +1119,21 @@ def _layered_t2_inner(args, meta_path):
 
         lines: list = []
         lines.append(f"# Claim evaluation\n")
-        lines.append(f"**Claim:** {topic}\n")
-        lines.append(f"**Topic shape:** {topic_shape}"
-                     + (f" (explanans: {topic_cause}; explanandum: {topic_outcome})" if topic_shape == "causal" and topic_cause else "")
-                     + "\n")
-        lines.append(f"**Corpus:** {total_admitted} of {meta_n_total} papers admitted ({100 * total_admitted // max(1, meta_n_total)}%).\n")
-        lines.append(f"**Aggregate verdict:** {_headline_verdict()}.\n")
-        lines.append(f"**Breakdown:** support={n_support}, rival={n_rival}, upstream={n_upstream}, downstream={n_downstream}, adjacent={n_adjacent}.\n")
+        if topic_shape == "explanatory":
+            _open = _open_question_verdict(outline_plan)
+            lines.append(f"**Question:** {topic}\n")
+            lines.append(f"**Topic shape:** explanatory (explanandum: {topic_outcome}; the topic names no cause)\n")
+            lines.append(f"**Corpus:** {total_admitted} of {meta_n_total} papers admitted ({100 * total_admitted // max(1, meta_n_total)}%).\n")
+            lines.append(f"**Aggregate verdict:** {_open['headline']}.\n")
+            lines.append(f"**Breakdown:** {_open['breakdown']}.\n")
+        else:
+            lines.append(f"**Claim:** {topic}\n")
+            lines.append(f"**Topic shape:** {topic_shape}"
+                         + (f" (explanans: {topic_cause}; explanandum: {topic_outcome})" if topic_shape == "causal" and topic_cause else "")
+                         + "\n")
+            lines.append(f"**Corpus:** {total_admitted} of {meta_n_total} papers admitted ({100 * total_admitted // max(1, meta_n_total)}%).\n")
+            lines.append(f"**Aggregate verdict:** {_headline_verdict()}.\n")
+            lines.append(f"**Breakdown:** support={n_support}, rival={n_rival}, upstream={n_upstream}, downstream={n_downstream}, adjacent={n_adjacent}.\n")
         lines.append("---\n")
 
         for rel in ordered_relations:

@@ -7,6 +7,10 @@ SHARED_MODULES = (
     "test_citation_resolution.py",
     "test_bibliographic_labels.py",
     "test_label_check.py",
+    "test_outline_open_questions.py",
+    "test_reasoner_breakdown.py",
+    "test_writer_open_questions.py",
+    "test_prompt_pins.py",
 )
 
 _UNIT = Path(__file__).resolve().parents[1] / "unit"
