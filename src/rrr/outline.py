@@ -207,14 +207,18 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "what the topic ASKS, not by its subject matter.\n\n"
         "  - causal: the topic NAMES a cause X and an outcome Y. It asserts "
         "that X CAUSES or EXPLAINS Y, or asks whether or how X affects Y. "
-        "Hallmark: the topic's own words name the cause.\n"
+        "Hallmark: the topic's own words name the cause. A statement that "
+        "names both a cause and its effect is causal.\n"
         "      Examples: \"Sleep deprivation impairs immune function.\" "
         "\"Catalyst surface area determines reaction rate.\" "
+        "\"Coral bleaching resulted from warmer seas.\" "
         "\"How did the printing press change literacy in early modern Europe?\"\n\n"
-        "  - explanatory: the topic names an outcome Y and asks WHY it "
-        "happened, WHAT explains it, or HOW it came about. It names NO cause: "
-        "finding the cause is the question. Y may itself be a gap between "
-        "two cases. Hallmark: an outcome and an open why.\n"
+        "  - why_question: the topic is a QUESTION. It names an outcome Y "
+        "and asks WHY it happened, WHAT explains it, or HOW it came about, "
+        "and it names NO cause: finding the cause is the question. Y may "
+        "itself be a gap between two cases. A statement is NEVER a "
+        "why_question, and a question that names the cause it asks about "
+        "(\"How did X change Y?\") is causal.\n"
         "      Examples: \"Why are honeybee colonies declining?\" "
         "\"How did the Antarctic ozone hole come about?\" "
         "\"Why do songbirds in cities sing at a higher pitch than those in "
@@ -238,11 +242,12 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "about patterns, features, or measurements is descriptive even when "
         "its subject is something normally studied causally. Read the topic "
         "as a QUESTION: does it ask 'does X cause Y?' (causal), 'why Y?' or "
-        "'what causes Y?' (explanatory), 'is A more X than B?' "
+        "'what causes Y?' (why_question), 'is A more X than B?' "
         "(comparative), or 'what is/are X?' (descriptive).\n\n"
-        "SECOND TRAP: never supply a cause yourself. If you cannot point to "
-        "the words of the topic that name the cause, the topic is "
-        "explanatory, however well known its usual explanations are.\n\n"
+        "SECOND TRAP: why_question is only for a question that names no "
+        "cause. A topic that states its cause (\"Y resulted from X\", \"X "
+        "shaped Y\") is causal, and X is its cause. Never supply a cause "
+        "the topic does not name.\n\n"
         "## PART 2 — CORPUS FIT\n"
         "Look at the paper TITLES above. Are these papers PLAUSIBLY useful "
         "for a literature review on the topic? Be honest. Two outcomes:\n\n"
@@ -278,15 +283,15 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "proceed on an incoherent topic just because the corpus is "
         "topically broad.\n\n"
         "## PART 3 — SLOTS (skip if topic_shape is comparative or descriptive)\n"
-        "If you picked topic_shape=\"causal\" or \"explanatory\", also "
+        "If you picked topic_shape=\"causal\" or \"why_question\", also "
         "identify the pinned slots that every downstream stage will "
         "reference verbatim:\n\n"
         "  - topic_outcome: a SHORT noun phrase (<=80 chars) for the "
         "phenomenon being EXPLAINED — the explanandum. Required for causal "
-        "AND explanatory topics.\n"
+        "topics AND for a why_question.\n"
         "  - topic_cause: a SHORT noun phrase (<=80 chars) for the variable "
         "the topic claims is doing the EXPLAINING — the explanans. Causal "
-        "topics only: copy the topic's own words. For an explanatory topic "
+        "topics only: copy the topic's own words. For a why_question "
         "return an EMPTY string. Do not guess a cause and do not write a "
         "placeholder such as \"unknown factors\".\n\n"
         "These slots are the most important fields you produce. Every "
@@ -297,9 +302,8 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "  Topic \"Sleep deprivation impairs immune function.\" -> "
         "topic_cause=\"sleep deprivation\", topic_outcome=\"impaired immune "
         "function\".\n"
-        "  Topic \"Phonemic awareness in early childhood predicts later "
-        "reading skill.\" -> topic_cause=\"phonemic awareness in early "
-        "childhood\", topic_outcome=\"later reading skill\".\n"
+        "  Topic \"Coral bleaching resulted from warmer seas.\" -> "
+        "topic_cause=\"warmer seas\", topic_outcome=\"coral bleaching\".\n"
         "  Topic \"Why are honeybee colonies declining?\" -> "
         "topic_cause=\"\", topic_outcome=\"decline of honeybee colonies\".\n"
         "  Topic \"Why do songbirds in cities sing at a higher pitch than "
@@ -309,7 +313,7 @@ def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
         "strings — they are not used.\n\n"
         "## OUTPUT\n"
         "Return ONE JSON object with EXACTLY these six keys:\n"
-        "  topic_shape: \"causal\" | \"explanatory\" | \"comparative\" | "
+        "  topic_shape: \"causal\" | \"why_question\" | \"comparative\" | "
         "\"descriptive\"\n"
         "  topic_shape_rationale: one sentence (<=200 chars) defending the "
         "shape choice, quoting the topic's phrasing.\n"
@@ -412,19 +416,46 @@ def _cause_words_comparable() -> bool:
     return topic_lang == corpus_lang
 
 
-def _validate_precheck(obj, topic: str = "", compare_words: bool = True) -> Optional[dict]:
+_SHAPE_LABELS = {
+    "why_question": "explanatory",
+    "why-question": "explanatory",
+    "why question": "explanatory",
+    "why": "explanatory",
+}
+
+_QUESTION_OPENERS = frozenset({
+    "why", "what", "how", "which", "when", "where", "who", "whom", "whose",
+    "does", "do", "did", "is", "are", "was", "were", "can", "could", "should",
+    "will", "would", "has", "have", "had", "to",
+})
+
+
+def _is_question(topic: str) -> bool:
+    text = (topic or "").strip()
+    if any(mark in text for mark in ("?", "？", "؟", ";", "¿")):
+        return True
+    first = re.findall(r"[^\W\d_]+", text.casefold())[:1]
+    return bool(first) and first[0] in _QUESTION_OPENERS
+
+
+def _validate_precheck(obj, topic: str = "", compare_words: bool = True,
+                       final: bool = True) -> Optional[dict]:
     if not isinstance(obj, dict):
-        return None
-    shape = str(obj.get("topic_shape", "")).strip().lower()
-    if shape not in _TOPIC_SHAPES:
         return None
     fit = str(obj.get("corpus_fit", "")).strip().upper()
     if fit not in ("PROCEED", "REFUSE"):
         return None
+    shape = str(obj.get("topic_shape", "")).strip().lower()
+    shape = _SHAPE_LABELS.get(shape, shape)
+    if shape not in _TOPIC_SHAPES:
+        if fit != "REFUSE":
+            return None
+        shape = "unclassified"
     topic_cause = str(obj.get("topic_cause", "") or "").strip()[:120]
     topic_outcome = str(obj.get("topic_outcome", "") or "").strip()[:120]
     model_shape, model_cause = shape, topic_cause
     adjusted = ""
+    is_statement = bool(topic) and compare_words and not _is_question(topic)
     if fit == "PROCEED" and shape in _OUTCOME_SHAPES:
         if not topic_outcome:
             return None
@@ -435,12 +466,20 @@ def _validate_precheck(obj, topic: str = "", compare_words: bool = True) -> Opti
         elif not topic_cause:
             shape = "explanatory"
             adjusted = "causal_without_cause"
-        elif topic and compare_words:
+        elif topic and compare_words and not is_statement:
             refused = _cause_check(topic_cause, topic, topic_outcome)
             if refused:
                 shape = "explanatory"
                 adjusted = f"cause_{refused}"
                 topic_cause = ""
+    if fit == "PROCEED" and shape == "explanatory" and is_statement:
+        if model_shape == "causal" and not final:
+            return None
+        adjusted = ("statement_not_a_question" if model_shape == "explanatory"
+                    else "statement_without_cause")
+        shape = "descriptive"
+        topic_cause = ""
+        topic_outcome = ""
     result = {
         "topic_shape": shape,
         "topic_shape_rationale": str(obj.get("topic_shape_rationale", "") or "").strip()[:300],
@@ -459,8 +498,9 @@ def _validate_precheck(obj, topic: str = "", compare_words: bool = True) -> Opti
 _PRECHECK_RETRY_REMINDER = (
     "\n\nReminder: return ONLY the JSON object with the six keys. "
     "topic_shape must be one of the four values listed and corpus_fit must "
-    "be PROCEED or REFUSE. A causal or explanatory topic needs a "
-    "topic_outcome; an explanatory topic has an empty topic_cause."
+    "be PROCEED or REFUSE. A causal topic needs a topic_cause, in the "
+    "topic's own words, and a topic_outcome. A why_question needs a "
+    "topic_outcome and has an empty topic_cause."
 )
 
 
@@ -495,13 +535,11 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None,
 
     prompt = _build_precheck_prompt(topic, titles)
     compare_words = _cause_words_comparable()
-    attempts = (
-        ("outline_precheck", prompt),
-        ("outline_precheck_retry", prompt + _PRECHECK_RETRY_REMINDER),
-    )
     result = None
     failure = ("model_call_error", "")
-    for stage_name, text in attempts:
+    for attempt, stage_name in enumerate(("outline_precheck", "outline_precheck_retry")):
+        final = attempt == 1
+        text = prompt + (_PRECHECK_RETRY_REMINDER if final else "")
         raw = ""
         try:
             import ollama
@@ -534,7 +572,7 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None,
             failure = ("malformed_json", raw[:300])
             continue
         try:
-            result = _validate_precheck(obj, topic, compare_words)
+            result = _validate_precheck(obj, topic, compare_words, final=final)
         except Exception:
             result = None
         if result is not None:

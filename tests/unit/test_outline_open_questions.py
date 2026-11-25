@@ -72,18 +72,26 @@ class Stage0PromptTests(unittest.TestCase):
 
     def test_four_kinds_are_offered(self):
         self.assertEqual(("causal", "explanatory", "comparative", "descriptive"), outline._TOPIC_SHAPES)
-        for shape in outline._TOPIC_SHAPES:
-            self.assertIn(f"  - {shape}:", self.prompt)
-        self.assertIn('"causal" | "explanatory" | "comparative" | "descriptive"', self.prompt)
+        for label in ("causal", "why_question", "comparative", "descriptive"):
+            self.assertIn(f"  - {label}:", self.prompt)
+        self.assertIn('"causal" | "why_question" | "comparative" | "descriptive"', self.prompt)
+
+    def test_the_model_is_shown_a_label_that_says_question(self):
+        self.assertNotIn("explanatory", self.prompt)
+        self.assertIn("A statement is NEVER a why_question", self.prompt)
+        self.assertIn("a question that names the cause it asks about", self.prompt)
+        self.assertIn("A statement that names both a cause and its effect is causal", self.prompt)
+        self.assertIn('"Coral bleaching resulted from warmer seas."', self.prompt)
+        self.assertEqual("explanatory", outline._SHAPE_LABELS["why_question"])
 
     def test_open_questions_have_examples_and_an_empty_cause(self):
         self.assertIn("Why are honeybee colonies declining?", self.prompt)
         self.assertIn('topic_cause="", topic_outcome="decline of honeybee colonies"', self.prompt)
-        self.assertIn("never supply a cause yourself", self.prompt)
+        self.assertIn("Never supply a cause the topic does not name", self.prompt)
 
     def test_a_question_about_causes_is_no_longer_called_causal(self):
         self.assertNotIn("'what causes X?' (causal)", self.prompt)
-        self.assertIn("'what causes Y?' (explanatory)", self.prompt)
+        self.assertIn("'what causes Y?' (why_question)", self.prompt)
 
     def test_corpus_fit_instructions_are_those_of_15_19_4(self):
         part = self.prompt[self.prompt.index("## PART 2"):self.prompt.index("## PART 3")]
@@ -196,6 +204,67 @@ class CauseGuardTests(unittest.TestCase):
     def test_a_topic_in_a_script_without_word_breaks_is_not_judged(self):
         self.assertEqual("", outline._cause_check("原因", "为什么蜜蜂数量下降", "蜜蜂数量下降"))
 
+    def test_the_label_shown_to_the_model_is_read_as_the_explanatory_shape(self):
+        for label in ("why_question", "Why_Question", "why-question", "explanatory"):
+            with self.subTest(label=label):
+                result = self.check(BEES, label, "", "decline of honeybee colonies")
+                self.assertEqual("explanatory", result["topic_shape"])
+                self.assertNotIn("shape_adjusted", result)
+
+    def test_questions_are_told_from_statements(self):
+        for topic in (BEES, PRESS, "why did the ozone hole open", "What explains glacier surges",
+                      "¿Por qué disminuyen las abejas?", "为什么蜜蜂数量下降？", "Does AI raise productivity"):
+            self.assertTrue(outline._is_question(topic), topic)
+        for topic in ("Sleep deprivation impairs immune function.", "Coral bleaching resulted from warmer seas.",
+                      "The printing press and literacy", "Glacier surges"):
+            self.assertFalse(outline._is_question(topic), topic)
+
+    def test_a_statement_filed_as_an_open_question_is_read_as_a_description(self):
+        for claim in ("Reef fish are scarcer in the north than in the south.",
+                      "Coral bleaching resulted from warmer seas."):
+            for final in (False, True):
+                with self.subTest(claim=claim, final=final):
+                    result = outline._validate_precheck(
+                        stage0("why_question", "PROCEED", "a cause", "coral bleaching"), claim, final=final)
+                    self.assertEqual("descriptive", result["topic_shape"])
+                    self.assertEqual("", result["topic_cause"])
+                    self.assertEqual("", result["topic_outcome"])
+                    self.assertEqual("statement_not_a_question", result["shape_adjusted"])
+                    self.assertEqual("explanatory", result["model_topic_shape"])
+        asked = outline._validate_precheck(stage0("why_question", "PROCEED", "", "coral bleaching"),
+                                           "Why did the corals bleach?", final=False)
+        self.assertEqual("explanatory", asked["topic_shape"])
+        self.assertNotIn("shape_adjusted", asked)
+
+    def test_a_statement_called_causal_without_a_cause_is_asked_again_then_described(self):
+        claim = "Coral bleaching resulted from warmer seas."
+        answer = stage0("causal", "PROCEED", "", "coral bleaching")
+        self.assertIsNone(outline._validate_precheck(answer, claim, final=False))
+        result = outline._validate_precheck(answer, claim, final=True)
+        self.assertEqual("descriptive", result["topic_shape"])
+        self.assertEqual("statement_without_cause", result["shape_adjusted"])
+
+    def test_a_refusal_is_valid_with_a_shape_outside_the_list(self):
+        for shape in ("REFUSE", "none", "", "unintelligible"):
+            with self.subTest(shape=shape):
+                result = outline._validate_precheck(stage0(shape, "REFUSE", "", ""), "milk house table pigeon")
+                self.assertEqual("REFUSE", result["corpus_fit"])
+                self.assertEqual("unclassified", result["topic_shape"])
+        self.assertIsNone(outline._validate_precheck(stage0("REFUSE", "PROCEED", "", ""), BEES))
+
+    def test_a_statement_keeps_its_cause_when_the_model_rewords_it(self):
+        cases = [
+            ("The colonial government kept the north as a labour reserve.", "colonial government policy"),
+            ("Independence brought little change to the north.", "national independence"),
+            ("Smarter people earn more.", "intelligence"),
+        ]
+        for claim, cause in cases:
+            with self.subTest(claim=claim):
+                result = self.check(claim, "causal", cause, "the outcome the claim names")
+                self.assertEqual("causal", result["topic_shape"])
+                self.assertEqual(cause, result["topic_cause"])
+                self.assertNotIn("shape_adjusted", result)
+
     def test_unknown_shapes_and_fits_are_invalid(self):
         self.assertIsNone(outline._validate_precheck(stage0("open", "PROCEED", "", "x"), BEES))
         self.assertIsNone(outline._validate_precheck(stage0("causal", "MAYBE", "a", "b"), BEES))
@@ -247,6 +316,42 @@ class Stage0CallTests(StubbedStages):
                 self.assertIsNone(result)
                 self.assertEqual(2, len(fake.prompts))
                 self.assertEqual(kind, diagnostics["failure"])
+
+    def test_a_statement_filed_as_an_open_question_costs_one_call(self):
+        claim = "Reef fish are scarcer in the north than in the south."
+        fake = FakeModel([stage0("why_question", outcome="scarcity of reef fish in the north")])
+        result, diagnostics = self.precheck(fake, topic=claim)
+        self.assertEqual(1, len(fake.prompts))
+        self.assertEqual("descriptive", result["topic_shape"])
+        self.assertEqual("statement_not_a_question", result["shape_adjusted"])
+        self.assertEqual({}, diagnostics)
+
+    def test_a_statement_without_its_cause_is_asked_for_it_once(self):
+        claim = "Coral bleaching resulted from warmer seas."
+        fake = FakeModel([stage0("causal", cause="", outcome="coral bleaching"),
+                          stage0("causal", cause="warmer seas", outcome="coral bleaching")])
+        result, _ = self.precheck(fake, topic=claim)
+        self.assertEqual(2, len(fake.prompts))
+        self.assertIn("A causal topic needs a topic_cause", fake.prompts[1])
+        self.assertEqual("causal", result["topic_shape"])
+        self.assertEqual("warmer seas", result["topic_cause"])
+        again = stage0("causal", cause="", outcome="coral bleaching")
+        result, _ = self.precheck(FakeModel([again, again]), topic=claim)
+        self.assertEqual("descriptive", result["topic_shape"])
+        self.assertEqual("statement_without_cause", result["shape_adjusted"])
+
+    def test_a_refusal_with_an_odd_shape_is_a_refusal_at_the_first_answer(self):
+        fake = FakeModel([stage0("REFUSE", fit="REFUSE")])
+        result, diagnostics = self.precheck(fake, topic="milk house getting asked whole table pigeon under")
+        self.assertEqual(1, len(fake.prompts))
+        self.assertEqual("REFUSE", result["corpus_fit"])
+        self.assertEqual({}, diagnostics)
+
+    def test_a_question_called_an_open_question_costs_one_call(self):
+        fake = FakeModel([stage0("why_question", outcome="decline of honeybee colonies")])
+        result, _ = self.precheck(fake)
+        self.assertEqual(1, len(fake.prompts))
+        self.assertEqual("explanatory", result["topic_shape"])
 
     def test_no_titles_is_reported_without_a_call(self):
         fake = FakeModel([])

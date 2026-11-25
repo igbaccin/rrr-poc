@@ -828,10 +828,9 @@ def _layered_t2_inner(args, meta_path):
     if early_pre.get("shape_adjusted"):
         print(f"[Layered-T2] Stage 0: the model read the topic as "
               f"{early_pre.get('model_topic_shape')} with the cause "
-              f"{early_pre.get('model_topic_cause')!r}. The topic's own words "
-              f"do not name that cause ({early_pre['shape_adjusted']}), so the "
-              f"topic is treated as an open question about "
-              f"{early_pre.get('topic_outcome')!r}.")
+              f"{early_pre.get('model_topic_cause')!r}. RRR reads it as "
+              f"{early_pre.get('topic_shape')} "
+              f"({early_pre['shape_adjusted']}).")
     if early_pre.get("corpus_fit") == "REFUSE":
         refusal_explanation = early_pre.get("corpus_fit_rationale", "") or (
             "Stage 0 precheck determined the topic and corpus come from "
