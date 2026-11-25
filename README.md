@@ -124,6 +124,7 @@ bibliographic records.
 | Path | Contents |
 | --- | --- |
 | `src/rrr/` | RRR source code |
+| `profiles/hosted/` | The modules that differ in the Codex and Claude profiles |
 | `plugins/rrr/` | Installable Codex plugin |
 | `skills/rrr/` | Portable Codex and Claude skill bundle |
 | `dist/` | Installable Python wheel and SHA-256 checksum |

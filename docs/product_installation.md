@@ -265,6 +265,53 @@ In Claude Code, request the Anthropic API explicitly:
 /rrr t2 <topic>. Use the Anthropic API.
 ```
 
+## Managed Windows computers
+
+A computer administered by a university or a company often restricts what a
+user account may run and reach. RRR was first used on such a laptop, and the
+following points come from that installation.
+
+**The `rrr` launcher may be blocked.** pip writes a small launcher, `rrr.exe`,
+beside the interpreter. It is an unsigned executable in a user folder, and
+group policy can refuse it with "This program is blocked by group policy". The
+interpreter itself is signed and runs. RRR therefore never depends on the
+launcher. The installer returns a `command` made of the interpreter followed
+by `-m rrr`, the Codex plugin and the Claude skill use that command, and in a
+terminal every command runs as:
+
+```powershell
+python -m rrr prepare "PATH_TO_PDF_FOLDER"
+```
+
+For the private runtime that the plugin installs, the interpreter is
+`%LOCALAPPDATA%\RRR\runtime\<version>\venv\Scripts\python.exe`.
+
+**The package index may be unreachable.** The first installation downloads
+RRR's dependencies from pypi.org. Where the network blocks that address, or
+lets it through only at times, the installer reports the failed download with
+the remedies. The section on installing without access to the package index,
+below, describes the wheelhouse route, which needs no network on the target
+computer.
+
+**Where RRR keeps its data.** Everything RRR writes goes under
+`%LOCALAPPDATA%\RRR`: the private runtime in `runtime`, and one workspace per
+PDF folder in `corpora`, with the catalogue, the extracted page text, the
+index and the runs. The PDFs stay where they are and are only read. Set
+`RRR_DATA_DIR` to keep all of it elsewhere, for instance on a drive with more
+room.
+
+**No console windows.** RRR starts its own steps and the Codex or Claude calls
+without a console window, so a review started from a desktop application does
+not flash a window for each of its thirty to forty calls.
+
+**Logs.** Every RRR process writes UTF-8. A log redirected to a file shows
+accented names and dashes correctly when it is opened as UTF-8.
+
+**Finding Codex.** RRR looks for `codex.exe` in the two helper folders under
+`%USERPROFILE%\.codex`, then in the newest build folder under
+`%LOCALAPPDATA%\OpenAI\Codex\bin`, then on `PATH`. `RRR_HOST_COMMAND` names
+the executable directly when none of these applies.
+
 ## What the first installation prints
 
 The installer reports each step on the error stream: the private Python
