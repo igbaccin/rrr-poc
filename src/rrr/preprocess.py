@@ -5,24 +5,25 @@ from rrr.paths import data_path
 from rrr.text import normalize_text, sentence_spans
 from multiprocessing import Pool, cpu_count
 
+_REF_HEADER_END = r'\s*[:.]?\s*$'
 _REF_HEADERS = [
-    r'^\s*REFERENCES\s*$',
-    r'^\s*References\s*$',
-    r'^\s*BIBLIOGRAPHY\s*$',
-    r'^\s*Bibliography\s*$',
-    r'^\s*Works\s+Cited\s*$',
-    r'^\s*WORKS\s+CITED\s*$',
-    r'^\s*Reference\s+List\s*$',
-    r'^\s*REFERENCE\s+LIST\s*$',
-    r'^\s*Literature\s+Cited\s*$',
-    r'^\s*LITERATURE\s+CITED\s*$',
-    r'^\s*Sources\s*$',
-    r'^\s*SOURCES\s*$',
+    r'^\s*REFERENCES' + _REF_HEADER_END,
+    r'^\s*References' + _REF_HEADER_END,
+    r'^\s*BIBLIOGRAPHY' + _REF_HEADER_END,
+    r'^\s*Bibliography' + _REF_HEADER_END,
+    r'^\s*Works\s+Cited' + _REF_HEADER_END,
+    r'^\s*WORKS\s+CITED' + _REF_HEADER_END,
+    r'^\s*Reference\s+List' + _REF_HEADER_END,
+    r'^\s*REFERENCE\s+LIST' + _REF_HEADER_END,
+    r'^\s*Literature\s+Cited' + _REF_HEADER_END,
+    r'^\s*LITERATURE\s+CITED' + _REF_HEADER_END,
+    r'^\s*Sources' + _REF_HEADER_END,
+    r'^\s*SOURCES' + _REF_HEADER_END,
 ]
 
 _INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)', re.IGNORECASE)
 
-_STRONG_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|$)')
+_STRONG_INLINE_REFERENCES_RE = re.compile(r'REFERENCES(?=[A-Z]|\s|[:.]|$)')
 
 _JSTOR_COVER_RE = re.compile(r'Linked references are available on JSTOR', re.IGNORECASE)
 
@@ -30,7 +31,8 @@ _BIB_ENTRY_LINE_RE = re.compile(
     r'(?m)^\s*[A-Z][A-Za-z\'.\-]+,\s+(?:[A-Z]\.|[A-Z][a-z]+).{20,}')
 
 _STANDALONE_REF_HEADER_RE = re.compile(
-    r'(?m)^\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography|WORKS CITED|Works Cited)\s*$')
+    r'(?m)^\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography|WORKS CITED|Works Cited)'
+    r'\s*[:.]?\s*$')
 
 
 def _truncate_at_reference_header(page_text: str) -> tuple:
@@ -41,13 +43,60 @@ def _truncate_at_reference_header(page_text: str) -> tuple:
         if m and m.start() < earliest:
             earliest = m.start()
             found = True
-    m_inline = _INLINE_REFERENCES_RE.search(page_text)
-    if m_inline and m_inline.start() < earliest:
-        earliest = m_inline.start()
-        found = True
+    for inline in (_INLINE_REFERENCES_RE, _STRONG_INLINE_REFERENCES_RE):
+        m_inline = inline.search(page_text)
+        if m_inline and m_inline.start() < earliest:
+            earliest = m_inline.start()
+            found = True
     if found:
         return page_text[:earliest].rstrip(), True
     return page_text, False
+
+
+def _column_text_beside_reference_header(page, text_before_header: str) -> str:
+    try:
+        blocks = [b for b in page.get_text("blocks") if len(b) >= 7 and b[6] == 0]
+    except Exception:
+        return ""
+    heading_index = None
+    heading_top = None
+    before_parts = []
+    for index, block in enumerate(blocks):
+        text = block[4]
+        match = None
+        for pattern in _REF_HEADERS:
+            found = re.search(pattern, text, re.MULTILINE)
+            if found and (match is None or found.start() < match.start()):
+                match = found
+        if match is None:
+            before_parts.append(text)
+            continue
+        lead = text[:match.start()]
+        before_parts.append(lead)
+        lines = max(1, text.count("\n"))
+        heading_top = block[1] + (block[3] - block[1]) * (lead.count("\n") / lines)
+        heading_index = index
+        break
+    if heading_index is None:
+        return ""
+    if normalize_text("".join(before_parts).strip()).rstrip() != text_before_header:
+        return ""
+
+    heading_block = blocks[heading_index]
+    column_right = heading_block[2]
+    for block in blocks[:heading_index]:
+        if block[0] <= heading_block[0] + 5 and block[2] > column_right:
+            column_right = block[2]
+    extra = [
+        block[4] for block in blocks[heading_index + 1:]
+        if block[3] <= heading_top + 2 and block[0] >= column_right - 5
+    ]
+    text = normalize_text("".join(extra).strip())
+    if len(text) < 200:
+        return ""
+    if _BIB_ENTRY_LINE_RE.search(text) or _is_reference_dense(text):
+        return ""
+    return text
 
 def _is_reference_dense(page_text: str) -> bool:
     if len(page_text) < 200:
@@ -102,6 +151,17 @@ def _find_reference_start(pages: list) -> int:
             return i
     return -1
 
+def extract_pages_with_numbers(pdf_path: str):
+    with pymupdf.open(pdf_path) as doc:
+        raw = [page.get_text() for page in doc]
+    pages, numbers = [], []
+    for number, text in enumerate(raw):
+        if text.strip():
+            pages.append(normalize_text(text.strip()))
+            numbers.append(number)
+    return pages, numbers
+
+
 def extract_pages(pdf_path: str):
     with pymupdf.open(pdf_path) as doc:
         pages = [page.get_text() for page in doc]
@@ -123,7 +183,7 @@ def _process_one(row_dict):
         return {"doc_id": doc_id, "ok": False, "reason": "missing_pdf"}
     try:
         h = sha256_file(pdf)
-        pages = extract_pages(pdf)
+        pages, page_numbers = extract_pages_with_numbers(pdf)
 
         ref_start = _find_reference_start(pages)
 
@@ -138,6 +198,15 @@ def _process_one(row_dict):
             boundary_page = pages[ref_start]
             trimmed, truncated = _truncate_at_reference_header(boundary_page)
             if truncated and trimmed:
+                with pymupdf.open(pdf) as doc:
+                    beside = _column_text_beside_reference_header(
+                        doc[page_numbers[ref_start]], trimmed,
+                    )
+                if beside:
+                    if re.search(r"[A-Za-z]-$", trimmed) and re.match(r"[a-z]", beside):
+                        trimmed = trimmed[:-1] + beside
+                    else:
+                        trimmed = trimmed + "\n" + beside
                 content_pages = content_pages + [trimmed]
                 ref_pages -= 1
 

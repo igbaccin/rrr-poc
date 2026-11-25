@@ -34,3 +34,22 @@ def write_bib(path: Path, entries: list) -> Path:
     path = Path(path)
     path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
     return path
+
+
+def make_layout_pdf(path: Path, pages: list, page_size=(468, 684)) -> Path:
+    import pymupdf
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    for boxes in pages:
+        page = doc.new_page(width=page_size[0], height=page_size[1])
+        for rect, text in boxes:
+            leftover = page.insert_textbox(
+                pymupdf.Rect(*rect), text, fontsize=8, fontname="helv",
+            )
+            if leftover < 0:
+                raise ValueError(f"text does not fit its box {rect}: {text[:40]!r}")
+    doc.save(str(path))
+    doc.close()
+    return path
