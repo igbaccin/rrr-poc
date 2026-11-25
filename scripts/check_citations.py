@@ -13,8 +13,16 @@ try:
         _build_author_year_lookup,
         _build_display_lookup,
         _doc_id_to_author_label,
+        compile_citation_patterns,
+        known_label_alternation,
+        _GROUPED_DISPLAY_LABEL as _RENDER_GROUP_LABEL,
+        _split_leading_particles,
     )
 except Exception:
+    compile_citation_patterns = None
+    known_label_alternation = None
+    _RENDER_GROUP_LABEL = None
+    _split_leading_particles = None
     CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
     _DISPLAY_UNIT = (
         r"(?:(?i:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
@@ -25,10 +33,10 @@ except Exception:
     )
     DISPLAY_CITE_RE = re.compile(
         r"(?<!\w)(" + _DISPLAY_LABEL + r")\s+"
-        r"\((\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(\d+)\)"
+        r"\((\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
     )
     DISPLAY_PAREN_CITE_RE = re.compile(
-        r"\((" + _DISPLAY_LABEL + r")(?:,?\s+)(\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(\d+)\)"
+        r"\((" + _DISPLAY_LABEL + r")(?:,?\s+)(\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
     )
 
     def _doc_id_to_author_label(doc_id):
@@ -93,21 +101,15 @@ _GROUP_DISPLAY_LABEL_RE = (
     + r"(?:\s+(?:(?:and|&)\s+" + _GROUP_SURNAME_RE
     + r"|et\s+al\.?))?"
 )
+if _RENDER_GROUP_LABEL:
+    _GROUP_DISPLAY_LABEL_RE = _RENDER_GROUP_LABEL
 _GROUP_CANONICAL_UNIT_RE = re.compile(
     r"^\s*(?P<doc_id>[A-Za-z0-9_&.\-]+)\s*:\s*"
     r"p\.\s*(?P<page>\d+)\s*$"
 )
-_GROUP_DISPLAY_UNIT_RE = re.compile(
-    r"^\s*(?P<label>" + _GROUP_DISPLAY_LABEL_RE + r")"
-    r"(?:,?\s+)(?P<year>\d{4})[a-z]?"
-    r"(?:,\s*|\s+)p\.\s*(?P<page>\d+)\s*$"
-)
 _GROUP_NARRATIVE_FIRST_RE = re.compile(
-    r"^\s*(?P<year>\d{4})[a-z]?"
+    r"^\s*(?P<year>\d{4}[a-z]?)"
     r"(?:,\s*|\s+)p\.\s*(?P<page>\d+)\s*$"
-)
-_GROUP_PREFIX_RE = re.compile(
-    r"(?<!\w)(?P<label>" + _GROUP_DISPLAY_LABEL_RE + r")\s*$"
 )
 _SEMICOLON_CONTAINER_RE = re.compile(
     r"\((?P<body>[^()]*;[^()]*)\)"
@@ -122,17 +124,47 @@ _RECOVERABLE_CANONICAL_UNIT_RE = re.compile(
     r"p\.\s*(?P<pages>" + _RECOVERABLE_PAGE_SPEC + r")\s*$",
     re.IGNORECASE,
 )
-_RECOVERABLE_DISPLAY_UNIT_RE = re.compile(
-    r"^\s*(?P<label>" + _GROUP_DISPLAY_LABEL_RE + r")"
-    r"(?:,?\s+)(?P<year>\d{4})[a-z]?"
-    r"(?:,\s*|\s+)p\.\s*(?P<pages>"
-    + _RECOVERABLE_PAGE_SPEC + r")\s*$"
-)
 _RECOVERABLE_NARRATIVE_UNIT_RE = re.compile(
-    r"^\s*(?P<year>\d{4})[a-z]?"
+    r"^\s*(?P<year>\d{4}[a-z]?)"
     r"(?:,\s*|\s+)p\.\s*(?P<pages>"
     + _RECOVERABLE_PAGE_SPEC + r")\s*$"
 )
+
+_GROUP_LABEL = _GROUP_DISPLAY_LABEL_RE
+_GENERIC_DISPLAY_PATTERNS = (DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE)
+
+
+def _configure_label_patterns(known=""):
+    global DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE, _GROUP_LABEL
+    global _GROUP_DISPLAY_UNIT_RE, _GROUP_PREFIX_RE, _RECOVERABLE_DISPLAY_UNIT_RE
+    if compile_citation_patterns is not None:
+        compiled = compile_citation_patterns(known)
+        DISPLAY_CITE_RE = compiled["narrative"]
+        DISPLAY_PAREN_CITE_RE = compiled["paren"]
+    else:
+        known = ""
+        DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE = _GENERIC_DISPLAY_PATTERNS
+    _GROUP_LABEL = (
+        _GROUP_DISPLAY_LABEL_RE if not known
+        else r"(?:(?i:" + known + r")|" + _GROUP_DISPLAY_LABEL_RE + r")"
+    )
+    _GROUP_DISPLAY_UNIT_RE = re.compile(
+        r"^\s*(?P<label>" + _GROUP_LABEL + r")"
+        r"(?:,?\s+)(?P<year>\d{4}[a-z]?)"
+        r"(?:,\s*|\s+)p\.\s*(?P<page>\d+)\s*$"
+    )
+    _GROUP_PREFIX_RE = re.compile(
+        r"(?<!\w)(?P<label>" + _GROUP_LABEL + r")\s*$"
+    )
+    _RECOVERABLE_DISPLAY_UNIT_RE = re.compile(
+        r"^\s*(?P<label>" + _GROUP_LABEL + r")"
+        r"(?:,?\s+)(?P<year>\d{4}[a-z]?)"
+        r"(?:,\s*|\s+)p\.\s*(?P<pages>"
+        + _RECOVERABLE_PAGE_SPEC + r")\s*$"
+    )
+
+
+_configure_label_patterns("")
 _PAGE_ONLY_SPEC_RE = re.compile(
     r"^\s*p{1,2}\.\s*(?P<pages>\d+(?:\s*"
     r"(?:[-\u2013\u2014,;]|\band\b)\s*(?:p{1,2}\.\s*)?\d+)*)\s*$",
@@ -315,7 +347,7 @@ def _classify_malformed_group_unit(raw, narrative_label=None):
                  re.IGNORECASE):
         return "group_multi_page"
     if re.fullmatch(
-        r"\s*" + _GROUP_DISPLAY_LABEL_RE
+        r"\s*" + _GROUP_LABEL
         + r"(?:,?\s+)\d{4}[a-z]?\s*",
         expanded,
     ):
@@ -496,7 +528,7 @@ _LOOSE_AUTHOR_YEAR_RE = re.compile(
     r"(?:(?:van|von|de|del|der)\s+)?[A-Z][A-Za-z\-]+"
     r"(?:\s*(?:&|and)\s*(?:(?:van|von|de|del|der)\s+)?[A-Z][A-Za-z\-]+)?"
     r"(?:\s+et\s+al\.?)?"
-    r")\s+(\d{4})[a-z]?(?!\s*[:,]?\s*p\.)"
+    r")\s+(\d{4}[a-z]?)(?!\s*[:,]?\s*p\.)"
 )
 
 _E3_HARD_PATTERNS = [
@@ -765,6 +797,19 @@ def _load_doc_max_pages(data_dir):
 
 
 def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_check=True):
+    labels = []
+    for doc_id, row in _load_citation_metadata(metadata_path).items():
+        label = row.get("display_label", "") or _doc_id_to_author_label(str(doc_id))
+        labels.append(re.sub(r"\s*\(\d{4}[a-z]?\)\s*$", "", label))
+    known = known_label_alternation(labels) if known_label_alternation else ""
+    _configure_label_patterns(known)
+    try:
+        return _check_review(text, metadata_path, data_dir, quote_check)
+    finally:
+        _configure_label_patterns("")
+
+
+def _check_review(text, metadata_path="metadata.csv", data_dir="data", quote_check=True):
     citation_metadata = _load_citation_metadata(metadata_path)
     valid_docs = set(citation_metadata)
     doc_max = _load_doc_max_pages(data_dir)
@@ -779,7 +824,11 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         return match.group(1) if match else ""
 
     def _normalise_label(value):
-        return str(value or "").strip().lower().rstrip(".")
+        return " ".join(str(value or "").lower().split()).rstrip(".")
+
+    def _year_letter(value):
+        match = re.search(r"\b\d{4}([a-z])\b", str(value or ""))
+        return match.group(1) if match else ""
 
     def _split_display_label(value, fallback_year=""):
         label = str(value or "").strip()
@@ -799,6 +848,8 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
                     r"^(van|von|de|del|der)([A-Z].+)$", raw)
                 if particle:
                     lowered = particle.group(2).lower()
+                elif _split_leading_particles and raw[:1].islower():
+                    lowered = _split_leading_particles(raw).split()[-1].lower()
             tokens.add(lowered)
         return frozenset(tokens)
 
@@ -806,6 +857,9 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
     display_collisions = set()
     citation_labels = {}
     full_signatures = {}
+    doc_letters = {}
+    docs_by_label = {}
+    docs_by_first_author = {}
     for _did in valid_docs:
         _row = citation_metadata.get(_did, {})
         _metadata_label = _row.get("display_label", "")
@@ -820,6 +874,13 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
             if _doc_match:
                 _year = _doc_match.group(2)
         citation_labels[_did] = (_author_label, _year)
+        doc_letters[_did] = (
+            _year_letter(_label) or _year_letter(_row.get("year", ""))
+            or _year_letter(str(_did).rsplit("_", 1)[-1])
+        )
+        if _author_label and _year:
+            docs_by_label.setdefault(
+                (_normalise_label(_author_label), _year), []).append(_did)
 
         if _author_label and _year:
             _key = (_normalise_label(_author_label), _year)
@@ -886,6 +947,8 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         if " et al" in _normalise_label(_author_label):
             _keys.append((_first_author + " et al", _year))
         for _key in _keys:
+            docs_by_first_author.setdefault(_key, []).append(_did)
+        for _key in _keys:
             if _key in unique_author_year_lookup and unique_author_year_lookup[_key] != _did:
                 _first_author_collisions.add(_key)
             else:
@@ -895,6 +958,22 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
 
     def _resolve_display_label(label, year):
         label_norm = _normalise_label(label)
+        letter = _year_letter(year)
+        year = str(year or "")[:4]
+
+        def _by_letter(candidates):
+            candidates = list(dict.fromkeys(candidates or []))
+            lettered = [c for c in candidates if doc_letters.get(c)]
+            if not lettered:
+                return None, False
+            if letter:
+                named = [c for c in candidates if doc_letters.get(c) == letter]
+                return (named[0] if len(named) == 1 else None), True
+            return (candidates[0] if len(candidates) == 1 else None), True
+
+        did, decided = _by_letter(docs_by_label.get((label_norm, year)))
+        if decided:
+            return did
         did = display_lookup.get((label_norm, year))
         if did:
             return did
@@ -911,6 +990,10 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         first_author = re.split(
             r"\s+et\s+al\.?", label_norm, maxsplit=1)[0]
         first_author = first_author.strip()
+        for _key in ((first_author, year), (first_author + " et al", year)):
+            did, decided = _by_letter(docs_by_first_author.get(_key))
+            if decided:
+                return did
         did = unique_author_year_lookup.get((first_author, year))
         if did:
             return did

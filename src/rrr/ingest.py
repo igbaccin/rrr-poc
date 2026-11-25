@@ -10,7 +10,7 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +40,7 @@ class ExtractedMeta:
     source: str = "none"
     notes: str = ""
     display_label: str = ""
+    surnames: list = field(default_factory=list)
     bib_key: str = ""
     year_letter_source: str = ""
 
@@ -49,6 +50,7 @@ METADATA_CSV_COLUMNS = [
     "number", "pages", "doi_or_url", "pdf_path",
     "content_sha1", "first_author_surname", "confidence", "source", "notes",
     "lang",
+    "display_label",
 ]
 
 
@@ -752,6 +754,39 @@ def _join_notes(existing: str, addition: str) -> str:
     return f"{existing}; {addition}" if existing else addition
 
 
+def _display_name(name) -> str:
+    text = unicodedata.normalize("NFC", _bibtex_plain(name))
+    for dash in "\u2010\u2011\u2012\u2013\u2014":
+        text = text.replace(dash, "-")
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    text = re.sub(r"[()\[\];,]", " ", text)
+    text = re.sub(r"\bet\s+al\.?\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if re.search(r"[^\W\d_]", text) else ""
+
+
+def build_display_label(surnames: list, year) -> str:
+    names = [_display_name(name) for name in surnames or []]
+    cell = re.fullmatch(r"\s*(\d{4}[a-z]?)\s*", str(year or ""))
+    if not names or not all(names) or not cell:
+        return ""
+    if len(names) == 1:
+        who = names[0]
+    elif len(names) == 2:
+        who = f"{names[0]} and {names[1]}"
+    else:
+        who = f"{names[0]} et al."
+    return f"{who} ({cell.group(1)})"
+
+
+def assign_display_labels(rows: list) -> None:
+    for meta in rows:
+        if not getattr(meta, "doc_id", ""):
+            continue
+        surnames = list(getattr(meta, "surnames", None) or []) or _surnames_from_meta(meta)
+        meta.display_label = build_display_label(surnames, meta.year)
+
+
 def hold_repeated_bib_entries(rows: list) -> list:
     strength = {"file_field": 0, "key": 1, "file_name": 2, "title": 3}
     by_key: dict = {}
@@ -784,6 +819,7 @@ def hold_repeated_bib_entries(rows: list) -> list:
 
 def _fill_from_bib(meta: ExtractedMeta, entry: dict) -> None:
     meta.bib_key = entry.get("key", "")
+    meta.surnames = list(entry.get("surnames") or [])
     meta.title = entry["title"]
     meta.year = entry["year"]
     meta.venue = entry["venue"]
@@ -1008,6 +1044,7 @@ def ingest_corpus(corpus_dir: Path,
                 for member in group["members"]
             )
             print(f"[ingest] same author and year, {group['label']}: {members}")
+    assign_display_labels(results)
     if output_csv:
         _write_metadata_csv(results, output_csv)
         if progress:
@@ -1039,4 +1076,5 @@ def _write_metadata_csv(rows: list, path: Path) -> None:
                 "source": r.source,
                 "notes": r.notes,
                 "lang": r.lang,
+                "display_label": getattr(r, "display_label", ""),
             })

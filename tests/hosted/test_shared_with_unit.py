@@ -5,12 +5,18 @@ from pathlib import Path
 
 SHARED_MODULES = (
     "test_citation_resolution.py",
+    "test_bibliographic_labels.py",
+    "test_label_check.py",
 )
 
 _UNIT = Path(__file__).resolve().parents[1] / "unit"
 
 
 def load_tests(loader, standard_tests, pattern):
+    import sys
+
+    if str(_UNIT) not in sys.path:
+        sys.path.insert(0, str(_UNIT))
     suite = unittest.TestSuite()
     for name in SHARED_MODULES:
         spec = importlib.util.spec_from_file_location(

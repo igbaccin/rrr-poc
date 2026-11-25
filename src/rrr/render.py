@@ -16,13 +16,64 @@ _DISPLAY_LABEL = (
     r"(?:" + _DISPLAY_UNIT +
     r"(?:\s+(?:and\s+" + _DISPLAY_UNIT + r"|et\s+al\.))?)"
 )
-DISPLAY_CITE_RE = re.compile(
-    r"(?<!\w)(" + _DISPLAY_LABEL + r")\s+"
-    r"\((\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
-)
-DISPLAY_PAREN_CITE_RE = re.compile(
-    r"\((" + _DISPLAY_LABEL + r")(?:,?\s+)(\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
-)
+
+
+def known_label_alternation(labels) -> str:
+    generic = re.compile(_DISPLAY_LABEL)
+    patterns = set()
+    for label in labels or ():
+        words = str(label or "").split()
+        if not words or generic.fullmatch(" ".join(words)):
+            continue
+        et_al = len(words) > 2 and [w.lower().rstrip(".") for w in words[-2:]] == ["et", "al"]
+        if et_al:
+            words = words[:-2]
+        pattern = r"\s+".join(re.escape(word) for word in words)
+        if et_al:
+            pattern += r"\s+et\s+al\.?"
+        patterns.add(pattern)
+    return "|".join(sorted(patterns, key=lambda item: (-len(item), item)))
+
+
+def _with_known(known: str, grammar: str) -> str:
+    return grammar if not known else r"(?:(?i:" + known + r")|" + grammar + r")"
+
+
+def compile_citation_patterns(known: str = "") -> dict:
+    label = _with_known(known, _DISPLAY_LABEL)
+    grouped = _with_known(known, _GROUPED_DISPLAY_LABEL)
+    return {
+        "narrative": re.compile(
+            r"(?<!\w)(" + label + r")\s+"
+            r"\((\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
+        ),
+        "paren": re.compile(
+            r"\((" + label + r")(?:,?\s+)(\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(\d+)\)"
+        ),
+        "grouped_item": re.compile(
+            r"(?P<label>" + grouped + r")(?:,?\s+)"
+            r"(?P<year>\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(?P<page>\d+)"
+        ),
+        "grouped_narrative_label": re.compile(
+            r"(?<!\w)(?P<label>" + grouped + r")\s*$"
+        ),
+    }
+
+
+class _CataloguePattern:
+    def __init__(self, name: str):
+        self._name = name
+        self._compiled = None
+
+    def _use(self, compiled: dict) -> None:
+        self._compiled = compiled[self._name]
+
+    def __getattr__(self, attribute):
+        return getattr(self._compiled, attribute)
+
+    def __repr__(self):
+        return f"<citation pattern {self._name}: {self._compiled.pattern!r}>"
+
 
 _GROUPED_PAREN_RE = re.compile(r"\((?P<body>[^();]*(?:;[^();]*)+)\)")
 _GROUPED_SURNAME = (
@@ -37,16 +88,30 @@ _GROUPED_DISPLAY_LABEL = (
 _GROUPED_CANONICAL_ITEM_RE = re.compile(
     r"(?P<doc_id>[A-Za-z0-9_&.\-]+)\s*:\s*p\.\s*(?P<page>\d+)"
 )
-_GROUPED_DISPLAY_ITEM_RE = re.compile(
-    r"(?P<label>" + _GROUPED_DISPLAY_LABEL + r")(?:,?\s+)"
-    r"(?P<year>\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(?P<page>\d+)"
-)
 _GROUPED_NARRATIVE_FIRST_RE = re.compile(
     r"(?P<year>\d{4}[a-z]?)(?:,\s*|\s+)p\.\s*(?P<page>\d+)"
 )
-_GROUPED_NARRATIVE_LABEL_RE = re.compile(
-    r"(?<!\w)(?P<label>" + _GROUPED_DISPLAY_LABEL + r")\s*$"
+
+DISPLAY_CITE_RE = _CataloguePattern("narrative")
+DISPLAY_PAREN_CITE_RE = _CataloguePattern("paren")
+_GROUPED_DISPLAY_ITEM_RE = _CataloguePattern("grouped_item")
+_GROUPED_NARRATIVE_LABEL_RE = _CataloguePattern("grouped_narrative_label")
+_CATALOGUE_PATTERNS = (
+    DISPLAY_CITE_RE, DISPLAY_PAREN_CITE_RE,
+    _GROUPED_DISPLAY_ITEM_RE, _GROUPED_NARRATIVE_LABEL_RE,
 )
+_KNOWN_LABELS = ""
+
+
+def _use_known_labels(known: str) -> None:
+    global _KNOWN_LABELS
+    compiled = compile_citation_patterns(known)
+    for pattern in _CATALOGUE_PATTERNS:
+        pattern._use(compiled)
+    _KNOWN_LABELS = known
+
+
+_use_known_labels("")
 _GROUPED_CITATION_SHAPED_RE = re.compile(
     r"(?:\bp{1,2}\.\s*\d+|\b\d{4}[a-z]?\b)", re.IGNORECASE
 )
@@ -71,13 +136,17 @@ def _label_with_year(label: str, year: str) -> str:
     return f"{match.group(1)} ({year})"
 
 
+def _label_key(label) -> str:
+    return " ".join(str(label or "").lower().split())
+
+
 def note_rendered_citation(doc_id, page) -> None:
     doc_id = str(doc_id or "").strip()
     match = _LABEL_YEAR_RE.match(_doc_id_to_author_label(doc_id))
     if not doc_id or not match:
         return
     try:
-        key = (match.group(1).strip().lower(), match.group(2), int(page))
+        key = (_label_key(match.group(1)), match.group(2), int(page))
     except (TypeError, ValueError):
         return
     _RENDERED_CITATIONS.setdefault(key, set()).add(doc_id)
@@ -133,6 +202,9 @@ def set_metadata_labels(rows, *, clear: bool = True) -> int:
             if lettered != entry["display_label"]:
                 entry["display_label"] = lettered
                 entry["surnames"] = _regex_author_surnames_only(lettered)
+    _use_known_labels(known_label_alternation(
+        entry["surnames"] for entry in _METADATA_LABEL_LOOKUP.values()
+    ))
     return count
 
 
@@ -311,7 +383,7 @@ class DisplayLookup(dict):
         return None, ()
 
     def resolve(self, label, year, page=None):
-        label = str(label or "").strip().lower()
+        label = _label_key(label)
         year = str(year or "").strip()
         doc_id, candidates = self._direct(label, year)
         if doc_id is None and not candidates:
@@ -330,7 +402,7 @@ class DisplayLookup(dict):
                 if not entry:
                     continue
                 noted = _RENDERED_CITATIONS.get(
-                    (entry.group(1).strip().lower(), entry.group(2), int(page)), ()
+                    (_label_key(entry.group(1)), entry.group(2), int(page)), ()
                 )
                 if candidate in noted:
                     rendered.add(candidate)
@@ -339,9 +411,7 @@ class DisplayLookup(dict):
 
     def get(self, key, default=None):
         if isinstance(key, tuple) and len(key) == 2:
-            doc_id, _ = self._direct(
-                str(key[0] or "").strip().lower(), str(key[1] or "").strip(),
-            )
+            doc_id, _ = self._direct(_label_key(key[0]), str(key[1] or "").strip())
             return default if doc_id is None else doc_id
         return dict.get(self, key, default)
 
@@ -355,7 +425,7 @@ def _build_display_lookup(allowed_doc_ids):
         m = _LABEL_YEAR_RE.match(label)
         if not m:
             continue
-        name = m.group(1).strip().lower()
+        name = _label_key(m.group(1))
         year = m.group(2)
         exact.setdefault((name, year), [])
         if did not in exact[(name, year)]:
@@ -403,6 +473,7 @@ def citation_inside(citation, allowed_docs, allowed_pairs=None):
 def check_citation_labels(rows) -> dict:
     global _METADATA_LABEL_LOOKUP, _RENDERED_CITATIONS
     saved = (_METADATA_LABEL_LOOKUP, _RENDERED_CITATIONS)
+    saved_known = _KNOWN_LABELS
     problems = []
     try:
         set_metadata_labels(rows)
@@ -459,6 +530,7 @@ def check_citation_labels(rows) -> dict:
         return {"checked": len(doc_ids), "problems": problems}
     finally:
         _METADATA_LABEL_LOOKUP, _RENDERED_CITATIONS = saved
+        _use_known_labels(saved_known)
 
 
 def parse_citations(text: str, display_lookup: dict = None):
