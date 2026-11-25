@@ -13,6 +13,8 @@ from rrr.render import (
     DISPLAY_PAREN_CITE_RE,
     parse_citations,
     render_citation,
+    citation_inside,
+    note_rendered_citation,
     _build_author_year_lookup,
     _build_display_lookup,
     _collect_cited_docs as _shared_collect_cited_docs,
@@ -661,6 +663,7 @@ def _render_evidence_id_citations(text: str, evidence_map: dict) -> tuple:
             continue
         doc_id = ev["doc_id"]
         page = int(ev["page"])
+        note_rendered_citation(doc_id, page)
         full_label = _doc_id_to_author_label(doc_id)
         surnames = _author_surnames_only(full_label)
         ym = re.match(r"^.*?\((\d{4}[a-z]?)\)\s*$", full_label)
@@ -1913,6 +1916,10 @@ def _remove_invalid_citations(text: str, allowed_docs: set, allowed_pairs=None,
                     page,
                     "unresolved_display",
                 ))
+                continue
+            if c.get("candidates") and citation_inside(
+                c, allowed_docs, allowed_pairs,
+            ):
                 continue
             if doc_id.lower() not in allowed_lower:
                 invalid.append((c["start"], c["end"], doc_id, page, "unknown_doc"))

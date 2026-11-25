@@ -24,6 +24,7 @@ class PreparedWorkspace:
     metadata_path: Path
     reused: bool
     pdf_count: int
+    same_author_year: tuple = ()
 
     def as_dict(self) -> dict:
         return {
@@ -32,6 +33,7 @@ class PreparedWorkspace:
             "metadata_path": str(self.metadata_path),
             "reused": self.reused,
             "pdf_count": self.pdf_count,
+            "same_author_year": list(self.same_author_year),
         }
 
 
@@ -137,6 +139,21 @@ def _is_reusable(workspace_dir: Path, snapshot: list[dict]) -> bool:
     return manifest.get("corpus_snapshot") == snapshot
 
 
+def _ingest_report(workspace_dir: Path) -> dict:
+    try:
+        report = json.loads(
+            (workspace_dir / "ingest_report.json").read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return report if isinstance(report, dict) else {}
+
+
+def _same_author_year(workspace_dir: Path) -> tuple:
+    groups = _ingest_report(workspace_dir).get("same_author_year") or []
+    return tuple(group for group in groups if isinstance(group, dict))
+
+
 def _run(command: list[str], env: dict[str, str], quiet: bool = False) -> None:
     completed = subprocess.run(
         command,
@@ -182,6 +199,7 @@ def prepare_workspace(
             metadata_path=metadata_path,
             reused=True,
             pdf_count=len(pdfs),
+            same_author_year=_same_author_year(workspace_dir),
         )
 
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -233,4 +251,5 @@ def prepare_workspace(
         metadata_path=metadata_path,
         reused=False,
         pdf_count=len(pdfs),
+        same_author_year=_same_author_year(workspace_dir),
     )

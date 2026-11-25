@@ -37,6 +37,8 @@ class ExtractedMeta:
     confidence: str = "low"
     source: str = "none"
     notes: str = ""
+    bib_key: str = ""
+    year_letter_source: str = ""
 
 
 METADATA_CSV_COLUMNS = [
@@ -391,7 +393,116 @@ def generate_doc_id(surnames: list, year: str, existing: set = None) -> str:
     return f"{base}_{n}"
 
 
+_YEAR_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+_DOC_ID_PARTS_RE = re.compile(r"^(?P<name>.+)_(?P<year>\d{4})(?P<letter>[a-z]?)$")
+
+
+def _year_letter_hint(meta: ExtractedMeta, year: str) -> tuple:
+    cell = re.fullmatch(r"\s*(\d{4})([a-z])\s*", str(meta.year or ""))
+    if cell and cell.group(1) == year:
+        return cell.group(2), "bibliography year"
+    key = re.search(rf"(?<!\d){year}([a-z])$", str(meta.bib_key or ""))
+    if key:
+        return key.group(1), "bibliography key"
+    stem = Path(str(meta.pdf_path or "")).stem
+    name = re.search(rf"(?<!\d){year}([a-z])(?![A-Za-z0-9])", stem)
+    if name:
+        return name.group(1), "file name"
+    return "", ""
+
+
+def assign_year_letters(rows: list) -> list:
+    from rrr.render import _regex_doc_id_to_author_label
+
+    groups: dict = {}
+    for meta in rows:
+        parts = _DOC_ID_PARTS_RE.match(str(getattr(meta, "doc_id", "") or ""))
+        if not parts:
+            continue
+        key = (parts.group("name").casefold(), parts.group("year"))
+        groups.setdefault(key, []).append((meta, parts.group("name")))
+
+    report = []
+    for (_, year), members in sorted(groups.items()):
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda item: (
+            Path(str(item[0].pdf_path or "")).name.casefold(),
+            str(item[0].content_sha1 or ""),
+        ))
+        name = members[0][1]
+        taken: dict = {}
+        pending = []
+        for meta, _ in members:
+            letter, source = _year_letter_hint(meta, year)
+            if letter and letter not in taken:
+                taken[letter] = (meta, source)
+            else:
+                pending.append((meta, letter))
+        free = [letter for letter in _YEAR_LETTERS if letter not in taken]
+        for meta, wanted in pending:
+            if not free:
+                meta.notes = _join_notes(meta.notes, "same_author_year:no_free_letter")
+                continue
+            letter = free.pop(0)
+            source = "assigned" if not wanted else f"assigned ({wanted} already in use)"
+            taken[letter] = (meta, source)
+        record = {
+            "label": _regex_doc_id_to_author_label(f"{name}_{year}"),
+            "members": [],
+        }
+        for letter in sorted(taken):
+            meta, source = taken[letter]
+            meta.year = f"{year}{letter}"
+            meta.doc_id = f"{name}_{year}{letter}"
+            meta.year_letter_source = source
+            record["members"].append({
+                "doc_id": meta.doc_id,
+                "pdf": meta.pdf_path,
+                "year": meta.year,
+                "letter_source": source,
+            })
+        report.append(record)
+    return report
+
+
+def year_letter_groups(rows: list) -> list:
+    from rrr.render import _regex_doc_id_to_author_label
+
+    groups: dict = {}
+    for meta in rows:
+        if not getattr(meta, "year_letter_source", ""):
+            continue
+        parts = _DOC_ID_PARTS_RE.match(str(meta.doc_id or ""))
+        if not parts or not parts.group("letter"):
+            continue
+        key = (parts.group("name"), parts.group("year"))
+        groups.setdefault(key, []).append(meta)
+    report = []
+    for (name, year), members in sorted(groups.items()):
+        if len(members) < 2:
+            continue
+        report.append({
+            "label": _regex_doc_id_to_author_label(f"{name}_{year}"),
+            "members": [
+                {
+                    "doc_id": meta.doc_id,
+                    "pdf": meta.pdf_path,
+                    "year": meta.year,
+                    "letter_source": meta.year_letter_source,
+                }
+                for meta in sorted(members, key=lambda meta: meta.doc_id)
+            ],
+        })
+    return report
+
+
+def _join_notes(existing: str, addition: str) -> str:
+    return f"{existing}; {addition}" if existing else addition
+
+
 def _fill_from_bib(meta: ExtractedMeta, entry: dict) -> None:
+    meta.bib_key = entry.get("key", "")
     meta.title = entry["title"]
     meta.year = entry["year"]
     meta.venue = entry["venue"]
@@ -577,6 +688,14 @@ def ingest_corpus(corpus_dir: Path,
             print(f"  [{dt:5.1f}s] {pdf.name:44s}  →  doc_id={meta.doc_id!r:34s} "
                   f"src={meta.source} conf={meta.confidence}"
                   + (f"  notes={meta.notes}" if meta.notes else ""))
+    for group in assign_year_letters(results):
+        if progress:
+            members = "; ".join(
+                f"{member['doc_id']} <- {Path(member['pdf']).name} "
+                f"(letter: {member['letter_source']})"
+                for member in group["members"]
+            )
+            print(f"[ingest] same author and year, {group['label']}: {members}")
     if output_csv:
         _write_metadata_csv(results, output_csv)
         if progress:

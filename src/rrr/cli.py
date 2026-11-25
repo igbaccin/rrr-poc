@@ -70,7 +70,7 @@ def ingest_main(argv):
     args = ap.parse_args(argv)
 
     from pathlib import Path
-    from rrr.ingest import ingest_corpus, _write_metadata_csv
+    from rrr.ingest import ingest_corpus, _write_metadata_csv, year_letter_groups
 
     corpus_dir = Path(args.corpus)
     if not corpus_dir.is_dir():
@@ -113,6 +113,7 @@ def ingest_main(argv):
         "n_approved": len(approved),
         "n_pending": len(pending),
         "accept_low_confidence": bool(args.accept_low_confidence),
+        "same_author_year": year_letter_groups(results),
         "rows": [
             {"doc_id": m.doc_id, "pdf": m.pdf_path, "title": m.title,
              "authors": m.authors_short, "year": m.year,
@@ -293,6 +294,12 @@ def prepare_main(argv):
             f"{prepared.workspace_dir}"
         )
         print(f"[RRR] metadata: {prepared.metadata_path}")
+        for group in prepared.same_author_year:
+            members = ", ".join(
+                f"{member['year']} = {Path(member['pdf']).name}"
+                for member in group["members"]
+            )
+            print(f"[RRR] same author and year, {group['label']}: {members}")
 
 
 def _select_topic_runtime(topic):

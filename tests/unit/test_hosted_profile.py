@@ -48,6 +48,27 @@ class HostedProfileTests(unittest.TestCase):
                     expected.read_bytes(), (package / name).read_bytes(), name
                 )
 
+    def test_render_modules_differ_only_in_the_grouped_narrative_branch(self):
+        local = (ROOT / "src" / "rrr" / "render.py").read_text(encoding="utf-8")
+        hosted = (OVERLAY / "render.py").read_text(encoding="utf-8")
+        local_branch = (
+            "            narrative = _GROUPED_NARRATIVE_FIRST_RE.fullmatch(item_raw)\n"
+            "            if narrative and index == 0:\n"
+        )
+        hosted_branch = (
+            "            narrative = (\n"
+            "                _GROUPED_NARRATIVE_FIRST_RE.fullmatch(item_raw)\n"
+            "                if index == 0 else None\n"
+            "            )\n"
+            "            if narrative:\n"
+        )
+        self.assertEqual(1, local.count(local_branch))
+        self.assertEqual(1, hosted.count(hosted_branch))
+        self.assertEqual(
+            local.replace(local_branch, hosted_branch).rstrip("\n"),
+            hosted.rstrip("\n"),
+        )
+
     def test_hosted_version_replaces_the_local_version(self):
         build = _load_build_module()
         pyproject = build.hosted_pyproject("15.19.4")
