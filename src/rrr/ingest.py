@@ -247,82 +247,269 @@ def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
             "author_full": "; ".join(full_names),
             "first_surname": short_names[0] if short_names else "",
             "surnames": list(short_names),
+            "files": _bib_file_names(fields.get("file")),
         })
     return entries
+
+
+def _match_key(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _ascii_fold(value).casefold())
+
+
+def _file_name_key(name) -> str:
+    return unicodedata.normalize("NFC", str(name or "")).casefold().strip()
+
+
+def _bib_file_names(value) -> list:
+    names = []
+    for part in re.split(r"(?<!\\);", str(value or "")):
+        text = part.strip()
+        if not text:
+            continue
+        if "\\\\" in text or "\\:" in text:
+            text = text.replace("\\\\", "/")
+            text = re.sub(r"\\(.)", r"\1", text)
+        else:
+            text = text.replace("\\", "/")
+        last = None
+        for last in re.finditer(r"\.pdf", text, flags=re.IGNORECASE):
+            pass
+        if last is None:
+            continue
+        base = re.split(r"[/:]", text[:last.end()])[-1].strip()
+        if base and base not in names:
+            names.append(base)
+    return names
+
+
+def _year_parts(value) -> tuple:
+    match = re.fullmatch(r"\s*(\d{4})([a-z]?)\s*", str(value or ""))
+    return (match.group(1), match.group(2)) if match else ("", "")
+
+
+def _entry_letter(entry: dict) -> str:
+    year, letter = _year_parts(entry.get("year"))
+    if letter or not year:
+        return letter
+    key = re.search(rf"(?<!\d){year}([a-z])$", str(entry.get("key") or ""))
+    return key.group(1) if key else ""
+
+
+def _match_text(value) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", _ascii_fold(value).lower()))
 
 
 def _fuzzy_title_match(title: str, text: str, threshold: float = 0.9) -> bool:
     if not title or not text:
         return False
-    title_lower = re.sub(r"\s+", " ", title.lower())
-    text_lower = re.sub(r"\s+", " ", text.lower())
-    tokens = re.findall(r"[a-z0-9]{5,}", title_lower)
+    title_words = _match_text(title).split()
+    text_plain = _match_text(text)
+    return _title_words_match(title_words, text_plain, set(text_plain.split()), threshold)
+
+
+def _title_words_match(title_words: list, text_plain: str, text_words: set,
+                       threshold: float) -> bool:
+    tokens = [word for word in title_words if len(word) >= 5]
     if len(tokens) < 3:
         return False
-    hits = sum(1 for t in tokens if re.search(rf"\b{re.escape(t)}\b", text_lower))
+    hits = sum(1 for token in tokens if token in text_words)
     if (hits / len(tokens)) < threshold:
         return False
-    words = re.findall(r"[a-z0-9]+", title_lower)
-    for i in range(len(words) - 3):
-        chunk = " ".join(words[i:i + 4])
-        if chunk in text_lower:
+    padded = f" {text_plain} "
+    for i in range(len(title_words) - 3):
+        if f" {' '.join(title_words[i:i + 4])} " in padded:
             return True
     return False
 
 
-def match_bib_entry(pdf_path: Path, text: str, sidecar: list) -> Optional[dict]:
-    stem = pdf_path.stem
-    stem_lower = stem.lower()
+@dataclass
+class BibMatch:
+    entry: Optional[dict] = None
+    route: str = ""
+    note: str = ""
+    ambiguous: bool = False
 
-    for e in sidecar:
-        if e["key"].lower() == stem_lower:
-            return e
 
-    fn = parse_filename_heuristic(pdf_path)
-    if fn:
-        fn_year = fn["year"]
-        fn_name = fn["name"].lower()
-        fn_name_first = re.sub(r"etal.*|&.*", "", fn_name)
-        candidates = []
-        for e in sidecar:
-            surname = (e.get("first_surname") or "").lower()
-            year = (e.get("year") or "").strip()
-            if not surname or year != fn_year:
-                continue
-            if fn_name_first.startswith(surname) or surname.startswith(fn_name_first):
-                candidates.append(e)
-        if len(candidates) == 1:
-            return candidates[0]
+def _entry_fits_file_name(entry: dict, parsed: dict) -> str:
+    year, _ = _year_parts(entry.get("year"))
+    if not year or year != parsed["year"]:
+        return ""
+    first = _match_key(entry.get("first_surname"))
+    if not first:
+        return ""
+    if _match_key(parsed["whole"]) == first:
+        return "exact"
+    if not parsed["surnames"]:
+        return ""
+    name = _match_key(parsed["surnames"][0])
+    if not name:
+        return ""
+    without_particles = _match_key(" ".join(
+        word for word in str(entry.get("first_surname") or "").split()
+        if word.lower() not in _LATIN_PARTICLES
+    ))
+    if name in (first, without_particles):
+        return "exact"
+    if name.startswith(first) or first.startswith(name):
+        return "loose"
+    return ""
+
+
+def _narrow_by_co_authors(candidates: list, parsed: dict) -> list:
+    wanted = [_match_key(name) for name in parsed["surnames"]]
+
+    def agrees(entry: dict) -> bool:
+        surnames = [_match_key(name) for name in entry.get("surnames") or []]
+        if not surnames:
+            return False
+        if parsed["et_al"]:
+            return len(surnames) >= 3
+        if len(wanted) >= 2:
+            return surnames[1:len(wanted)] == wanted[1:]
+        return len(surnames) == 1
+
+    agreeing = [entry for entry in candidates if agrees(entry)]
+    return agreeing or candidates
+
+
+def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMatch:
+    name_key = _file_name_key(pdf_path.name)
+    text_plain = _match_text(text)
+    text_words = set(text_plain.split())
+    padded = f" {text_plain} "
+
+    listed = [
+        entry for entry in sidecar
+        if any(_file_name_key(name) == name_key for name in entry.get("files") or [])
+    ]
+    if len(listed) == 1:
+        return BibMatch(entry=listed[0], route="file_field")
+    shared_file_note = ""
+    if len(listed) > 1:
+        shared_file_note = (
+            "file field: " + ", ".join(entry["key"] for entry in listed)
+            + " all name this file"
+        )
+
+    stem_key = _file_name_key(pdf_path.stem)
+    for entry in sidecar:
+        if _file_name_key(entry["key"]) == stem_key:
+            return BibMatch(entry=entry, route="key")
+
+    notes = [shared_file_note] if shared_file_note else []
+    parsed = parse_filename_heuristic(pdf_path)
+    if parsed:
+        fits = [(entry, _entry_fits_file_name(entry, parsed)) for entry in sidecar]
+        candidates = [entry for entry, fit in fits if fit == "exact"]
+        if not candidates:
+            candidates = [
+                entry for entry, fit in fits
+                if fit == "loose"
+                and (
+                    f" {_match_text(entry.get('first_surname'))} " in padded
+                    or (parsed["letter"] and _entry_letter(entry) == parsed["letter"])
+                )
+            ]
+        who = parsed["whole"] + (" et al." if parsed["et_al"] else "")
+        when = parsed["year"] + parsed["letter"]
         if len(candidates) > 1:
-            for e in candidates:
-                if _fuzzy_title_match(e["title"], text, threshold=0.85):
-                    return e
-            return candidates[0]
+            candidates = _narrow_by_co_authors(candidates, parsed)
+        if len(candidates) > 1:
+            by_letter = [
+                entry for entry in candidates
+                if parsed["letter"] and _entry_letter(entry) == parsed["letter"]
+            ]
+            if by_letter:
+                candidates = by_letter
+        if len(candidates) > 1:
+            by_title = [
+                entry for entry in candidates
+                if _fuzzy_title_match(entry["title"], text, threshold=0.85)
+            ]
+            if len(by_title) == 1:
+                candidates = by_title
+        if len(candidates) == 1:
+            return BibMatch(entry=candidates[0], route="file_name")
+        if len(candidates) > 1:
+            keys = ", ".join(entry["key"] for entry in candidates)
+            return BibMatch(
+                ambiguous=True,
+                note=(
+                    f"bibliography: {len(candidates)} entries fit the file name "
+                    f"({who}, {when}): {keys}. Add the year letter to the file "
+                    "name or a file field to the entry"
+                ),
+            )
+        notes.append(
+            f"file name read as {who} ({when}), and no bibliography entry has "
+            "that first author and year"
+        )
+    else:
+        notes.append("file name has no author-and-year form")
 
-    text_lower = text.lower()
-    for e in sidecar:
-        surname = (e.get("first_surname") or "").lower()
-        year = (e.get("year") or "").strip()
+    for entry in sidecar:
+        surname = _match_text(entry.get("first_surname"))
+        year, _ = _year_parts(entry.get("year"))
         if not surname or not year:
             continue
-        if surname not in text_lower or year not in text:
+        if f" {surname} " not in padded or year not in text_words:
             continue
-        if _fuzzy_title_match(e["title"], text, threshold=0.9):
-            return e
-    return None
+        if _title_words_match(_match_text(entry["title"]).split(), text_plain,
+                              text_words, 0.9):
+            return BibMatch(entry=entry, route="title")
+    notes.append("no bibliography title found on the first pages")
+    return BibMatch(note="bibliography: " + "; ".join(notes))
+
+
+def match_bib_entry(pdf_path: Path, text: str, sidecar: list) -> Optional[dict]:
+    return match_bib_entry_detailed(pdf_path, text, sidecar).entry
 
 
 _FILENAME_AUTHOR_YEAR_RE = re.compile(
     r"^(?P<name>[A-Za-z][A-Za-z0-9&_.\-]*?)_(?P<year>\d{4})[a-z]?$"
 )
 
+_FILENAME_YEAR = r"(?P<year>1[4-9]\d\d|20\d\d)(?P<letter>[a-z]?)"
+_FILENAME_FORMS = (
+    re.compile(r"^(?P<names>.*?[^\W\d_].*?)\s*[(\[]\s*" + _FILENAME_YEAR + r"\s*[)\]]\s*$"),
+    re.compile(r"^(?P<names>.*?[^\W\d_].*?)[\s_\-,.]+" + _FILENAME_YEAR + r"\s*$"),
+)
+_FILENAME_ET_AL_RE = re.compile(
+    r"(?:(?i:[\s_,]+et[\s_.]*al\.?)|(?<=[a-z])EtAl)\s*$"
+)
+
 
 def parse_filename_heuristic(pdf_path: Path) -> Optional[dict]:
-    stem = pdf_path.stem
-    m = _FILENAME_AUTHOR_YEAR_RE.match(stem)
-    if not m:
+    stem = unicodedata.normalize("NFC", Path(pdf_path).stem).strip()
+    match = None
+    for form in _FILENAME_FORMS:
+        match = form.match(stem)
+        if match:
+            break
+    if not match:
         return None
-    return {"name": m.group("name"), "year": m.group("year")}
+    raw = match.group("names").strip().strip(",;").strip()
+    if not raw:
+        return None
+    legacy = _FILENAME_AUTHOR_YEAR_RE.match(stem)
+    names = raw
+    et_al = bool(_FILENAME_ET_AL_RE.search(names))
+    if et_al:
+        names = _FILENAME_ET_AL_RE.sub("", names).strip().strip(",;").strip()
+    whole = re.sub(r"[_\s]+", " ", names).strip()
+    surnames = [
+        part.strip()
+        for part in re.split(r"\s*&\s*|\s+and\s+|\s*,\s*|\s*\+\s*", whole)
+        if part.strip()
+    ]
+    return {
+        "name": legacy.group("name") if legacy else raw,
+        "year": match.group("year"),
+        "letter": match.group("letter"),
+        "whole": whole,
+        "surnames": surnames,
+        "et_al": et_al,
+    }
 
 
 _LLM_PROMPT = """You are extracting bibliographic metadata from the first pages of an academic paper.
@@ -564,6 +751,36 @@ def _join_notes(existing: str, addition: str) -> str:
     return f"{existing}; {addition}" if existing else addition
 
 
+def hold_repeated_bib_entries(rows: list) -> list:
+    strength = {"file_field": 0, "key": 1, "file_name": 2, "title": 3}
+    by_key: dict = {}
+    for meta in rows:
+        if getattr(meta, "source", "") == "bib_sidecar" and getattr(meta, "bib_key", ""):
+            by_key.setdefault(meta.bib_key, []).append(meta)
+    held = []
+    for key, members in by_key.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda meta: (
+            strength.get(str(meta.notes or "").partition("bib_match:")[2], 9),
+            Path(str(meta.pdf_path or "")).name.casefold(),
+        ))
+        keeper = members[0]
+        for meta in members[1:]:
+            same_file = bool(meta.content_sha1) and meta.content_sha1 == keeper.content_sha1
+            meta.notes = (
+                f"bibliography entry {key} is already matched to "
+                f"{Path(str(keeper.pdf_path)).name}"
+                + ("; this PDF is an identical copy of it" if same_file else
+                   "; remove the second copy, or give this PDF its own entry")
+            )
+            meta.doc_id = ""
+            meta.confidence = "low"
+            meta.source = "bib_repeated"
+            held.append(meta)
+    return held
+
+
 def _fill_from_bib(meta: ExtractedMeta, entry: dict) -> None:
     meta.bib_key = entry.get("key", "")
     meta.title = entry["title"]
@@ -620,28 +837,49 @@ def cascade(pdf_path: Path,
     if len(text.strip()) < 200:
         meta.confidence = "low"
         meta.source = "needs_ocr"
-        meta.notes = f"page_text_only_{len(text.strip())}_chars"
+        meta.notes = (
+            f"page_text_only_{len(text.strip())}_chars; the first pages carry "
+            "too little text to identify the document, so the PDF needs OCR"
+        )
         meta.lang = detect_pdf_language(text)
         return meta
 
     meta.lang = detect_pdf_language(text)
 
+    reasons = []
+
     if sidecar_bib_entries:
-        entry = match_bib_entry(pdf_path, text, sidecar_bib_entries)
-        if entry:
+        match = match_bib_entry_detailed(pdf_path, text, sidecar_bib_entries)
+        if match.entry:
+            entry = match.entry
             _fill_from_bib(meta, entry)
             meta.source = "bib_sidecar"
             meta.confidence = "high"
+            meta.notes = f"bib_match:{match.route}"
             meta.doc_id = generate_doc_id(_bib_surnames_list(entry), entry["year"], existing_doc_ids)
             return meta
+        if match.ambiguous:
+            meta.source = "bib_ambiguous"
+            meta.confidence = "low"
+            meta.notes = match.note
+            return meta
+        reasons.append(match.note)
+    else:
+        reasons.append("no bibliography file was supplied")
 
     fn = parse_filename_heuristic(pdf_path)
     if fn:
         meta.notes = f"filename_hint:{fn['name']}_{fn['year']}"
 
     doi = find_doi(text)
+    if not doi:
+        reasons.append("no DOI on the first pages")
+    elif not use_crossref:
+        reasons.append(f"DOI {doi} found, Crossref lookup switched off")
     if doi and use_crossref:
         cr = crossref_lookup(doi)
+        if not cr:
+            reasons.append(f"DOI {doi} found, Crossref returned no record")
         if cr:
             fields = _crossref_to_fields(cr)
             _fill_from_dict(meta, fields)
@@ -656,8 +894,12 @@ def cascade(pdf_path: Path,
             meta.doc_id = generate_doc_id(_surnames_from_meta(meta), meta.year, existing_doc_ids)
             return meta
 
+    if not use_llm:
+        reasons.append("model extraction not requested")
     if use_llm:
         llm = llm_extract_metadata(text, model=llm_model)
+        if not (llm and (llm.get("authors") or llm.get("year"))):
+            reasons.append("model extraction returned no author or year")
         if llm and (llm.get("authors") or llm.get("year")):
             authors = llm.get("authors") or []
             year = str(llm.get("year") or "").strip()
@@ -715,6 +957,7 @@ def cascade(pdf_path: Path,
 
     meta.confidence = "failed"
     meta.source = "none"
+    meta.notes = _join_notes(meta.notes, "unmatched: " + "; ".join(reasons))
     return meta
 
 
@@ -753,6 +996,9 @@ def ingest_corpus(corpus_dir: Path,
             print(f"  [{dt:5.1f}s] {pdf.name:44s}  →  doc_id={meta.doc_id!r:34s} "
                   f"src={meta.source} conf={meta.confidence}"
                   + (f"  notes={meta.notes}" if meta.notes else ""))
+    for meta in hold_repeated_bib_entries(results):
+        if progress:
+            print(f"[ingest] held for review: {Path(meta.pdf_path).name}: {meta.notes}")
     for group in assign_year_letters(results):
         if progress:
             members = "; ".join(
