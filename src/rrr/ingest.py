@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import codecs
 import csv
 import hashlib
 import json
 import os
 import re
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -168,6 +170,51 @@ def _crossref_to_fields(cr: dict) -> dict:
     }
 
 
+_LATEX_ACCENTS = {
+    "'": "\N{COMBINING ACUTE ACCENT}",
+    "`": "\N{COMBINING GRAVE ACCENT}",
+    '"': "\N{COMBINING DIAERESIS}",
+    "^": "\N{COMBINING CIRCUMFLEX ACCENT}",
+    "~": "\N{COMBINING TILDE}",
+    "c": "\N{COMBINING CEDILLA}",
+    "v": "\N{COMBINING CARON}",
+}
+_LATEX_ACCENT_RE = re.compile(
+    r"\\(?P<command>['`\"^~cv])\s*"
+    r"(?:\{\s*\\?(?P<braced>[A-Za-z\u0131])\s*\}|(?P<bare>[A-Za-z]))"
+)
+
+
+def _bibtex_plain(value) -> str:
+    text = str(value or "")
+    if "\\" in text:
+        try:
+            import latexcodec
+            text = codecs.decode(text, "ulatex")
+        except Exception:
+            pass
+
+        def accent(match: re.Match) -> str:
+            letter = match.group("braced") or match.group("bare")
+            letter = "i" if letter == "\u0131" else letter
+            return unicodedata.normalize(
+                "NFC", letter + _LATEX_ACCENTS[match.group("command")]
+            )
+
+        text = _LATEX_ACCENT_RE.sub(accent, text)
+        text = re.sub(r"\\ss\b", "ß", text)
+        text = re.sub(r"\\([&%$#_])", r"\1", text)
+        text = re.sub(r"\\[A-Za-z]+\s*", "", text)
+        text = text.replace("\\", "")
+    text = text.replace("{", "").replace("}", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _person_surname(person) -> str:
+    parts = list(person.prelast_names) + list(person.last_names)
+    return _bibtex_plain(" ".join(parts))
+
+
 def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
     if not bib_path or not bib_path.is_file():
         return []
@@ -182,16 +229,16 @@ def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
         persons = entry.persons.get("author", []) or []
         short_names, full_names = [], []
         for p in persons:
-            first = " ".join(p.first_names)
-            last = " ".join(p.last_names)
+            first = _bibtex_plain(" ".join(p.first_names))
+            last = _person_surname(p)
             if last:
                 short_names.append(last)
                 full_names.append(f"{last}, {first}" if first else last)
         entries.append({
             "key": key,
-            "title": (fields.get("title") or "").strip("{} "),
+            "title": _bibtex_plain(fields.get("title")),
             "year": (fields.get("year") or "").strip(),
-            "venue": (fields.get("journal") or fields.get("booktitle") or "").strip(),
+            "venue": _bibtex_plain(fields.get("journal") or fields.get("booktitle")),
             "volume": (fields.get("volume") or "").strip(),
             "number": (fields.get("number") or "").strip(),
             "pages": (fields.get("pages") or "").strip(),
@@ -199,6 +246,7 @@ def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
             "authors_short": " & ".join(short_names),
             "author_full": "; ".join(full_names),
             "first_surname": short_names[0] if short_names else "",
+            "surnames": list(short_names),
         })
     return entries
 
@@ -343,12 +391,27 @@ def validate_extraction(authors: list, year: str, text: str) -> tuple:
     return (len(reasons) == 0, reasons)
 
 
-_LATIN_PARTICLES = {"van", "von", "de", "del", "der", "la", "le", "du", "di", "da"}
+from rrr.render import NAME_PARTICLES as _RENDER_PARTICLES
+
+_LATIN_PARTICLES = set(_RENDER_PARTICLES)
+
+_ASCII_SPELLINGS = {
+    "ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ø": "o", "Ø": "O",
+    "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D", "þ": "th",
+    "Þ": "Th", "ı": "i",
+}
+
+
+def _ascii_fold(s: str) -> str:
+    spelled = "".join(_ASCII_SPELLINGS.get(ch, ch) for ch in str(s or ""))
+    decomposed = unicodedata.normalize("NFKD", spelled)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def _clean_surname_token(s: str) -> str:
     if not s:
         return ""
+    s = _ascii_fold(s)
     s = re.sub(r"\bet\s+al\.?", "", s, flags=re.IGNORECASE)
     parts = re.split(r"\s+", s.strip())
     out = []
@@ -530,6 +593,8 @@ def _surnames_from_meta(meta: ExtractedMeta) -> list:
 
 
 def _bib_surnames_list(entry: dict) -> list:
+    if entry.get("surnames"):
+        return list(entry["surnames"])
     return [s.strip() for s in (entry.get("authors_short") or "").split("&") if s.strip()]
 
 
