@@ -400,8 +400,9 @@ def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMat
             return BibMatch(entry=entry, route="key")
 
     notes = [shared_file_note] if shared_file_note else []
-    parsed = parse_filename_heuristic(pdf_path)
-    if parsed:
+    readings = parse_filename_readings(pdf_path)
+    ambiguous = None
+    for parsed in readings:
         fits = [(entry, _entry_fits_file_name(entry, parsed)) for entry in sidecar]
         candidates = [entry for entry, fit in fits if fit == "exact"]
         if not candidates:
@@ -413,8 +414,6 @@ def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMat
                     or (parsed["letter"] and _entry_letter(entry) == parsed["letter"])
                 )
             ]
-        who = parsed["whole"] + (" et al." if parsed["et_al"] else "")
-        when = parsed["year"] + parsed["letter"]
         if len(candidates) > 1:
             candidates = _narrow_by_co_authors(candidates, parsed)
         if len(candidates) > 1:
@@ -433,19 +432,25 @@ def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMat
                 candidates = by_title
         if len(candidates) == 1:
             return BibMatch(entry=candidates[0], route="file_name")
-        if len(candidates) > 1:
+        if len(candidates) > 1 and ambiguous is None:
+            who = parsed["whole"] + (" et al." if parsed["et_al"] else "")
             keys = ", ".join(entry["key"] for entry in candidates)
-            return BibMatch(
+            ambiguous = BibMatch(
                 ambiguous=True,
                 note=(
                     f"bibliography: {len(candidates)} entries fit the file name "
-                    f"({who}, {when}): {keys}. Add the year letter to the file "
-                    "name or a file field to the entry"
+                    f"({who}, {parsed['year']}{parsed['letter']}): {keys}. Add "
+                    "the year letter to the file name or a file field to the entry"
                 ),
             )
+    if ambiguous is not None:
+        return ambiguous
+    if readings:
+        first = readings[0]
+        who = first["whole"] + (" et al." if first["et_al"] else "")
         notes.append(
-            f"file name read as {who} ({when}), and no bibliography entry has "
-            "that first author and year"
+            f"file name read as {who} ({first['year']}{first['letter']}), and no "
+            "bibliography entry has that first author and year"
         )
     else:
         notes.append("file name has no author-and-year form")
@@ -473,46 +478,64 @@ _FILENAME_AUTHOR_YEAR_RE = re.compile(
 )
 
 _FILENAME_YEAR = r"(?P<year>1[4-9]\d\d|20\d\d)(?P<letter>[a-z]?)"
+_FILENAME_DASH = r"\s+[-\u2013\u2014]\s+"
 _FILENAME_FORMS = (
     re.compile(r"^(?P<names>.*?[^\W\d_].*?)\s*[(\[]\s*" + _FILENAME_YEAR + r"\s*[)\]]\s*$"),
+    re.compile(r"^(?P<names>.*?[^\W\d_].*?)" + _FILENAME_DASH + _FILENAME_YEAR
+               + _FILENAME_DASH + r".+$"),
+    re.compile(r"^(?P<names>.*?[^\W\d_].*?)\s*[(\[]\s*" + _FILENAME_YEAR
+               + r"\s*[)\]]\s*[-\u2013\u2014_,.:]?\s*\S.*$"),
     re.compile(r"^(?P<names>.*?[^\W\d_].*?)[\s_\-,.]+" + _FILENAME_YEAR + r"\s*$"),
+    re.compile(r"^(?P<names>[^\W\d_]+(?:[&\-][^\W\d_]+)*)" + _FILENAME_YEAR + r"$"),
+    re.compile(r"^" + _FILENAME_YEAR + r"\s*[-\u2013\u2014_ ]\s*"
+               r"(?P<names>[^\W\d_][^\-\u2013\u2014_]*?)"
+               r"(?:\s*[-\u2013\u2014_]\s*.+)?$"),
 )
 _FILENAME_ET_AL_RE = re.compile(
     r"(?:(?i:[\s_,]+et[\s_.]*al\.?)|(?<=[a-z])EtAl)\s*$"
 )
 
 
-def parse_filename_heuristic(pdf_path: Path) -> Optional[dict]:
+def parse_filename_readings(pdf_path: Path) -> list:
     stem = unicodedata.normalize("NFC", Path(pdf_path).stem).strip()
-    match = None
+    legacy = _FILENAME_AUTHOR_YEAR_RE.match(stem)
+    readings = []
+    seen = set()
     for form in _FILENAME_FORMS:
         match = form.match(stem)
-        if match:
-            break
-    if not match:
-        return None
-    raw = match.group("names").strip().strip(",;").strip()
-    if not raw:
-        return None
-    legacy = _FILENAME_AUTHOR_YEAR_RE.match(stem)
-    names = raw
-    et_al = bool(_FILENAME_ET_AL_RE.search(names))
-    if et_al:
-        names = _FILENAME_ET_AL_RE.sub("", names).strip().strip(",;").strip()
-    whole = re.sub(r"[_\s]+", " ", names).strip()
-    surnames = [
-        part.strip()
-        for part in re.split(r"\s*&\s*|\s+and\s+|\s*,\s*|\s*\+\s*", whole)
-        if part.strip()
-    ]
-    return {
-        "name": legacy.group("name") if legacy else raw,
-        "year": match.group("year"),
-        "letter": match.group("letter"),
-        "whole": whole,
-        "surnames": surnames,
-        "et_al": et_al,
-    }
+        if not match:
+            continue
+        raw = match.group("names").strip().strip(",;").strip()
+        if not raw:
+            continue
+        names = raw
+        et_al = bool(_FILENAME_ET_AL_RE.search(names))
+        if et_al:
+            names = _FILENAME_ET_AL_RE.sub("", names).strip().strip(",;").strip()
+        whole = re.sub(r"[_\s]+", " ", names).strip()
+        surnames = [
+            part.strip()
+            for part in re.split(r"\s*&\s*|\s+and\s+|\s*,\s*|\s*\+\s*", whole)
+            if part.strip()
+        ]
+        key = (whole.casefold(), match.group("year"), match.group("letter"), et_al)
+        if not whole or key in seen:
+            continue
+        seen.add(key)
+        readings.append({
+            "name": legacy.group("name") if legacy else raw,
+            "year": match.group("year"),
+            "letter": match.group("letter"),
+            "whole": whole,
+            "surnames": surnames,
+            "et_al": et_al,
+        })
+    return readings
+
+
+def parse_filename_heuristic(pdf_path: Path) -> Optional[dict]:
+    readings = parse_filename_readings(pdf_path)
+    return readings[0] if readings else None
 
 
 _LLM_PROMPT = """You are extracting bibliographic metadata from the first pages of an academic paper.

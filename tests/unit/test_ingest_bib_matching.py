@@ -15,6 +15,7 @@ from rrr.ingest import (
     match_bib_entry_detailed,
     parse_bib_sidecar,
     parse_filename_heuristic,
+    parse_filename_readings,
 )
 
 
@@ -141,6 +142,40 @@ class FileNameFormTests(unittest.TestCase):
             self.assertEqual(letter, parsed["letter"], stem)
             self.assertEqual(et_al, parsed["et_al"], stem)
 
+    def test_reference_manager_and_other_common_forms(self):
+        cases = {
+            "Moradi - 2012 - Climate, height and economic development": (["Moradi"], "2012", False),
+            "Moradi et al. - 2013 - Heights and Development": (["Moradi"], "2013", True),
+            "Aboagye and Bolt - 2021 - Long-term trends": (["Aboagye", "Bolt"], "2021", False),
+            "Frankema and van Waijenburg – 2012 – Structural impediments": (
+                ["Frankema", "van Waijenburg"], "2012", False),
+            "Plange (1979) Underdevelopment in Northern Ghana": (["Plange"], "1979", False),
+            "World Bank (1995) - Ghana Poverty Past Present and Future": (
+                ["World Bank"], "1995", False),
+            "Smith2019": (["Smith"], "2019", False),
+            "2012 - Moradi - Climate": (["Moradi"], "2012", False),
+            "2012_Moradi_Climate_height": (["Moradi"], "2012", False),
+            "2012 Moradi": (["Moradi"], "2012", False),
+        }
+        for stem, (surnames, year, et_al) in cases.items():
+            parsed = self._read(stem)
+            self.assertIsNotNone(parsed, stem)
+            self.assertEqual((surnames, year, et_al),
+                             (parsed["surnames"], parsed["year"], parsed["et_al"]), stem)
+
+    def test_a_year_inside_the_title_gives_a_second_reading_only(self):
+        readings = parse_filename_readings(
+            Path("Moradi - 2012 - Heights in Ghana 1870-1980.pdf")
+        )
+        self.assertEqual("2012", readings[0]["year"])
+        self.assertEqual(["Moradi"], readings[0]["surnames"])
+        self.assertEqual(["2012", "1980"], [reading["year"] for reading in readings])
+
+    def test_names_that_only_look_like_one_are_not_read(self):
+        for stem in ("Report on Ghana 1957 census", "10.1016_j.eeh.2021.101405",
+                     "1-s2.0-S0014498321000280-main", "chapter 3 (draft)"):
+            self.assertEqual([], parse_filename_readings(Path(stem + ".pdf")), stem)
+
     def test_the_older_convention_keeps_its_name_field(self):
         self.assertEqual("AcemogluEtAl", self._read("AcemogluEtAl_2001")["name"])
         self.assertEqual("North&Weingast", self._read("North&Weingast_1989")["name"])
@@ -195,6 +230,37 @@ class FileNameMatchTests(unittest.TestCase):
             self.assertIsNotNone(match.entry, f"{file_name}: {match.note}")
             self.assertEqual(key, match.entry["key"], file_name)
             self.assertEqual("file_name", match.route, file_name)
+
+    def test_reference_manager_file_names_find_their_entry(self):
+        sidecar = self.SIDECAR + [
+            _entry("MoradiClimate", ["Moradi"], "2012"),
+            _entry("Moradi1980", ["Moradi"], "1980"),
+            _entry("MoradiAustinBaten2013", ["Moradi", "Austin", "Baten"], "2013"),
+        ]
+        expected = {
+            "Moradi - 2012 - Heights in Ghana 1870-1980.pdf": "MoradiClimate",
+            "Moradi et al. - 2013 - Heights and Development in a Cash-Crop Colony.pdf":
+                "MoradiAustinBaten2013",
+            "Aryeetey and Kanbur - 2008 - Ghana's economy at half century.pdf":
+                "AryeeteyKanbur2008",
+            "World Bank (1995) Ghana Poverty Past Present and Future.pdf": "WorldBank1995",
+            "2017 - de Haas - Measuring rural welfare.pdf": "deHaas2017",
+            "2003_Canagarajah and Pörtner_Evolution of poverty.pdf": "CanagarajahPortner2003",
+            "Moradi2012.pdf": "MoradiClimate",
+        }
+        for file_name, key in expected.items():
+            match = _match(file_name, sidecar)
+            self.assertIsNotNone(match.entry, f"{file_name}: {match.note}")
+            self.assertEqual((key, "file_name"), (match.entry["key"], match.route), file_name)
+
+    def test_a_later_reading_is_used_when_the_first_finds_no_entry(self):
+        sidecar = [_entry("Moradi1980", ["Moradi"], "1980")]
+        text = "Alexander Moradi. Heights in Ghana. 1980. " + FILLER
+        match = _match("Moradi - 2012 - Heights in Ghana 1870-1980.pdf", sidecar, text)
+        self.assertEqual("Moradi1980", match.entry["key"])
+        self.assertIsNone(
+            _match("Moradi - 2012 - Heights in Ghana 1870-1980.pdf", sidecar, FILLER).entry
+        )
 
     def test_the_key_route_still_works(self):
         match = _match("worldbank1995.pdf", self.SIDECAR)
