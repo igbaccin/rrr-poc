@@ -14,6 +14,9 @@ from pathlib import Path
 
 BOOTSTRAP_SCHEMA = 2
 
+PIP_TIMEOUT_SECONDS = 30
+PIP_RETRIES = 3
+
 
 def _data_dir() -> Path:
     override = os.environ.get("RRR_DATA_DIR")
@@ -84,10 +87,66 @@ def runtime_starts(python_exe: Path) -> bool:
     return completed.returncode == 0
 
 
+def _say(message: str) -> None:
+    sys.stderr.write(f"[RRR] {message}\n")
+    sys.stderr.flush()
+
+
+def resolve_wheelhouse(explicit: Path | None = None) -> Path | None:
+    raw = str(explicit) if explicit else os.environ.get("RRR_WHEELHOUSE", "").strip()
+    if not raw:
+        return None
+    folder = Path(raw).expanduser().resolve()
+    if not folder.is_dir():
+        raise RuntimeError(f"The wheelhouse folder does not exist: {folder}")
+    return folder
+
+
+def _pip_install(python_exe: Path, arguments: list[str], wheelhouse: Path | None) -> None:
+    command = [str(python_exe), "-m", "pip", "install", "--disable-pip-version-check"]
+    if "PIP_DEFAULT_TIMEOUT" not in os.environ:
+        command += ["--timeout", str(PIP_TIMEOUT_SECONDS)]
+    if "PIP_RETRIES" not in os.environ:
+        command += ["--retries", str(PIP_RETRIES)]
+    if wheelhouse is not None:
+        command += ["--no-index", "--find-links", str(wheelhouse)]
+    command += arguments
+    try:
+        sys.stderr.fileno()
+        streams = {"stdout": sys.stderr, "stderr": sys.stderr}
+    except (AttributeError, OSError, ValueError):
+        streams = {}
+    subprocess.run(command, check=True, **streams, **_quiet_child())
+
+
+def _dependency_failure(exit_code: int, wheelhouse: Path | None, wheel: Path) -> str:
+    if wheelhouse is not None:
+        return (
+            f"pip could not install RRR from the wheelhouse {wheelhouse} "
+            f"(exit code {exit_code}). A package RRR needs is missing from "
+            "that folder, or was downloaded for another Python version or "
+            "another system. Fill the folder on a computer with the same "
+            "Python version and system, with: python -m pip download --dest "
+            f"<folder> \"{wheel}\""
+        )
+    return (
+        f"pip could not download RRR's dependencies (exit code {exit_code}). "
+        "The usual cause is that this computer cannot reach the Python "
+        "package index (pypi.org) at the moment: a managed network may block "
+        "it or let it through only at times. pip's own messages are above. "
+        "What helps: (1) run the same step again in a few minutes; (2) if "
+        "your organisation runs a package mirror, set PIP_INDEX_URL to its "
+        "address; (3) behind a proxy, set HTTPS_PROXY; (4) install with no "
+        "network at all from a folder of wheels, with --wheelhouse <folder> "
+        "or RRR_WHEELHOUSE=<folder>."
+    )
+
+
 def bootstrap(
     plugin_root: Path,
     install_base: Path | None = None,
     install_api: bool = False,
+    wheelhouse: Path | None = None,
 ) -> dict:
     wheel, bundle = _load_bundle(plugin_root)
     version = str(bundle["version"])
@@ -113,35 +172,29 @@ def bootstrap(
             reused = False
 
     if not reused:
+        wheelhouse = resolve_wheelhouse(wheelhouse)
         install_root.mkdir(parents=True, exist_ok=True)
         if not python_exe.is_file():
+            _say(f"creating a private Python environment in {venv_dir}")
             venv.EnvBuilder(with_pip=True).create(venv_dir)
         wheel_spec = str(wheel) + ("[api]" if install_api else "")
-        subprocess.run(
-            [
-                str(python_exe),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--upgrade",
-                wheel_spec,
-            ],
-            check=True,
-        )
-        subprocess.run(
-            [
-                str(python_exe),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--force-reinstall",
-                "--no-deps",
-                str(wheel),
-            ],
-            check=True,
-        )
+        if wheelhouse is not None:
+            _say(f"installing RRR's dependencies from the wheelhouse {wheelhouse} (no network)")
+        else:
+            _say(
+                "downloading and installing RRR's dependencies; the first "
+                "installation fetches a few hundred megabytes and can take "
+                "several minutes on a slow or filtered connection"
+            )
+        try:
+            _pip_install(python_exe, ["--upgrade", wheel_spec], wheelhouse)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                _dependency_failure(exc.returncode, wheelhouse, wheel)
+            ) from exc
+        _say(f"installing the bundled RRR {version} wheel")
+        _pip_install(python_exe, ["--force-reinstall", "--no-deps", str(wheel)], wheelhouse)
+        _say("checking that the runtime starts")
         if not runtime_starts(python_exe):
             raise RuntimeError(
                 "RRR was installed, but its interpreter cannot import it: "
@@ -178,6 +231,15 @@ def main() -> None:
     ap.add_argument("--plugin-root", default=str(Path(__file__).resolve().parents[1]))
     ap.add_argument("--install-base", default=None)
     ap.add_argument("--api", action="store_true", help="Install provider API dependencies")
+    ap.add_argument(
+        "--wheelhouse",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Install from this folder of wheels and use no network "
+            "(pip --no-index --find-links DIR). RRR_WHEELHOUSE does the same."
+        ),
+    )
     ap.add_argument("--json", action="store_true", dest="as_json")
     args = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
@@ -190,10 +252,16 @@ def main() -> None:
             Path(args.plugin_root),
             Path(args.install_base) if args.install_base else None,
             install_api=args.api,
+            wheelhouse=Path(args.wheelhouse) if args.wheelhouse else None,
         )
     except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
         sys.stderr.write(f"[RRR] installation failed: {exc}\n")
         raise SystemExit(2)
+    _say(
+        f"RRR {result['version']} "
+        + ("was already installed" if result["reused"] else "is installed")
+        + ". Run it with: " + " ".join(result["command"])
+    )
     if args.as_json:
         print(json.dumps(result, ensure_ascii=False))
     else:

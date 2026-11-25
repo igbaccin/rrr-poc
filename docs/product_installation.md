@@ -240,4 +240,41 @@ In Claude Code, request the Anthropic API explicitly:
 /rrr t2 <topic>. Use the Anthropic API.
 ```
 
+## What the first installation prints
+
+The installer reports each step on the error stream: the private Python
+environment it creates, the download of the dependencies, the bundled RRR
+wheel, and a final check that the runtime starts. pip's own download lines
+appear in between. The result of `--json` stays alone on standard output.
+
+A first installation downloads a few hundred megabytes. pip waits 30 seconds on
+a silent connection and makes three further attempts before it gives up.
+`PIP_DEFAULT_TIMEOUT` and `PIP_RETRIES` change those two values.
+
+## Installing without access to the package index
+
+Some networks block the Python package index (pypi.org) or let it through only
+at times. The installer then stops with a message that lists the remedies. Try
+again a few minutes later, set `PIP_INDEX_URL` to a package mirror your
+organisation runs, or set `HTTPS_PROXY` when a proxy stands in between.
+
+RRR can also be installed with no network at all, from a folder of wheels. Fill
+that folder once on a computer that reaches the index and runs the same Python
+version and the same system as the target:
+
+```bash
+python -m pip download --dest wheelhouse "PATH_TO/runtime/rrr_poc-15.19.3-py3-none-any.whl"
+```
+
+The command downloads RRR's dependencies beside the bundled wheel. Copy the
+folder to the target computer and name it when installing:
+
+```bash
+python scripts/bootstrap_rrr.py --wheelhouse PATH_TO/wheelhouse --json
+```
+
+Setting `RRR_WHEELHOUSE` to the folder has the same effect, which suits a host
+that runs the installer on the user's behalf. Add `[api]` to the wheel path in
+the download command when the provider API mode will be used.
+
 The [before-running guide](before_running.md) applies to every runtime mode.
