@@ -119,6 +119,13 @@ Ollama and an Anthropic API key are unnecessary.
 - Internet access during the first installation
 - PDFs containing usable text or OCR
 
+RRR starts Claude Code as a command-line program. The `claude` command has to
+be installed and signed in with `claude auth login`. The Claude desktop
+application alone is not enough, because the copy of Claude Code it carries is
+signed in only while the application itself runs it.
+`rrr host-doctor --host claude` reports whether RRR can use the sign-in, and
+costs no model call.
+
 ### Ask Claude Code to install RRR
 
 Paste this message into Claude Code:

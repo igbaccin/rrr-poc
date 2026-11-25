@@ -70,8 +70,11 @@ Honor an explicit runtime request. `local` or `ollama` selects local mode.
   allowance. Set `RRR_RUNTIME=host` and `RRR_HOST=claude`. Clear
   `RRR_API_PROVIDER` and `RRR_API_MODEL`. Run
   `rrr host-doctor --host claude`; it requires Claude Code 2.1.169 or newer and
-  a Claude.ai Pro, Max, Team, or Enterprise subscription. Use `--smoke` when an
-  end-to-end host diagnostic is needed. A run inherits the model and the
+  a Claude.ai Pro, Max, Team, or Enterprise subscription. RRR starts the
+  `claude` command-line program, which has to be installed and signed in with
+  `claude auth login`; the Claude desktop application alone does not provide
+  it. When the check fails for that reason, tell the user so. Use `--smoke`
+  when an end-to-end host diagnostic is needed. A run inherits the model and the
   effort the user has selected in Claude Code: those of the session that
   starts RRR, then `ANTHROPIC_MODEL` and `CLAUDE_CODE_EFFORT_LEVEL`, then the
   user settings. `claude-opus-5-5` at its default effort runs only when RRR
