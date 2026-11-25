@@ -284,6 +284,23 @@ def _timeout_seconds() -> float:
     return max(30.0, value)
 
 
+def _codex_app_executables(local_app_data: Optional[str] = None) -> List[str]:
+    base = (
+        local_app_data if local_app_data is not None
+        else os.environ.get("LOCALAPPDATA", "")
+    ).strip()
+    if not base:
+        return []
+    found = []
+    try:
+        for path in (Path(base) / "OpenAI" / "Codex" / "bin").glob("*/codex.exe"):
+            if path.is_file():
+                found.append((path.stat().st_mtime, str(path)))
+    except OSError:
+        return []
+    return [path for _, path in sorted(found, reverse=True)]
+
+
 def _command_candidates(host: str) -> List[str]:
     override = os.environ.get("RRR_HOST_COMMAND", "").strip()
     if override:
@@ -301,6 +318,7 @@ def _command_candidates(host: str) -> List[str]:
                 / "codex.exe"
             ),
         ])
+        candidates.extend(_codex_app_executables()[:1])
 
     resolved = shutil.which(host)
     if resolved:
