@@ -39,6 +39,7 @@ class ExtractedMeta:
     confidence: str = "low"
     source: str = "none"
     notes: str = ""
+    display_label: str = ""
     bib_key: str = ""
     year_letter_source: str = ""
 

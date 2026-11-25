@@ -89,14 +89,49 @@ def ingest_main(argv):
         use_openalex=not args.no_openalex,
     )
 
+    from rrr.render import check_citation_labels
+
+    label_check = check_citation_labels([
+        {
+            "doc_id": m.doc_id,
+            "year": m.year,
+            "display_label": getattr(m, "display_label", ""),
+            "first_author_surname": m.first_author_surname,
+        }
+        for m in results if m.doc_id
+    ])
+    unreadable = set()
+    for problem in label_check["problems"]:
+        ids = ", ".join(problem["doc_ids"])
+        if problem["problem"] == "unreadable_label":
+            unreadable.update(problem["doc_ids"])
+            sys.stderr.write(
+                f"[ingest] citation label cannot be read back: {problem['label']} "
+                f"({ids}). {problem['remedy']}\n"
+            )
+        else:
+            sys.stderr.write(
+                f"[ingest] warning: {len(problem['doc_ids'])} documents share the "
+                f"citation label {problem['label']} ({ids}). {problem['remedy']}\n"
+            )
+    for m in results:
+        if m.doc_id in unreadable:
+            note = "citation label cannot be read back; set display_label for this row"
+            m.notes = f"{m.notes}; {note}" if m.notes else note
+
     def _needs_review(m):
+        if m.doc_id in unreadable:
+            return True
         if m.confidence in ("low", "failed"):
             return True
         return m.source == "llm_extraction"
 
     approved = [m for m in results if not _needs_review(m)]
     pending = [m for m in results if _needs_review(m)]
-    unusable = [m for m in results if not m.doc_id or not m.pdf_path]
+    unusable = [
+        m for m in results
+        if not m.doc_id or not m.pdf_path or m.doc_id in unreadable
+    ]
 
     def _row_status(m):
         if m in unusable:
@@ -114,6 +149,7 @@ def ingest_main(argv):
         "n_pending": len(pending),
         "accept_low_confidence": bool(args.accept_low_confidence),
         "same_author_year": year_letter_groups(results),
+        "label_check": label_check,
         "rows": [
             {"doc_id": m.doc_id, "pdf": m.pdf_path, "title": m.title,
              "authors": m.authors_short, "year": m.year,
@@ -300,6 +336,8 @@ def prepare_main(argv):
                 for member in group["members"]
             )
             print(f"[RRR] same author and year, {group['label']}: {members}")
+        for warning in prepared.warnings:
+            sys.stderr.write(f"[RRR] warning: {warning['message']}\n")
 
 
 def _select_topic_runtime(topic):

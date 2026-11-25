@@ -25,6 +25,7 @@ class PreparedWorkspace:
     reused: bool
     pdf_count: int
     same_author_year: tuple = ()
+    warnings: tuple = ()
 
     def as_dict(self) -> dict:
         return {
@@ -34,6 +35,7 @@ class PreparedWorkspace:
             "reused": self.reused,
             "pdf_count": self.pdf_count,
             "same_author_year": list(self.same_author_year),
+            "warnings": list(self.warnings),
         }
 
 
@@ -154,6 +156,35 @@ def _same_author_year(workspace_dir: Path) -> tuple:
     return tuple(group for group in groups if isinstance(group, dict))
 
 
+def _warnings(workspace_dir: Path) -> tuple:
+    report = _ingest_report(workspace_dir)
+    warnings = []
+    for problem in (report.get("label_check") or {}).get("problems") or []:
+        if not isinstance(problem, dict):
+            continue
+        doc_ids = [str(doc_id) for doc_id in problem.get("doc_ids") or []]
+        label = str(problem.get("label") or "")
+        if problem.get("problem") == "shared_label":
+            message = (
+                f"{len(doc_ids)} documents share the citation label {label} "
+                f"({', '.join(doc_ids)}). {problem.get('remedy', '')}"
+            )
+            kind = "shared_citation_label"
+        else:
+            message = (
+                f"The citation label {label} ({', '.join(doc_ids)}) cannot be "
+                f"read back. {problem.get('remedy', '')}"
+            )
+            kind = "unreadable_citation_label"
+        warnings.append({
+            "type": kind,
+            "label": label,
+            "doc_ids": doc_ids,
+            "message": message.strip(),
+        })
+    return tuple(warnings)
+
+
 def _run(command: list[str], env: dict[str, str], quiet: bool = False) -> None:
     completed = subprocess.run(
         command,
@@ -200,6 +231,7 @@ def prepare_workspace(
             reused=True,
             pdf_count=len(pdfs),
             same_author_year=_same_author_year(workspace_dir),
+            warnings=_warnings(workspace_dir),
         )
 
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -252,4 +284,5 @@ def prepare_workspace(
         reused=False,
         pdf_count=len(pdfs),
         same_author_year=_same_author_year(workspace_dir),
+        warnings=_warnings(workspace_dir),
     )

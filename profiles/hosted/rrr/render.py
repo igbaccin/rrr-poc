@@ -400,6 +400,67 @@ def citation_inside(citation, allowed_docs, allowed_pairs=None):
     return None
 
 
+def check_citation_labels(rows) -> dict:
+    global _METADATA_LABEL_LOOKUP, _RENDERED_CITATIONS
+    saved = (_METADATA_LABEL_LOOKUP, _RENDERED_CITATIONS)
+    problems = []
+    try:
+        set_metadata_labels(rows)
+        doc_ids = list(_METADATA_LABEL_LOOKUP)
+        lookup = _build_display_lookup(doc_ids)
+        by_label = {}
+        for doc_id in doc_ids:
+            label = _METADATA_LABEL_LOOKUP[doc_id]["display_label"]
+            by_label.setdefault(" ".join(label.lower().split()), []).append(doc_id)
+        for group in by_label.values():
+            if len(group) > 1:
+                label = _METADATA_LABEL_LOOKUP[group[0]]["display_label"]
+                problems.append({
+                    "problem": "shared_label",
+                    "label": label,
+                    "doc_ids": sorted(group),
+                    "remedy": (
+                        "Give each work its own year letter (1979a, 1979b) in "
+                        "the bibliography year or in the file name, then "
+                        "prepare the collection again."
+                    ),
+                })
+        for doc_id in doc_ids:
+            label = _METADATA_LABEL_LOOKUP[doc_id]["display_label"]
+            parts = _LABEL_YEAR_RE.match(label)
+            readable = bool(parts)
+            if parts:
+                name, year = parts.group(1).strip(), parts.group(2)
+                for text in (
+                    f"As {name} ({year}, p.3) shows, this holds.",
+                    f"This holds ({name} {year}, p.3).",
+                    f"This holds (Zzyzx 1900, p.1; {name} {year}, p.3).",
+                ):
+                    found = [
+                        citation for citation in parse_citations(text, display_lookup=lookup)
+                        if citation.get("label") != "Zzyzx"
+                    ]
+                    if len(found) != 1 or doc_id not in (
+                        tuple(found[0].get("candidates") or ()) or (found[0].get("doc_id"),)
+                    ):
+                        readable = False
+                        break
+            if not readable:
+                problems.append({
+                    "problem": "unreadable_label",
+                    "label": label,
+                    "doc_ids": [doc_id],
+                    "remedy": (
+                        "Set display_label for this row of metadata.csv to "
+                        "the form Surname (Year), A and B (Year) or "
+                        "A et al. (Year), then prepare the collection again."
+                    ),
+                })
+        return {"checked": len(doc_ids), "problems": problems}
+    finally:
+        _METADATA_LABEL_LOOKUP, _RENDERED_CITATIONS = saved
+
+
 def parse_citations(text: str, display_lookup: dict = None):
     source = text or ""
     hits = []
