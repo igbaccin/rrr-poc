@@ -1,4 +1,3 @@
-"""The quotation verifier scans curly quotation marks and spares coverage quotations (vlm.2.5)."""
 import tempfile
 import unittest
 from pathlib import Path

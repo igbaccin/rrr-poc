@@ -8,22 +8,9 @@ def ensure_dir(path):
 
 
 def extract_first_json(raw: str):
-    """v15.13: robustly extract the first complete JSON object/array from a
-    model response, tolerating preamble, trailing prose, and markdown fences.
-
-    The old pattern — json.loads(raw[raw.find("{"):raw.rfind("}")+1]) — spans
-    the first '{' to the LAST '}', which breaks whenever a model emits prose
-    containing braces after the object (verbose models like qwen3:30b-a3b,
-    or a frontier API model that appends an explanation). This scans for the
-    first '{' or '[' and bracket-matches to its true close, respecting string
-    literals and escapes, then json.loads that slice.
-
-    Returns the parsed object, or None if no complete JSON value is found.
-    """
     if not raw:
         return None
     text = raw.strip()
-    # Strip a leading ```json / ``` fence if present (frontier-model habit).
     if text.startswith("```"):
         nl = text.find("\n")
         if nl != -1:
@@ -58,7 +45,7 @@ def extract_first_json(raw: str):
                     try:
                         return json.loads(candidate)
                     except Exception:
-                        break  # first object malformed; don't try to be clever
+                        break
     return None
 
 
@@ -71,10 +58,6 @@ def sha256_file(path):
 
 
 def save_json(obj, path):
-    # v15.14: atomic write (tmp + os.replace). Run artifacts (ledger,
-    # manifest, metrics, per-doc summaries) were written in place; a crash
-    # mid-write left a truncated JSON that a replay/downstream reader then
-    # failed to parse. os.replace is atomic on both POSIX and Windows.
     path = str(path)
     ensure_dir(os.path.dirname(path))
     tmp = path + ".tmp"
@@ -84,9 +67,6 @@ def save_json(obj, path):
 
 
 def env_int(name: str, default: int) -> int:
-    """v15.14: guarded int(os.environ...) parse. A malformed value used to
-    raise ValueError deep inside the pipeline (or at module import time for
-    writer knobs); now it warns and falls back to the default."""
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
         return default

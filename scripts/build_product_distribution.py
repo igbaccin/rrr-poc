@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Build the public local-reference RRR wheel.
-
-The hosted-agent plugin is a separate tested release. A local build leaves its
-runtime untouched unless the caller explicitly requests synchronization.
-"""
 from __future__ import annotations
 
 import argparse

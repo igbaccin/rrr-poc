@@ -1,42 +1,3 @@
-"""v15: corpus-level outline builder.
-
-Replaces v14.4's per-paper fused stance call with a three-stage corpus-level
-pipeline:
-
-  Stage 1 (CLUSTER): one LLM call over all admitted papers' claims. Returns
-    `topic_shape` + clusters (papers grouped by what they argue, before any
-    relation-to-topic judgement) + unassigned papers.
-
-  Stage 2 (POSTURE): one LLM call per cluster. Returns the cluster's
-    structural relation to the topic (from a per-shape enum), a free-text
-    elaboration the writer uses verbatim, plus a `reasoning_trace` that
-    forces the model to ground the relation tag in an explicit quote from
-    the cluster's claims. No `supports`/`critiques`/`complicates` vocabulary
-    survives into the writer's prose.
-
-  Stage 3 (ORDER): one LLM call over the N cluster summaries to pick
-    section order. Rule-based when there are <=2 clusters.
-
-Topic shapes (3) and their relation enums:
-
-  causal       — topic asserts X causes Y.
-                 relations: same_as_topic_cause, upstream_of_topic_cause,
-                 downstream_of_topic_cause, rival_to_topic_cause,
-                 scope_condition, adjacent
-  comparative  — topic asserts A differs from / is better than B.
-                 relations: endorses_topic, reverses_topic, qualifies_topic,
-                 methodological_critique, adjacent
-  descriptive  — topic asserts X has property/pattern P.
-                 relations: confirms_description, contradicts_description,
-                 adds_nuance, adjacent
-
-The 6-value causal enum is the load-bearing fix for the v14.4 failure
-(AJR/Nunn upstream causes were rounded to `critiques`). Per-shape rubrics
-keep the prompt topic-agnostic — same code works for gender-wage-gap,
-monetary-policy, sociology-of-religion topics by simply landing in a
-different shape.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -56,22 +17,6 @@ _MODEL = os.environ.get(
 )
 _KEEP_ALIVE = "30m"
 
-# Bump on prompt changes to invalidate downstream caches.
-# v15.0.1: cluster prompt rewritten to encourage INCLUSIVE clustering.
-# v15.1.0: shape detection + corpus-fit refusal moved OUT of Stage 1 into
-#   a new Stage 0 (precheck). Stage 1 now consumes topic_shape as input
-#   rather than re-detecting it, freeing it to specialise the clustering
-#   prompt by shape AND removing the v15.0.2 failure modes:
-#     - descriptive topics were misdetected as causal 3/3 (the menu was
-#       inside the cluster prompt, where it lost attention)
-#     - off-topic corpora wrote 1.4k-word hallucinated reviews because
-#       inclusive-clustering force-fit everything into clusters and
-#       unassigned_share never reached the refusal threshold
-# v15.14: bumped — (a) the v15.12 _language_prefix rewrite changed prompt
-# bytes without a version bump, so v15.11-keyed caches could serve stale
-# postures; (b) the signatures below now cover ALL prompt-shaping inputs
-# (corpus lang, topic_cause/outcome, shared_thread/cause, evidence), which
-# changes key layout.
 _PRECHECK_PROMPT_VERSION = "2026-07-02-v15.14-precheck"
 _CLUSTER_PROMPT_VERSION = "2026-07-02-v15.14-cluster"
 _POSTURE_PROMPT_VERSION = "2026-07-02-v15.14-posture"
@@ -79,17 +24,9 @@ _ORDER_PROMPT_VERSION = "2026-07-02-v15.14-order"
 
 
 def _lang_sig() -> bytes:
-    """v15.14: corpus language participates in every stage prompt via
-    _language_prefix(), so it must participate in every cache key too —
-    otherwise switching RRR_CORPUS_LANG replays caches built under a
-    different prompt."""
     return (os.environ.get("RRR_CORPUS_LANG", "en") or "en").encode("utf-8")
 
-# v15.1.0: Stage 0 (precheck) sees only the topic + paper titles, so
-# context can be small. Cheap call.
 _OPTIONS_PRECHECK = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 400}
-# Ample num_predict on Stage 1 because the JSON may contain ~50 doc_ids
-# distributed across 3-6 clusters.
 _OPTIONS_CLUSTER = {"temperature": 0.0, "num_ctx": 12288, "num_predict": 1800}
 _OPTIONS_POSTURE = {"temperature": 0.0, "num_ctx": 8192, "num_predict": 600}
 _OPTIONS_ORDER = {"temperature": 0.0, "num_ctx": 4096, "num_predict": 300}
@@ -122,11 +59,6 @@ _RELATIONS_BY_SHAPE: Dict[str, set] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Cache plumbing — one cache directory per stage. Cache files live under
-# runs/cache/outline/<stage>/<sig>.json. Keys are stable hashes; a prompt
-# version bump invalidates lookups without disk cleanup.
-
 def _sig_cluster(topic: str, doc_claims: List[Dict[str, str]],
                  topic_shape: str = "", topic_outcome: str = "") -> str:
     h = hashlib.sha256()
@@ -137,14 +69,10 @@ def _sig_cluster(topic: str, doc_claims: List[Dict[str, str]],
     h.update(_lang_sig())
     h.update(b"\x00")
     h.update((topic or "").encode("utf-8"))
-    # v15.14: shape + outcome condition the cluster prompt (pin lines) and
-    # were missing from the key — a re-run with a re-pinned Stage 0 silently
-    # replayed the old clustering.
     h.update(b"\x04")
     h.update((topic_shape or "").encode("utf-8"))
     h.update(b"\x05")
     h.update((topic_outcome or "").encode("utf-8"))
-    # Order-independent over docs: sort by doc_id.
     for entry in sorted(doc_claims, key=lambda d: d.get("doc_id", "")):
         h.update(b"\x01")
         h.update(str(entry.get("doc_id", "")).encode("utf-8"))
@@ -168,10 +96,6 @@ def _sig_posture(topic: str, topic_shape: str, cluster_doc_ids: List[str],
     h.update((topic or "").encode("utf-8"))
     h.update(b"\x01")
     h.update((topic_shape or "").encode())
-    # v15.14: everything else the posture prompt renders now participates in
-    # the key. Previously a re-run where Stage 0 pinned different
-    # cause/outcome slots, or where evidence extraction changed, silently
-    # reused the old posture.
     h.update(b"\x04")
     h.update((topic_cause or "").encode("utf-8"))
     h.update(b"\x05")
@@ -210,21 +134,18 @@ def _sig_order(topic: str, cluster_summaries: List[Dict[str, str]]) -> str:
         h.update((cs.get("relation") or "").encode())
         h.update(b"\x03")
         h.update((cs.get("elaboration") or "").encode("utf-8"))
-        # v15.14: shared_thread is rendered into the order prompt.
         h.update(b"\x04")
         h.update((cs.get("shared_thread") or "").encode("utf-8"))
     return h.hexdigest()[:16]
 
 
 def _cache_path(stage: str, sig: str) -> str:
-    # v15.16: workspace-level (was runs_path("cache", ...) — per-run under
-    # the v15.9 minted-run-id layout, so nothing was ever reused).
     return str(stage_cache_path("outline", stage, f"{sig}.json"))
 
 
 def _load_cache(stage: str, sig: str):
     if not stage_cache_enabled():
-        return None  # RRR_STAGE_CACHE=0: cold-run measurement mode
+        return None
     try:
         with open(_cache_path(stage, sig), encoding="utf-8") as f:
             return json.load(f)
@@ -233,8 +154,6 @@ def _load_cache(stage: str, sig: str):
 
 
 def _save_cache(stage: str, sig: str, obj) -> None:
-    # v15.14: atomic — a crash mid-write left a truncated cache entry
-    # (self-healing on load, but pointlessly re-paying the LLM call).
     ensure_dir(str(stage_cache_path("outline", stage)))
     path = _cache_path(stage, sig)
     tmp = path + ".tmp"
@@ -242,13 +161,6 @@ def _save_cache(stage: str, sig: str, obj) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
-
-# ---------------------------------------------------------------------------
-# Stage 0 — PRECHECK (corpus-fit refusal + topic shape detection)
-#
-# v15.1.0: pulled out of Stage 1 where it was a side-feature buried under
-# clustering and routinely failed (descriptive 0/3, refusal 0/3 on the
-# v15.0.2 smoke). Now its own focused call.
 
 def _sig_precheck(topic: str, doc_titles: List[str]) -> str:
     h = hashlib.sha256()
@@ -266,17 +178,6 @@ def _sig_precheck(topic: str, doc_titles: List[str]) -> str:
 
 
 def _language_prefix() -> str:
-    """v15.12: internal outline stages (precheck, cluster, posture, order)
-    run in the CORPUS/pivot language, not the topic language. This is the
-    key fix for the v15.11 mixed-language bug: applying the topic-language
-    directive to format=json stages made mistral emit half-English/half-
-    French JSON values that then leaked into the writer. Internal reasoning
-    now stays in the corpus language (where the model + evidence are
-    strongest and JSON compliance is reliable); only the writer translates
-    to the topic language for the user-facing review.
-
-    Empty for an English corpus (byte-identical to pre-v15.11 prompts).
-    """
     from rrr.language import language_directive
     directive = language_directive(os.environ.get("RRR_CORPUS_LANG", "en"))
     return f"{directive}\n\n" if directive else ""
@@ -285,12 +186,6 @@ def _language_prefix() -> str:
 def _build_precheck_prompt(topic: str, doc_titles: List[str]) -> str:
     _lang_pfx = _language_prefix()
     titles_block = "\n".join(f"  - {t}" for t in doc_titles)
-    # NOTE on examples: every illustrative example below is drawn from a
-    # domain DELIBERATELY unrelated to any topic this pipeline is
-    # commonly tested on. The point of the examples is to demonstrate the
-    # SHAPE PATTERN, not the subject matter. Adding examples whose subject
-    # overlaps the user's actual topic would nudge the model's classification
-    # in a non-agnostic way. Keep new examples cross-domain.
     return (
         _lang_pfx +
         "You are doing a PRE-FLIGHT check for a literature-review generator. "
@@ -409,10 +304,6 @@ def _validate_precheck(obj) -> Optional[dict]:
     fit = str(obj.get("corpus_fit", "")).strip().upper()
     if fit not in ("PROCEED", "REFUSE"):
         return None
-    # v15.2.0: causal topics MUST emit non-empty topic_cause + topic_outcome
-    # (the pinned explanans/explanandum that Stage 1 outcome-anchors on and
-    # Stage 2 pins as fixed reference points). Comparative/descriptive shapes
-    # leave them empty until v15.3.0 extends per-shape slot extraction.
     topic_cause = str(obj.get("topic_cause", "") or "").strip()[:120]
     topic_outcome = str(obj.get("topic_outcome", "") or "").strip()[:120]
     if shape == "causal" and fit == "PROCEED":
@@ -429,21 +320,12 @@ def _validate_precheck(obj) -> Optional[dict]:
 
 
 def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[dict]:
-    """Stage 0. One cheap LLM call over topic + paper titles. Returns
-    {topic_shape, corpus_fit, ...} or None on failure.
-
-    Decoupling shape detection and refusal from clustering avoids two
-    failure modes seen in the v15.0.2 smoke:
-      * shape detection burying inside Stage 1 -> 0/3 descriptive detected
-      * inclusive-clustering Stage 1 -> unassigned_share=0, refusal dead
-    """
     titles = []
     for d in doc_summaries:
         did = (d.get("doc_id") or "").strip()
         if not did:
             continue
         cite = (d.get("citation") or did).strip()
-        # Drop trailing whitespace/newlines and clip to keep prompt tight.
         cite = " ".join(cite.split())[:240]
         titles.append(cite)
     if not titles:
@@ -494,20 +376,9 @@ def precheck(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[di
     return result
 
 
-# ---------------------------------------------------------------------------
-# Stage 1 — CLUSTER
-
 def _build_cluster_prompt(topic: str, doc_claims: List[Dict[str, str]],
                           topic_shape: str = "causal",
                           topic_outcome: str = "") -> str:
-    # v15.5: prompt stripped to a single qualitative principle. The
-    # earlier versions accumulated quantitative pressures (3-6 cluster
-    # target, 0-15% unassigned ceiling, "specific enough" thread rules,
-    # "moderately broad" countervailing guidance) that conflicted and
-    # forced the model to either over-split (v15.3.0 -> 12 narrow
-    # clusters) or over-reject (v15.2.0 -> 0.5 unassigned share). The
-    # new prompt asks the model to identify the streams of literature it
-    # sees, and stops dictating count, coverage, or specificity.
     has_outcome = bool(topic_outcome) and topic_shape == "causal"
     outcome_line = (
         f"TOPIC OUTCOME: {topic_outcome}"
@@ -595,10 +466,6 @@ def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optiona
                 "cluster_id": cid,
                 "doc_ids": doc_ids,
                 "shared_thread": thread,
-                # v15.2.0: shared_cause is the cluster's distinctive
-                # explanatory variable for causal topics; empty for other
-                # shapes. Stage 2 uses this to pin the cluster's cause when
-                # judging its relation to topic_cause.
                 "shared_cause": cause,
             })
 
@@ -612,8 +479,6 @@ def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optiona
             unassigned.append(s)
             seen.add(s)
 
-    # Any doc_id that the model dropped (neither clustered nor unassigned) is
-    # added to unassigned so the partition is total.
     leftover = sorted(valid_doc_ids - seen)
     unassigned.extend(leftover)
 
@@ -631,13 +496,6 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
                    topic_shape: str = "causal",
                    topic_outcome: str = "",
                    metrics=None) -> Optional[dict]:
-    """Stage 1. One LLM call. Returns ClusterPlan dict or None on failure.
-
-    Input: doc_summaries with at least {doc_id, claim} per entry. Other
-    fields are ignored. claims-only input keeps the prompt short so the
-    model's attention is on the grouping decision, not on evidence weighing
-    (which comes in Stage 2).
-    """
     doc_claims = [
         {"doc_id": d.get("doc_id", ""), "claim": (d.get("claim") or "").strip()}
         for d in doc_summaries
@@ -683,7 +541,6 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
 
     plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids, topic_shape))
     if plan is None:
-        # One retry with an explicit reminder about the JSON contract.
         retry_prompt = prompt + "\n\nReminder: return ONLY the JSON object with the three keys topic_shape, clusters, unassigned_doc_ids."
         try:
             import ollama
@@ -719,41 +576,8 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
     return plan
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 — POSTURE (per cluster)
-
-
 def _scaffold_for_shape(topic_shape: str) -> str:
     if topic_shape == "causal":
-        # v15.2.0: scaffold rebuilt to anchor on the EXPLANANDUM (the shared
-        # outcome both causes purport to explain) and to put the rival test
-        # FIRST. The v15.0.x scaffold gave upstream a positive mechanical
-        # test ("flows INTO") but only a negative description for rival
-        # ("REPLACES and does NOT operate through"), and added an asymmetric
-        # "Key trap" warning that pushed every cluster away from rival. The
-        # v15.0.2 GD smoke confirmed that bias: North_1989 was upstream 9/9
-        # on a topic where it is the canonical rival, and AJR_2002 collapsed
-        # to upstream in 3/9 runs. Rival is now Test R, applied first.
-        # v15.2.1: scaffold reordered to make TEST U reachable. v15.2.0 put
-        # TEST R first AND demanded TEST U cite cluster_cause_quote /
-        # cluster_outcome_quote fields that the output schema never asked
-        # for. Net effect: TEST U was mechanically unreachable, every
-        # cluster fell through to TEST R, and clusters whose own
-        # shared_cause string named the topic cause as a downstream noun
-        # ("...led to extractive institutions" where topic_cause is
-        # "institutions") were mislabelled rival. v15.2.1 fix:
-        #   - The two quote fields are now REQUIRED output keys (enforced
-        #     by _build_posture_prompt + _validate_posture).
-        #   - New TEST C-THROUGH fires FIRST and asks "does the cluster's
-        #     own cause quote name the topic cause as a downstream noun?"
-        #     If yes, we are in the upstream/same-as zone and TEST R is
-        #     off the table.
-        #   - TEST R is preserved but only fires after TEST C-THROUGH /
-        #     TEST S / TEST U have all failed — keeps the AJR-on-GD win
-        #     intact (AJR's GD cluster names "institutions" as the
-        #     conduit, not "Europe unique factor endowments", so
-        #     TEST C-THROUGH does not fire and the cluster falls through
-        #     to rival correctly).
         return (
             "Before choosing `relation`, populate the two QUOTE fields and "
             "then walk the tests IN ORDER. Take the FIRST test whose "
@@ -831,7 +655,6 @@ def _scaffold_for_shape(topic_shape: str) -> str:
             "directly endorsing or reversing — `methodological_critique`; "
             "(E) about something else — `adjacent`."
         )
-    # descriptive
     return (
         "Before choosing `relation`, write `reasoning_trace` answering these "
         "THREE questions in order:\n"
@@ -856,10 +679,6 @@ def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
                           cluster_evidence: Dict[str, List[str]],
                           topic_cause: str = "",
                           topic_outcome: str = "") -> str:
-    # v15.2.0: pin TOPIC CAUSE and TOPIC OUTCOME at the prompt header for
-    # causal topics. These are the explanans/explanandum extracted in
-    # Stage 0 — every cluster's relation judgment must anchor on these
-    # fixed strings, not re-derive them.
     pin_lines = []
     if topic_shape == "causal" and topic_cause:
         pin_lines.append(f"TOPIC CAUSE (explanans, pinned): {topic_cause}")
@@ -892,12 +711,6 @@ def _build_posture_prompt(topic: str, topic_shape: str, cluster: dict,
         _scaffold_for_shape(topic_shape),
         "",
         "OUTPUT — return ONE JSON object with EXACTLY these keys:",
-        # v15.2.1: cluster_cause_quote / cluster_outcome_quote are NOW
-        # required output keys for causal topics. v15.2.0 mentioned them in
-        # the scaffold but never asked for them in the schema, so they
-        # arrived as NULL on every cluster and TEST U was mechanically
-        # unreachable. Required for causal topics; for comparative /
-        # descriptive shapes they remain empty strings.
         "  cluster_cause_quote: VERBATIM substring (>=4 words) from the "
         "cluster's claims naming the cluster's cause. Required for "
         "causal topics; empty string allowed only when relation = "
@@ -939,22 +752,8 @@ def _validate_posture(obj, topic_shape: str, valid_doc_ids: set) -> Optional[dic
     if lead and lead not in valid_doc_ids:
         lead = ""
     internal = str(obj.get("internal_disagreement", "") or "").strip()[:240]
-    # v15.2.1: cluster_cause_quote + cluster_outcome_quote captured here
-    # so they actually land in the ledger (v15.2.0 mentioned them in the
-    # scaffold but never extracted them, so TEST U was unreachable).
     cluster_cause_quote = str(obj.get("cluster_cause_quote", "") or "").strip()[:400]
     cluster_outcome_quote = str(obj.get("cluster_outcome_quote", "") or "").strip()[:400]
-    # For causal topics with a non-adjacent relation, require both quote
-    # fields to be present (>=20 chars as a cheap "is this a real quote"
-    # check). If empty, the posture call short-circuited; better to retry
-    # than to ship a relation decision with no evidentiary anchor.
-    # v15.2.2: lowered the quote-length minimum from 20 -> 10 chars.
-    # The v15.2.1 smoke showed adjacent ballooning to 8/12 clusters on
-    # causal topics because the model was producing short quotes that
-    # failed the 20-char gate, then the validator rejected, retry hit the
-    # same gate, and posture defaulted to adjacent. 10 chars still
-    # excludes empty/single-word fields but admits realistic quote
-    # phrases like "led to growth" or "shaped institutions".
     if (topic_shape == "causal"
             and relation != "adjacent"
             and (len(cluster_cause_quote) < 10 or len(cluster_outcome_quote) < 10)):
@@ -975,11 +774,6 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
                     topic_cause: str = "",
                     topic_outcome: str = "",
                     metrics=None) -> Optional[dict]:
-    """Stage 2. One LLM call per cluster.
-
-    cluster: {cluster_id, doc_ids, shared_thread, claims_by_doc}
-    cluster_evidence: {doc_id: [snippet, ...]}
-    """
     doc_ids = list(cluster.get("doc_ids") or [])
     claims = [cluster.get("claims_by_doc", {}).get(d, "") for d in doc_ids]
     sig = _sig_posture(
@@ -1026,7 +820,6 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
 
     posture = _parse_and_validate(raw, lambda obj: _validate_posture(obj, topic_shape, valid_doc_ids))
     if posture is None:
-        # One retry, JSON-only reminder.
         retry_prompt = prompt + "\n\nReturn ONLY the JSON object with the five required keys."
         try:
             import ollama
@@ -1054,14 +847,6 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
         if posture is None:
             return None
 
-    # v15.2.0: deterministic mechanism-grounding post-check. When the
-    # model picks `upstream_of_topic_cause` for a causal topic, verify the
-    # reasoning_trace actually shares enough content words with the
-    # cluster's claims to defend the "flows INTO" chain. If the model is
-    # template-filling rather than reading the cluster, downgrade to
-    # `adjacent` (the safe option — admits uncertainty rather than create
-    # false rivals). Only applies to causal topics where we have a
-    # cluster_cause string to ground against.
     cluster_cause = (cluster.get("shared_cause") or "").strip()
     cluster_thread = (cluster.get("shared_thread") or "").strip()
     grounding_source = cluster_cause or cluster_thread
@@ -1075,22 +860,6 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
             if metrics:
                 metrics.inc("outline_posture_grounding_downgrades")
 
-    # v15.2.1 + v15.2.3: SYMMETRIC post-check. Promote a non-upstream
-    # relation to upstream when the cluster's own quote names the
-    # topic_cause as a DOWNSTREAM NOUN after a conduit verb. v15.2.1
-    # caught the rival case; v15.2.3 widens to ALSO catch `adjacent`
-    # because the v15.2.2 INST smoke showed mistral-small landing AJR in
-    # adjacent (not rival) when its TEST C-THROUGH read failed on
-    # literal-string mismatch ("extractive institutions" != "institutions"
-    # to the model), so the rival-only post-check never fired. The
-    # deterministic stem-overlap check correctly sees institutions in
-    # extractive institutions.
-    #
-    # Grounding source: prefer the VERBATIM cluster_cause_quote the model
-    # produced in Stage 2 over the Stage-1 shared_cause label, because
-    # the quote is what the model actually based its decision on. Fall
-    # back to shared_cause when the quote is empty (e.g. adjacent
-    # responses that skipped the quote field).
     quote_for_conduit = (posture.get("cluster_cause_quote") or "").strip() or grounding_source
     if (topic_shape == "causal"
             and posture.get("relation") in ("rival_to_topic_cause", "adjacent")
@@ -1102,8 +871,6 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
             posture["mechanism_grounding"] = f"promoted_{original}_to_upstream_via_conduit_check"
             if metrics:
                 metrics.inc("outline_posture_grounding_promotions")
-                # v15.14: this counter was initialised in build_outline but
-                # never incremented — batteries reading it always saw 0.
                 metrics.inc("outline_posture_conduit_promotions")
 
     posture["model"] = _MODEL
@@ -1113,13 +880,6 @@ def posture_cluster(topic: str, topic_shape: str, cluster: dict,
         metrics.cache_event("outline_posture", "writes")
     return posture
 
-
-# ---------------------------------------------------------------------------
-# v15.2.0: mechanism-grounding sanity check (deterministic, no LLM).
-# When the model picks `upstream_of_topic_cause`, its reasoning_trace
-# must share at least 2 content-word stems with the cluster's
-# shared_cause/shared_thread. Otherwise it's template-filling and gets
-# downgraded to `adjacent` (safe — don't create false rivals).
 
 _STOPWORDS = frozenset({
     "the", "a", "an", "of", "in", "on", "at", "to", "for", "by", "with",
@@ -1140,9 +900,6 @@ _STOPWORDS = frozenset({
 
 
 def _stem(word: str) -> str:
-    """Cheap suffix-stripper. Good enough to map plurals/tenses to the
-    same key (institutions -> institut, slavery -> slaver, growing ->
-    grow, mortality -> mortal). No NLP dependency."""
     w = word.lower()
     for suf in ("ational", "tional", "ization", "ising", "izing",
                 "ation", "ition", "ments", "ness", "able", "ible",
@@ -1160,26 +917,14 @@ def _content_stems(text: str) -> set:
 
 
 def _mechanism_grounding_fails(reasoning: str, grounding_source: str) -> bool:
-    """Return True when the model's reasoning_trace shares fewer than 2
-    content-word stems with the cluster's shared_cause / shared_thread.
-    A True return means the upstream claim is not grounded in the
-    cluster's own language and should be downgraded to adjacent."""
     r_stems = _content_stems(reasoning)
     g_stems = _content_stems(grounding_source)
     if not g_stems:
-        return False  # nothing to ground against; let the LLM call stand
+        return False
     overlap = r_stems & g_stems
     return len(overlap) < 2
 
 
-# v15.2.1: conduit verbs that, when a cluster's shared_cause text contains
-# `<conduit_verb> ... <topic_cause_stem>`, signal the cluster is naming
-# the topic cause as a DOWNSTREAM result of its own cause — i.e. the
-# cluster is making an upstream argument. Detected post-Stage-2 to catch
-# rival-template-fires where the cluster's own text names the through-
-# chain explicitly (e.g. shared_cause="...led to the establishment of
-# extractive institutions" with topic_cause="institutions"). The verb
-# list is intentionally narrow and topic-agnostic.
 _CONDUIT_VERBS = (
     "led to", "leads to", "leading to",
     "produced", "produces", "producing", "produce",
@@ -1191,14 +936,6 @@ _CONDUIT_VERBS = (
     "determined", "determines", "determining",
     "gave rise to", "gives rise to", "giving rise to",
     "drives", "drove", "driving", "drive",
-    # v15.2.3: added "explain" family. The Sokoloff & Engerman cluster on
-    # INST has shared_cause "distributional conflicts provide a better
-    # explanation than efficiency for the core economic institutions" —
-    # syntactically the topic-cause noun appears AFTER `explanation` even
-    # though "explanation for" is not contiguous. Bare `explanation`
-    # plus the stem-overlap check is enough — if topic_cause is mentioned
-    # downstream of the word `explanation` in any phrasing, the cluster
-    # is naming it as the explanandum. Topic-agnostic.
     "account for", "accounts for",
     "explain", "explains", "explaining",
     "explanation", "explanations",
@@ -1206,19 +943,12 @@ _CONDUIT_VERBS = (
 
 
 def _names_topic_cause_as_conduit(grounding_source: str, topic_cause: str) -> bool:
-    """Return True when `grounding_source` (the cluster's shared_cause or
-    shared_thread) contains the topic_cause as a downstream noun after a
-    conduit verb. Used to PROMOTE rival_to_topic_cause -> upstream_of_topic_cause
-    when the cluster's own summary names the topic cause as the conduit
-    of its own argument."""
     if not grounding_source or not topic_cause:
         return False
     text = grounding_source.lower()
     topic_stems = _content_stems(topic_cause)
     if not topic_stems:
         return False
-    # Find any conduit verb in the cluster summary, then check whether
-    # the text AFTER the verb contains any topic_cause stem.
     for verb in _CONDUIT_VERBS:
         idx = text.find(verb)
         while idx != -1:
@@ -1228,10 +958,6 @@ def _names_topic_cause_as_conduit(grounding_source: str, topic_cause: str) -> bo
                 return True
             idx = text.find(verb, idx + 1)
     return False
-
-
-# ---------------------------------------------------------------------------
-# Stage 3 — ORDER
 
 
 def _build_order_prompt(topic: str, cluster_summaries: List[dict]) -> str:
@@ -1272,7 +998,6 @@ def _validate_order(obj, valid_ids: set) -> Optional[List[str]]:
         if s in valid_ids and s not in seen:
             out.append(s)
             seen.add(s)
-    # Fill in any leftovers in their original order so the partition is total.
     for cid in sorted(valid_ids - seen):
         out.append(cid)
     return out
@@ -1280,10 +1005,6 @@ def _validate_order(obj, valid_ids: set) -> Optional[List[str]]:
 
 def order_clusters(topic: str, cluster_summaries: List[dict],
                    metrics=None) -> List[str]:
-    """Stage 3. Pick section order. Returns ordered cluster_ids.
-
-    With <=2 clusters, returns the input order verbatim (no LLM call needed).
-    """
     ids = [cs.get("cluster_id") for cs in cluster_summaries if cs.get("cluster_id")]
     if len(ids) <= 2:
         return ids
@@ -1330,35 +1051,14 @@ def order_clusters(topic: str, cluster_summaries: List[dict],
     return parsed
 
 
-# ---------------------------------------------------------------------------
-# Top-level orchestrator
-
-
 def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Optional[dict]:
-    """Run Stage 0 (precheck) + Stage 1 + Stage 2 + Stage 3.
-
-    Returns:
-      - {"refused": True, "refusal_reason": ..., "topic_shape": ...} when
-        Stage 0 says corpus_fit=REFUSE. Caller should write a refusal
-        manifest and stop.
-      - Full outline plan on success.
-      - None if Stage 0 or Stage 1 fails irrecoverably (LLM error).
-    """
-    # v15.7: initialise grounding-postcheck counters at 0 so the 9-battery
-    # can distinguish "never fired" from "fired with zero hits". They were
-    # previously absent from run_metrics.json when the postchecks took the
-    # zero-hit branch.
     if metrics:
         metrics.set("outline_posture_grounding_downgrades", 0)
         metrics.set("outline_posture_grounding_promotions", 0)
         metrics.set("outline_posture_conduit_promotions", 0)
 
-    # Stage 0: corpus-fit + shape detection.
     pre = precheck(topic, doc_summaries, metrics=metrics)
     if not pre:
-        # Stage 0 LLM failure. Treat as a hard error rather than
-        # silently defaulting to causal+PROCEED — that's how the v15.0.2
-        # refusal failure happened.
         return None
 
     topic_shape = pre["topic_shape"]
@@ -1394,7 +1094,6 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
         d.get("doc_id"): d for d in doc_summaries if d.get("doc_id")
     }
 
-    # Build claims_by_doc + evidence_by_doc once.
     def _claim_of(did: str) -> str:
         d = summaries_by_doc.get(did) or {}
         return (d.get("claim") or "").strip()
@@ -1422,10 +1121,6 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
                                   topic_outcome=topic_outcome,
                                   metrics=metrics)
         if posture is None:
-            # Conservative fallback: tag the cluster as `adjacent` with a
-            # generic elaboration so the rest of the pipeline does not crash.
-            # The smoke will surface the failure via metrics.outline_posture
-            # error counts.
             posture = {
                 "relation": "adjacent",
                 "elaboration": c.get("shared_thread", "(posture failed)"),
@@ -1443,18 +1138,11 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
             "lead_doc_id": posture.get("lead_doc_id", ""),
             "internal_disagreement": posture.get("internal_disagreement", ""),
             "posture_failed": posture.get("posture_failed", False),
-            # v15.2.2: carry the v15.2.1 quote fields + mechanism_grounding
-            # signal into the ledger so the smoke harness can actually
-            # SEE what Stage 2 produced. The v15.2.1 smoke had 0/6
-            # quotes "populated" only because this propagation was
-            # missing — the validator HAD extracted them, but they died
-            # at this boundary.
             "cluster_cause_quote": posture.get("cluster_cause_quote", ""),
             "cluster_outcome_quote": posture.get("cluster_outcome_quote", ""),
             "mechanism_grounding": posture.get("mechanism_grounding", ""),
         })
 
-    # Stage 3.
     cluster_summaries_for_ordering = [
         {
             "cluster_id": c["cluster_id"],
@@ -1492,22 +1180,7 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None) -> Option
     }
 
 
-# ---------------------------------------------------------------------------
-# JSON helpers
-
-
 def _parse_and_validate(raw: str, validate_fn):
-    """Tolerant JSON parsing: extract the first complete JSON object, parse
-    it, run the validator. Returns whatever the validator returns, or None on
-    any error.
-
-    v15.13: uses the bracket-matching extractor (utils.extract_first_json) so
-    verbose models that emit prose after the object — qwen3:30b-a3b, or a
-    frontier API model appending an explanation — no longer break parsing.
-    Falls back to the old first-{ / last-} slice + trailing-comma repair when
-    the strict extractor finds nothing (handles the trailing-comma case the
-    strict json.loads would reject).
-    """
     if not raw:
         return None
     from rrr.utils import extract_first_json
@@ -1518,7 +1191,6 @@ def _parse_and_validate(raw: str, validate_fn):
         if start < 0 or end <= start:
             return None
         payload = raw[start:end + 1]
-        # Strip trailing commas that the model sometimes emits.
         payload = re.sub(r",\s*}", "}", payload)
         payload = re.sub(r",\s*]", "]", payload)
         try:

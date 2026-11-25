@@ -1,53 +1,12 @@
 #!/usr/bin/env python3
-"""
-check_citations.py — citation + quote integrity checker.
-
-Parses a composed review (.md) and checks every citation surface against the
-corpus (metadata.csv + per-doc page counts in data/*.json), then verifies any
-direct-quoted prose against the actual page_text on disk.
-
-v14.2 error taxonomy (expanded from the original E1/E2/E3):
-    E1  Out-of-corpus citation — cited identity does not resolve to a
-                                  document in metadata.csv
-    E2  Invalid page           — cited page exceeds doc's content-page count
-    E3  Format violation       — citation-like pattern that misses strict
-                                  format. Now HARD-only: page-only (p.5),
-                                  doc-without-page, multi-page citation,
-                                  square-bracket dump. Author-year-text
-                                  surfaces (e.g. "Hopkins (2009)" without a
-                                  page) are no longer E3 — they appear in
-                                  e3_soft for visibility but do NOT count
-                                  toward the hard failure score.
-    E4  Unverified quote       — quoted words do not occur on any retained
-                                  page of the documents cited in their sentence.
-    E5  Mis-attributed quote   — quoted words occur in a cited document, but
-                                  on a retained page other than the page cited
-                                  in their sentence.
-
-CLI:
-    python3 scripts/check_citations.py runs/review_composed.md
-    python3 scripts/check_citations.py runs/review_composed.md --json results.json
-    python3 scripts/check_citations.py runs/review_composed.md --json -   # stdout
-    python3 scripts/check_citations.py runs/review_composed.md --no-quote-check
-
-Import:
-    from check_citations import check_file, check_review
-"""
 
 from functools import lru_cache
 import os, re, json, glob, sys
 import unicodedata
 
-# v13: import CITE_RE from the canonical home so the script and the writer
-# always agree on the citation surface. v13.1 (FIX-F): also import the
-# display-form patterns and the author/year lookup builders so we can resolve
-# user-facing surfaces ("Author (Year, p.N)" / "(Author Year, p.N)") against
-# the corpus and bump E1 when the display label refers to a non-existent doc.
-# Fall back to local copies only when the rrr package isn't importable (e.g.
-# ad-hoc CLI use without PYTHONPATH set).
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-    from rrr.render import (  # type: ignore
+    from rrr.render import (
         CITE_RE,
         DISPLAY_CITE_RE,
         DISPLAY_PAREN_CITE_RE,
@@ -57,12 +16,6 @@ try:
     )
 except Exception:
     CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
-    # Re-implement the display-form patterns inline so the checker keeps
-    # working when run outside the package context. Keep these byte-identical
-    # with render.py so the writer and checker agree on what counts as a
-    # display citation.
-    # v13.1.1: particle group case-insensitive so "Van Zanden" capital-V matches
-    # the particle branch and the full label gets captured (mirrors render.py).
     _DISPLAY_UNIT = (
         r"(?:(?i:van|von|de|del|der)\s+[A-Z][A-Za-z\-]+|[A-Z][A-Za-z\-]+)"
     )
@@ -78,7 +31,7 @@ except Exception:
         r"\((" + _DISPLAY_LABEL + r")(?:,?\s+)(\d{4})[a-z]?(?:,\s*|\s+)p\.\s*(\d+)\)"
     )
 
-    def _doc_id_to_author_label(doc_id):  # type: ignore
+    def _doc_id_to_author_label(doc_id):
         if not doc_id:
             return ""
         m = re.match(r"^(.+?)_(\d{4})[a-z]?$", str(doc_id))
@@ -100,7 +53,7 @@ except Exception:
             return f"{parts[0]} et al. ({year})"
         return f"{_ns(name_part)} ({year})"
 
-    def _build_author_year_lookup(allowed_docs):  # type: ignore
+    def _build_author_year_lookup(allowed_docs):
         out = {}
         for did in allowed_docs:
             clean = did.replace("EtAl", "").replace("&", "")
@@ -113,7 +66,7 @@ except Exception:
                     out[(author + " et al", year)] = did
         return out
 
-    def _build_display_lookup(allowed_doc_ids):  # type: ignore
+    def _build_display_lookup(allowed_doc_ids):
         lookup, collisions = {}, set()
         for did in allowed_doc_ids or []:
             label = _doc_id_to_author_label(str(did))
@@ -131,10 +84,6 @@ except Exception:
 
 _AUTHOR_NAME_RE = r"(?:[A-Z][A-Za-z&.\-]+|(?:van|von|de|del|der)[A-Z][A-Za-z&.\-]+)"
 
-# Citation groups use semicolons to place two or more complete citation units
-# inside one pair of parentheses.  The renderer's standalone patterns cannot
-# see the inner units because only the whole group has parentheses, so the
-# checker parses group containers before scanning standalone citations.
 _GROUP_SURNAME_RE = (
     r"(?:(?:(?i:van|von|de|del|der)\s+)?"
     r"[A-Z][A-Za-z'\u2019\-]+)"
@@ -197,7 +146,6 @@ def _span_overlaps(start, end, spans):
 
 
 def _expand_cited_pages(value):
-    """Expand a malformed page list or short range into explicit pages."""
     cleaned = re.sub(r"p{1,2}\.\s*", "", str(value), flags=re.IGNORECASE)
     parts = re.split(r"\s*(?:,|;|\band\b)\s*", cleaned)
     pages = []
@@ -219,13 +167,6 @@ def _expand_cited_pages(value):
 
 def _recover_quote_only_citation_units(
         text, citation_units, group_errors, group_spans):
-    """Recover named pages from malformed citations for quotation checks.
-
-    These units never enter citation totals or document-breadth metrics. Their
-    citation form remains an E3 event. Recovery only prevents that format
-    event from causing a second, false quotation event when the quoted words
-    occur on one of the pages the malformed citation explicitly names.
-    """
     recovered = []
 
     def _append(template, pages, start, end, container_start, container_end,
@@ -261,9 +202,6 @@ def _recover_quote_only_citation_units(
             }, _expand_cited_pages(display.group("pages")))
         return None, []
 
-    # Standalone ranges and multi-page citations have one parenthetical
-    # container. A narrative display citation takes its author label from the
-    # text immediately before that container.
     for container in _PAREN_CONTAINER_RE.finditer(text):
         body = container.group("body")
         template, pages = _explicit_template(body)
@@ -308,9 +246,6 @@ def _recover_quote_only_citation_units(
             "malformed_multi_page",
         )
 
-    # In a citation group, a page-only member conventionally carries forward
-    # the document named by the preceding member. Preserve that association
-    # solely for quotation verification while retaining the member's E3.
     for detail in group_errors:
         page_only = _PAGE_ONLY_SPEC_RE.fullmatch(detail["raw"])
         if not page_only:
@@ -364,7 +299,6 @@ def _recover_quote_only_citation_units(
 
 
 def _classify_malformed_group_unit(raw, narrative_label=None):
-    """Return a hard-E3 reason for a citation-shaped malformed member."""
     value = str(raw or "").strip()
     if not value:
         return "group_empty_unit"
@@ -394,13 +328,6 @@ def _classify_malformed_group_unit(raw, narrative_label=None):
 
 
 def _parse_citation_units(text):
-    """Parse grouped and standalone citation units without resolving docs.
-
-    Every syntactically complete member becomes one unit.  Group containers
-    are discovered first so their members cannot be counted again by the
-    standalone patterns.  The returned group errors are already one-per-unit
-    hard E3 events.
-    """
     units = []
     group_errors = []
     group_spans = []
@@ -496,10 +423,6 @@ def _parse_citation_units(text):
 
         if not all_citation_shaped:
             continue
-        # A semicolon parenthesis containing only unpaged author-year prose
-        # remains outside grouped-citation parsing.  At least one complete
-        # citation establishes the container; malformed neighbours then
-        # receive unit-level E3 treatment.
         if not parsed_members:
             continue
 
@@ -568,12 +491,6 @@ def _parse_citation_units(text):
     group_spans.sort()
     return units, group_errors, group_spans
 
-# v13.1 (FIX-F): loose display form the model emits without a page when it is
-# uncertain — "Author & Author Year" or "Author and Author Year". These are
-# NOT matched by DISPLAY_CITE_RE/DISPLAY_PAREN_CITE_RE (which require a page),
-# but they still assert a (author, year) tuple that must resolve to a corpus
-# document. We capture the surface, the first-author surname (everything left
-# of the year), and the year, then resolve the same way as the paged forms.
 _LOOSE_AUTHOR_YEAR_RE = re.compile(
     r"(?<!\w)("
     r"(?:(?:van|von|de|del|der)\s+)?[A-Z][A-Za-z\-]+"
@@ -582,11 +499,6 @@ _LOOSE_AUTHOR_YEAR_RE = re.compile(
     r")\s+(\d{4})[a-z]?(?!\s*[:,]?\s*p\.)"
 )
 
-# E3 (HARD) — citation-shaped strings that are clearly wrong:
-#   - canonical-form cite missing a page
-#   - bare page-only cite, e.g. (p.5)
-#   - page range or multi-page packed citation, e.g. (Foo: p.5, p.7)
-#   - square-bracket evidence-id dump that survived the renderer
 _E3_HARD_PATTERNS = [
     ("doc_without_page", re.compile(r"\((?=[^)]*[A-Za-z0-9_&.\-]+_\d{4})(?![^)]*:\s*p\.)[^)]*\)")),
     ("page_only", re.compile(r"\((?:pp?\.)\s*\d+(?:\s*(?:,|-|and)\s*(?:pp?\.)?\s*\d+)*\)", re.IGNORECASE)),
@@ -597,45 +509,21 @@ _E3_HARD_PATTERNS = [
     )),
 ]
 
-# E3 (SOFT) — display-form narrative mentions WITHOUT a page number. These are
-# legitimate prose surfaces in many cases (e.g. "Hopkins (2009) argues that..."
-# followed by a fully-paged citation later in the paragraph), and the writer
-# system prompt does already require pages on every cite. We count them for
-# visibility (`e3_soft` in the result) but do NOT count them in `e3` so the
-# v14.1 false-positive over-counting against well-formed reviews is gone.
 _E3_SOFT_PATTERNS = [
     ("author_year_text", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?\s*\(\d{{4}}\)")),
     ("author_year_possessive", re.compile(rf"\b{_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?'s\s*\(\d{{4}}\)")),
     ("author_year_parenthetical", re.compile(rf"\({_AUTHOR_NAME_RE}(?:\s+et\s+al\.?)?,\s*\d{{4}}\)")),
 ]
 
-# E4 / E5 helpers — quoted spans of >=20 chars; nearby canonical (doc: p.N)
-# cite within +/- 200 chars.
-# v16.8 precision fix: (1) match smart quotes as well as straight ones — LLM
-# essays routinely use “ ” for real quotations, which the old straight-only
-# regex missed while stray straight " marks paired across prose; (2) cap the
-# span length so a mispaired quote can't swallow half a paragraph. A real
-# inline quotation is short; a 500-char "quote" is a pairing error.
 _QUOTED_SPAN_RE = re.compile(r'["“]([^"”\n]{20,500})["”]')
-# v16.8: a clean verbatim quotation never EMBEDS an in-text citation or an
-# evidence-id bracket. When the span matcher pairs the wrong quote marks it
-# swallows prose + citations; such spans are not checkable quotations and
-# would inflate E4/E5 with false quotation errors. Used to reject them.
 _SPAN_HAS_CITATION_RE = re.compile(
-    # v16.9: page RANGES (`p.1-2`, en-dash too) count as citations — models
-    # write them, and a range defeated the v16.8 pattern, letting a mispaired
-    # span containing "(AcemogluEtAl_2002: p.1-2)" through as a "quote".
-    r"\([A-Za-z0-9_&.\-]+:\s*p\.\s*\d+(?:\s*[-–]\s*\d+)?\)"        # canonical (doc: p.N[-M])
-    r"|\([^()]*\b\d{4}[a-z]?\s*,\s*p\.\s*\d+(?:\s*[-–]\s*\d+)?\)"  # display (Author Year, p.N[-M])
+    r"\([A-Za-z0-9_&.\-]+:\s*p\.\s*\d+(?:\s*[-–]\s*\d+)?\)"
+    r"|\([^()]*\b\d{4}[a-z]?\s*,\s*p\.\s*\d+(?:\s*[-–]\s*\d+)?\)"
     r"|\([^()\n]*(?:\b\d{4}[a-z]?\b|\bp\.\s*\d+)[^()\n]*;"
-    r"[^()\n]*(?:\b\d{4}[a-z]?\b|\bp\.\s*\d+)[^()\n]*\)"           # grouped citation container
-    r"|\[E\d{3,5}\]"                                               # unrendered evidence id
+    r"[^()\n]*(?:\b\d{4}[a-z]?\b|\bp\.\s*\d+)[^()\n]*\)"
+    r"|\[E\d{3,5}\]"
 )
 _NEARBY_CANONICAL_CITE_RE = re.compile(r"\(([A-Za-z0-9_&.\-]+):\s*p\.(\d+)\)")
-# Display-form cite for quote attribution lookup when the canonical form is
-# absent (e.g. when checking the FINAL user-facing review where cites have
-# already been display-rewritten). We re-use the existing DISPLAY_CITE_RE /
-# DISPLAY_PAREN_CITE_RE patterns when checking display-form reviews.
 _QUOTE_WINDOW_CHARS = 200
 _SENTENCE_TERMINATOR_RE = re.compile(
     r'(?P<terminal>(?:(?<!\.)\.(?!\.)|[!?])'
@@ -656,7 +544,6 @@ _ALWAYS_CONTINUING_ABBREVIATIONS = {
 
 
 def _abbreviation_has_continuation(text: str, dot_index: int) -> bool:
-    """Distinguish an internal abbreviation from one ending a sentence."""
     tail = text[dot_index + 1:]
     next_char = re.search(r"\S", tail)
     if not next_char:
@@ -666,7 +553,6 @@ def _abbreviation_has_continuation(text: str, dot_index: int) -> bool:
 
 
 def _period_ends_abbreviation(text: str, dot_index: int) -> bool:
-    """Return True for common periods that do not close a sentence."""
     prefix = text[:dot_index + 1]
     if re.search(r"(?:\b[A-Za-z]\.){2,}$", prefix):
         return _abbreviation_has_continuation(text, dot_index)
@@ -685,7 +571,6 @@ def _period_ends_abbreviation(text: str, dot_index: int) -> bool:
 
 
 def _sentence_breaks(text: str):
-    """Yield ``(sentence_end, next_sentence_start)`` boundary pairs."""
     boundaries = {
         (match.start(), match.end())
         for match in _PARAGRAPH_BREAK_RE.finditer(text)
@@ -700,12 +585,6 @@ def _sentence_breaks(text: str):
 
 
 def _sentence_bounds(text: str, start: int, end: int, boundaries=None):
-    """Return the sentence-like span governing ``text[start:end]``.
-
-    Terminal punctuation followed by whitespace closes a sentence regardless
-    of how the next sentence begins. Common abbreviations and initials are
-    excluded, and blank lines remain hard boundaries.
-    """
     left = 0
     right = len(text)
     if boundaries is None:
@@ -721,13 +600,6 @@ def _sentence_bounds(text: str, start: int, end: int, boundaries=None):
 
 
 def _normalise_for_quote_match(s: str) -> str:
-    """Normalise for verbatim-quote substring matching.
-
-    Normalization is symmetric across quoted words and page text. It handles
-    OCR hyphenation, Unicode ligatures and dashes, soft hyphens, and the narrow
-    currency-marker substitution observed in the retained corpus. Ellipses and
-    editorial brackets are evaluated separately as ordered quotation gaps.
-    """
     if not s:
         return ""
     s = unicodedata.normalize("NFKC", s).replace("\u00ad", "")
@@ -747,7 +619,6 @@ def _normalise_for_quote_match(s: str) -> str:
 
 
 def _normalise_quote_needle(s: str) -> str:
-    """Normalize quoted words and drop punctuation attached to quote marks."""
     return _normalise_for_quote_match(s).strip(" ,.;:!?")
 
 
@@ -755,7 +626,6 @@ _QUOTE_GAP_RE = re.compile(r"(?:\.{2,}|\u2026|\[[^\[\]]*\])")
 
 
 def _quote_matches_normalised_page(quote: str, page_text: str) -> bool:
-    """Match a quote, treating ellipses and editorial brackets as gaps."""
     needle = _normalise_quote_needle(quote)
     if needle and needle in page_text:
         return True
@@ -798,7 +668,6 @@ def _normalised_page_text(path: str):
 
 
 def _load_page_text(doc_id: str, page: int, page_text_dir: str):
-    """Read data/page_text/{doc_id}_page_{N}.txt; return None on miss."""
     try:
         p = os.path.join(page_text_dir, f"{doc_id}_page_{int(page)}.txt")
         if os.path.isfile(p):
@@ -809,10 +678,6 @@ def _load_page_text(doc_id: str, page: int, page_text_dir: str):
 
 
 def _find_other_pages_with_quote(doc_id: str, quote: str, page_text_dir: str, exclude_page: int):
-    """E5 detection: scan ALL pages of a doc for the normalised quote span.
-    Returns the page number(s) where the quote DOES appear (excluding the
-    cited page). An empty list means the wording remains unverified within
-    the cited document, so it is not a page-misattribution case."""
     if not os.path.isdir(page_text_dir):
         return []
     if not _normalise_quote_needle(quote):
@@ -836,8 +701,6 @@ def _find_other_pages_with_quote(doc_id: str, quote: str, page_text_dir: str, ex
 
 
 def _load_valid_docs(metadata_path):
-    """Load set of valid doc_ids from metadata CSV (stdlib csv — no pandas
-    dependency so the checker works in minimal environments)."""
     if not os.path.isfile(metadata_path):
         return set()
     import csv as _csv
@@ -852,12 +715,6 @@ def _load_valid_docs(metadata_path):
 
 
 def _load_citation_metadata(metadata_path):
-    """Load the citation fields needed to resolve display labels.
-
-    The checker normally works with corpus doc_ids that encode author and
-    year.  Newer corpora may use arbitrary doc_ids and carry the display
-    label in metadata instead, so resolution must consult both sources.
-    """
     if not os.path.isfile(metadata_path):
         return {}
     import csv as _csv
@@ -882,7 +739,6 @@ def _load_citation_metadata(metadata_path):
 
 
 def _load_doc_max_pages(data_dir):
-    """Load max content-page count per doc_id from preprocessing metadata."""
     doc_max = {}
     for jpath in glob.glob(os.path.join(data_dir, "*.json")):
         try:
@@ -895,7 +751,6 @@ def _load_doc_max_pages(data_dir):
         except Exception:
             continue
 
-    # Fallback: count page_text files
     if not doc_max:
         ptdir = os.path.join(data_dir, "page_text")
         if os.path.isdir(ptdir):
@@ -910,29 +765,11 @@ def _load_doc_max_pages(data_dir):
 
 
 def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_check=True):
-    """
-    Check a review text string for E1/E2/E3/E4/E5 errors.
-
-    Returns dict with:
-      n_citations, e1, e2, e3, e3_soft, e4, e5,
-      docs_cited, n_docs_cited, word_count,
-      e1_details, e2_details, e3_details, e3_soft_details,
-      e4_details, e5_details, quotes_checked, quotes_verified.
-
-    `quote_check` toggles the E4/E5 scan (cheap; off only for backwards
-    compatibility with callers that don't want disk reads of page_text).
-    """
     citation_metadata = _load_citation_metadata(metadata_path)
     valid_docs = set(citation_metadata)
     doc_max = _load_doc_max_pages(data_dir)
     page_text_dir = os.path.join(data_dir, "page_text")
 
-    # v13.1 (FIX-F): build the author/year lookups from the corpus so we can
-    # resolve display-form citations the writer emits ("Author (Year, p.N)"
-    # and "(Author Year, p.N)") and bump E1 when the (author, year) tuple
-    # doesn't match any corpus document. Without this layer, the strict
-    # CITE_RE check above misses display-form fabrications entirely — the
-    # v13 smoke surfaced "Dalrymple-Smith & Frankema 2017" with e1=0.
     ignored_name_tokens = {
         "and", "et", "al", "van", "von", "de", "del", "der",
     }
@@ -965,11 +802,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
             tokens.add(lowered)
         return frozenset(tokens)
 
-    # Build a collision-safe exact-label index from metadata when present,
-    # with the established doc_id renderer as the fallback. Keep full
-    # co-author signatures from both representations because arbitrary
-    # metadata doc_ids cannot be decoded for author names, while legacy
-    # corpora may omit display_label from metadata.
     display_lookup = {}
     display_collisions = set()
     citation_labels = {}
@@ -1027,10 +859,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
     for _key in display_collisions:
         display_lookup.pop(_key, None)
 
-    # The shared author-year helper preserves one value per key and therefore
-    # cannot expose collisions. Build a checker-local fallback that drops
-    # every first-author/year key shared by more than one corpus work. Exact
-    # display labels and full co-author matches are attempted before this map.
     unique_author_year_lookup = {}
     _first_author_collisions = set()
     for _did in valid_docs:
@@ -1066,18 +894,11 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         unique_author_year_lookup.pop(_key, None)
 
     def _resolve_display_label(label, year):
-        """Return the canonical doc_id for a display (label, year) pair, or
-        None if it doesn't match any corpus document. Exact labels and full
-        co-author signatures take precedence. A single surname or an
-        ``et al.`` surface may then use a unique first-author/year fallback."""
         label_norm = _normalise_label(label)
         did = display_lookup.get((label_norm, year))
         if did:
             return did
 
-        # A supplied co-author pair is an explicit signature. It must match
-        # in full and cannot degrade to either surname. Token comparison lets
-        # a display label omit a particle retained in a legacy doc_id.
         if re.search(r"\s+(?:and|&)\s+", label_norm):
             label_signature = _signature_tokens(label_norm)
             coauthor_matches = [
@@ -1087,8 +908,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
             ]
             return coauthor_matches[0] if len(coauthor_matches) == 1 else None
 
-        # The only degraded form accepted is a unique first-author/year
-        # surface, including the conventional first-author ``et al.`` label.
         first_author = re.split(
             r"\s+et\s+al\.?", label_norm, maxsplit=1)[0]
         first_author = first_author.strip()
@@ -1098,15 +917,11 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         did = unique_author_year_lookup.get((first_author + " et al", year))
         return did
 
-    # One parsed unit list drives every citation metric and downstream check.
-    # Full members of semicolon groups remain independent citations, while a
-    # malformed member contributes one hard E3 event and inherits nothing
-    # from its neighbours.
     citation_units, group_e3_details, group_spans = (
         _parse_citation_units(text))
     e1, e2 = 0, 0
     e1_details, e2_details = [], []
-    e1_loose_advisory = []  # v16.8: bare "Word Year" prose, advisory only
+    e1_loose_advisory = []
     docs_cited = set()
 
     for citation in citation_units:
@@ -1167,10 +982,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
                 citation["label"], citation["year"])
         citation["resolved_doc_id"] = did
 
-    # Loose form: "Author & Author Year" / "Author and Author Year" without a
-    # page. These don't get an E2 check (no page asserted) but they DO assert
-    # a corpus document and so bump E1 when unmatched. Skip anything that
-    # overlaps a span we've already classified to avoid double-counting.
     citation_spans = [
         (citation["container_start"], citation["container_end"])
         for citation in citation_units
@@ -1180,24 +991,10 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         if _span_overlaps(m.start(), m.end(), all_spans):
             continue
         label, year = m.group(1), m.group(2)
-        # Skip pure-year false positives (e.g. "the 1960s" can't match
-        # because the regex requires a leading capitalised surname, but
-        # belt-and-braces: require at least one alpha char in the label).
         if not re.search(r"[A-Za-z]", label):
             continue
         did = _resolve_display_label(label, year)
         if did is None:
-            # v16.8: bare "Word Year" (no parentheses, no page) is
-            # STRUCTURALLY AMBIGUOUS with ordinary historical prose —
-            # "England 1066", "Parliament 1688", "In 1850" all match this
-            # pattern. Counting them as fabricated citations produced
-            # systematic false positives, especially on unrestricted /
-            # off-the-shelf essays full of "ProperNoun Year" prose. A hard
-            # fabrication metric must not fire on ambiguous surfaces, so
-            # these are recorded as an ADVISORY signal (e1_loose_advisory)
-            # and NOT summed into E1. Genuine out-of-corpus citations in
-            # canonical `(doc: p.N)` or display `Author (Year, p.N)` form —
-            # which ARE structurally unambiguous — still count toward E1.
             ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
             e1_loose_advisory.append({
                 "doc_id": None, "label": label.strip(), "year": year,
@@ -1208,10 +1005,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         else:
             docs_cited.add(did)
 
-    # E3 HARD: format violations that are unambiguously broken (page-only,
-    # canonical cite missing a page, multi-page packed cite, bracket dump).
-    # v13.1 (FIX-F): exclude spans already classified by the display-form scan
-    # so a legitimate "Author (Year, p.N)" surface is not double-counted.
     e3_details = []
     for detail in group_e3_details:
         ctx = text[
@@ -1251,11 +1044,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
     ]
 
     def _e3_match_is_accounted_for(match):
-        # A parsed group owns its complete container because malformed
-        # members have already received unit-level E3 treatment. For a
-        # standalone citation, suppress only patterns that begin inside the
-        # valid citation. A malformed outer wrapper can contain a valid inner
-        # display citation and must remain visible as its own E3 event.
         if _span_overlaps(match.start(), match.end(), group_spans):
             return True
         if _span_overlaps(
@@ -1273,11 +1061,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
                 ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
                 e3_details.append({"reason": reason, "raw": m.group(0), "context": ctx})
 
-    # E3 SOFT: display-form author-year mentions without a page number. These
-    # do not count toward the hard E3 score but are surfaced for visibility.
-    # The writer prompt asks for pages on every cite — a high e3_soft count
-    # signals the writer is dropping pages, which is a prose-quality concern
-    # rather than a fabrication.
     e3_soft = 0
     e3_soft_details = []
     for reason, pat in _E3_SOFT_PATTERNS:
@@ -1287,11 +1070,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
                 ctx = text[max(0, m.start() - 80):m.end() + 80].replace("\n", " ").strip()
                 e3_soft_details.append({"reason": reason, "raw": m.group(0), "context": ctx})
 
-    # E4 / E5: quote-text integrity. Scan every "..." span >=20 chars and
-    # associate it with all actionable citations in the same sentence. When
-    # the sentence has no citation, fall back to the single nearest citation
-    # in the surrounding window. This prevents a closer citation in an
-    # adjacent sentence from displacing the citation that governs the quote.
     e4 = 0
     e5 = 0
     e4_details = []
@@ -1302,21 +1080,8 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
         sentence_boundaries = tuple(_sentence_breaks(text))
         for qm in _QUOTED_SPAN_RE.finditer(text):
             quote = qm.group(1)
-            # v16.8: reject mispaired spans that embed a citation / evidence
-            # id — they are not verbatim quotations and would false-positive
-            # as E4/E5.
             if _SPAN_HAS_CITATION_RE.search(quote):
                 continue
-            # v16.9: reject mispaired scare-quote spans structurally. A
-            # quoted phrase SHORTER than the 20-char span floor (e.g.
-            # "reversal of fortune", 19 chars) cannot match as a quote, so
-            # the matcher pairs its CLOSING mark with the NEXT phrase's
-            # opening mark and captures the interstitial PROSE as a phantom
-            # quote — which then false-positives as E4. A genuine quotation
-            # never begins or ends with whitespace inside its marks, so edge
-            # whitespace is the mispairing signature. Production audit
-            # (80 Claude-arm essays): 16/151 Sonnet and 71/262 Opus E4s
-            # carried it; every inspected case was interstitial prose.
             if quote != quote.strip():
                 continue
             q_start, q_end = qm.span()
@@ -1409,7 +1174,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
 
             ctx = text[max(0, q_start - 80):q_end + 80].replace("\n", " ").strip()
             if not candidates:
-                # No actionable attribution, so the quote cannot be checked.
                 continue
             quotes_checked += 1
             norm_q = _normalise_quote_needle(quote)
@@ -1434,8 +1198,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
                 quotes_verified += 1
                 continue
 
-            # A missing cited page is already an E2 event. It cannot support a
-            # reliable E4/E5 classification, so avoid double-counting it.
             if not all_pages_available:
                 continue
 
@@ -1476,11 +1238,6 @@ def check_review(text, metadata_path="metadata.csv", data_dir="data", quote_chec
 
     word_count = len(re.findall(r"\b\w+\b", text))
 
-    # v14.2: n_citations now sums canonical + display + loose. Final
-    # user-facing reviews are always in display form (the canonical form is
-    # only the internal validation surface), so counting canonical-only made
-    # the checker report n_citations=0 on every real review — a confusing
-    # gap that masked review quality.
     n_canonical = sum(
         citation["kind"] == "canonical" for citation in citation_units)
     n_display = sum(
@@ -1523,7 +1280,6 @@ def _empty_result(reason):
 
 
 def check_file(path, metadata_path="metadata.csv", data_dir="data", quote_check=True):
-    """Check a review file by path. Handles missing/empty files as refusal."""
     if not os.path.isfile(path):
         return _empty_result("file_not_found")
     with open(path, encoding="utf-8") as f:
@@ -1535,7 +1291,6 @@ def check_file(path, metadata_path="metadata.csv", data_dir="data", quote_check=
     return r
 
 
-# ── CLI ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Check citations in a review file")
@@ -1577,8 +1332,6 @@ if __name__ == "__main__":
         if result["e1_details"]:
             print("\nE1 details:")
             for d in result["e1_details"]:
-                # v13.1: display-form entries carry a label/year/surface
-                # instead of a canonical doc_id. Print whichever shape we have.
                 if d.get("doc_id"):
                     print(f"  {d['doc_id']}: p.{d['page']}")
                 else:

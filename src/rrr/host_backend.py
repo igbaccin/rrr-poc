@@ -1,18 +1,3 @@
-"""Subscription-backed Codex and Claude adapters for RRR.
-
-When ``RRR_RUNTIME=host``, the central LLM shim sends each RRR chat request to
-an isolated non-interactive Codex or Claude Code process. RRR verifies a
-subscription login before inference. Retrieval, evidence checks, rendering,
-and artifact creation remain local.
-
-The adapter deliberately starts a fresh host context for every call. This
-matches the stateless ``ollama.chat`` contract and prevents prior conversation
-content from entering a review. The child process receives a scrubbed
-environment. Codex runs without its shell and customization layers. Claude
-runs with no tools or filesystem setting sources. These controls keep host
-mode on the product-subscription path and limit each process to the request
-RRR supplies.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -94,7 +79,7 @@ _CLAUDE_CHILD_ENV = frozenset({
 
 
 class HostBackendError(RuntimeError):
-    """Raised when the selected subscription host cannot complete a call."""
+    pass
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -121,7 +106,6 @@ def _host_model(host: Optional[str] = None) -> str:
 
 
 def host_model_name() -> str:
-    """Return the stable model label recorded in manifests and cache keys."""
     host = _host_name()
     return f"{host}:{_host_model(host)}"
 
@@ -142,8 +126,6 @@ def _command_candidates(host: str) -> List[str]:
 
     candidates: List[str] = []
     if host == "codex" and os.name == "nt":
-        # The desktop app exposes a runnable helper even when its WindowsApps
-        # alias cannot be launched from a child process.
         candidates.extend([
             str(Path.home() / ".codex" / ".sandbox-bin" / "codex.exe"),
             str(
@@ -239,7 +221,6 @@ def _backend_prompt(payload: Dict[str, Any]) -> str:
 
 
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
-    """Terminate a timed-out CLI wrapper together with its descendants."""
     if proc.poll() is not None:
         return
     try:
@@ -428,7 +409,6 @@ def _verify_subscription_auth(
 
 
 def host_diagnostics() -> Dict[str, Any]:
-    """Verify CLI compatibility and subscription authentication."""
     host = _host_name()
     env = _child_environment(host)
     last_error: Optional[BaseException] = None
@@ -455,7 +435,6 @@ def host_diagnostics() -> Dict[str, Any]:
 
 
 def host_smoke_test() -> Dict[str, Any]:
-    """Run one paid host call and verify the JSON response contract."""
     result = host_chat(
         messages=[{
             "role": "user",
@@ -709,7 +688,6 @@ def host_chat(
     _rrr_stage: Optional[str] = None,
     **_ignored,
 ) -> Dict[str, Any]:
-    """Ollama-compatible entry point for subscription-backed host inference."""
     host = _host_name()
     selected_model = _host_model(host)
     stage = _infer_stage(_rrr_stage)

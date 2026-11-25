@@ -11,8 +11,6 @@ from pathlib import Path
 from rrr.paths import data_path, indices_path, repo_path, runs_path
 from rrr.utils import ensure_dir
 
-# v15.14: mirror of metrics._redact_env_value — the manifest's env snapshot
-# ships in the same downloaded artifacts.
 _SENSITIVE_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASS|CREDENTIAL", re.IGNORECASE)
 
 
@@ -48,7 +46,6 @@ def _hash_tree(root: Path, suffixes=(".txt", ".json", ".csv")):
 
 
 def _run_git(args):
-    """Return git's raw stdout, or None when git cannot answer."""
     try:
         res = subprocess.run(
             ["git", *args],
@@ -73,10 +70,6 @@ def _git_text(args, strip=True):
 
 
 def _git_info():
-    # Git output is read as bytes because the Windows locale (cp1252) cannot
-    # decode every UTF-8 diff, and a failed decode used to record the hash of
-    # an empty diff. The diff hash covers `git diff --no-ext-diff --binary`
-    # exactly as git prints it. Fields git cannot report are None.
     status = _git_text(["status", "--short"], strip=False)
     diff = _run_git(["diff", "--no-ext-diff", "--binary"])
     status_lines = status.splitlines() if status is not None else []
@@ -166,8 +159,6 @@ def build_run_manifest(task: str, topic: str, meta_path, model: str, plan=None, 
 def write_run_manifest(task: str, topic: str, meta_path, model: str, plan=None, extra=None):
     ensure_dir(str(runs_path()))
     manifest = build_run_manifest(task, topic, meta_path, model, plan=plan, extra=extra)
-    # v15.14: atomic write — the manifest is the run's provenance record; a
-    # crash mid-write must not leave a truncated one that parses as absent.
     path = str(runs_path("run_manifest.json"))
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

@@ -1,24 +1,3 @@
-"""Auto-metadata cascade for arbitrary-filename PDF corpora (v15.8 / Improvement #2).
-
-Runs, per PDF:
-  1. content_sha1(pdf)         — stable cache key
-  2. extract_pages_text        — first N pages via PyMuPDF; skip if <200 chars total (needs OCR)
-  3. bib sidecar match         — key match, fuzzy title match, author+year match
-  4. filename heuristic        — Author_YYYY pattern → hint only (not final metadata)
-  5. DOI regex + CrossRef      — very high confidence when hit
-  6. LLM extraction            — Ollama (or configurable) on first ~4000 chars, structured JSON
-  7. validation gate           — extracted year AND first-author surname must appear in text
-  8. OpenAlex title lookup     — fills venue/volume/DOI when missing (best-effort)
-  9. generate_doc_id           — collision-safe Author[EtAl]_YYYY convention (backward compat)
-
-The output is a metadata.csv row that the rest of the pipeline consumes unchanged
-(same 11 legacy columns + 5 new v15.8 columns: content_sha1, first_author_surname,
-confidence, source, notes).
-
-This module is intentionally standalone — no imports from rrr.writer / rrr.reasoner
-so it can be smoke-tested against the existing 50-paper corpus without spinning up
-the whole review pipeline.
-"""
 from __future__ import annotations
 
 import csv
@@ -36,22 +15,15 @@ from typing import Optional
 from rrr.llm import install as _install_llm_shim
 
 
-# ``rrr ingest`` is dispatched before the review reasoner is imported. Install
-# the shared runtime router here so metadata extraction follows local, API, and
-# subscription-host configuration as well.
 _install_llm_shim()
 
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ExtractedMeta:
     doc_id: str = ""
     title: str = ""
-    authors_short: str = ""            # "Acemoglu & Johnson & Robinson"
-    author_full: str = ""              # "Acemoglu, Daron; Johnson, Simon; Robinson, James"
+    authors_short: str = ""
+    author_full: str = ""
     first_author_surname: str = ""
     year: str = ""
     venue: str = ""
@@ -61,29 +33,21 @@ class ExtractedMeta:
     doi_or_url: str = ""
     pdf_path: str = ""
     content_sha1: str = ""
-    lang: str = "en"                   # v15.12: ISO-639-1 detected from body text
-    confidence: str = "low"            # high / medium / low / failed
-    source: str = "none"               # bib_sidecar / filename_regex / doi_crossref / llm_extraction / llm+crossref / needs_ocr / none
+    lang: str = "en"
+    confidence: str = "low"
+    source: str = "none"
     notes: str = ""
 
 
 METADATA_CSV_COLUMNS = [
     "doc_id", "title", "authors", "author_full", "year", "venue", "volume",
     "number", "pages", "doi_or_url", "pdf_path",
-    # v15.8 productisation columns:
     "content_sha1", "first_author_surname", "confidence", "source", "notes",
-    # v15.12 multilingual: detected body-text language (ISO-639-1).
     "lang",
 ]
 
 
 def detect_pdf_language(text: str, default: str = "en") -> str:
-    """v15.12: detect the body-text language of a PDF (ISO-639-1). Used by
-    the ingest cascade to populate metadata.csv[lang], which the reasoner
-    reads to pick the corpus/pivot language for cross-language retrieval.
-    Deterministic (seeded). Falls back to ``default`` on short text or when
-    langdetect is unavailable.
-    """
     body = (text or "").strip()
     if len(body) < 40:
         return default
@@ -95,10 +59,6 @@ def detect_pdf_language(text: str, default: str = "en") -> str:
     except Exception:
         return default
 
-
-# ---------------------------------------------------------------------------
-# Primitives
-# ---------------------------------------------------------------------------
 
 def content_sha1(pdf_path: Path) -> str:
     h = hashlib.sha1()
@@ -112,11 +72,8 @@ def content_sha1(pdf_path: Path) -> str:
 
 
 def extract_pages_text(pdf_path: Path, max_pages: int = 3) -> str:
-    """First N pages concatenated. Returns '' on any error (missing lib,
-    corrupt PDF, image-only PDF).
-    """
     try:
-        import fitz  # PyMuPDF
+        import fitz
     except Exception:
         return ""
     parts = []
@@ -139,15 +96,10 @@ def find_doi(text: str) -> Optional[str]:
     if not m:
         return None
     doi = m.group(1)
-    # Trim trailing punctuation the regex tolerated
     while doi and doi[-1] in ".,;:)]}'\"":
         doi = doi[:-1]
     return doi or None
 
-
-# ---------------------------------------------------------------------------
-# CrossRef + OpenAlex
-# ---------------------------------------------------------------------------
 
 _UA = "rrr-ingest/0.1 (mailto:rrr@localhost)"
 
@@ -214,10 +166,6 @@ def _crossref_to_fields(cr: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Bib sidecar
-# ---------------------------------------------------------------------------
-
 def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
     if not bib_path or not bib_path.is_file():
         return []
@@ -254,17 +202,6 @@ def parse_bib_sidecar(bib_path: Optional[Path]) -> list:
 
 
 def _fuzzy_title_match(title: str, text: str, threshold: float = 0.9) -> bool:
-    """STRICT title match: require BOTH signals to be present:
-      (a) >= threshold fraction of 5+ char title tokens appear as WHOLE WORDS
-          (\\b-anchored) in the lowercased text — no substring inflation.
-      (b) at least one 4-word verbatim chunk from the title appears as a
-          contiguous substring of the (lowercased, whitespace-collapsed) text.
-
-    The old version used 4+ char tokens with substring matching and threshold
-    0.75 — that produced false positives like matching every economics paper
-    to whichever bib entry had the most-common vocabulary. This one is
-    conservative on purpose; when it says True, it's an actual match.
-    """
     if not title or not text:
         return False
     title_lower = re.sub(r"\s+", " ", title.lower())
@@ -275,7 +212,6 @@ def _fuzzy_title_match(title: str, text: str, threshold: float = 0.9) -> bool:
     hits = sum(1 for t in tokens if re.search(rf"\b{re.escape(t)}\b", text_lower))
     if (hits / len(tokens)) < threshold:
         return False
-    # 4-word verbatim chunk
     words = re.findall(r"[a-z0-9]+", title_lower)
     for i in range(len(words) - 3):
         chunk = " ".join(words[i:i + 4])
@@ -285,56 +221,34 @@ def _fuzzy_title_match(title: str, text: str, threshold: float = 0.9) -> bool:
 
 
 def match_bib_entry(pdf_path: Path, text: str, sidecar: list) -> Optional[dict]:
-    """Match a PDF to a bib entry with a strict cascade:
-      1. Exact filename-stem == bib key
-      2. Parse filename via Author_YYYY convention → find bib entry with same
-         first-author surname AND same year (this is the load-bearing path
-         for corpora that already follow Author_YYYY naming).
-      3. Strict fuzzy title: high threshold + verbatim 4-word chunk +
-         first-surname + year both present in text (guards against generic
-         economics vocabulary inflating the match).
-    Returns the matching entry dict, or None.
-    """
     stem = pdf_path.stem
     stem_lower = stem.lower()
 
-    # 1) exact key match
     for e in sidecar:
         if e["key"].lower() == stem_lower:
             return e
 
-    # 2) filename Author_YYYY → bib first-surname + year
     fn = parse_filename_heuristic(pdf_path)
     if fn:
         fn_year = fn["year"]
-        # normalise filename name-part to lowercase, drop EtAl / & markers to
-        # match against bib first-surname
         fn_name = fn["name"].lower()
-        fn_name_first = re.sub(r"etal.*|&.*", "", fn_name)  # 'acemogluetal' → 'acemoglu'
+        fn_name_first = re.sub(r"etal.*|&.*", "", fn_name)
         candidates = []
         for e in sidecar:
             surname = (e.get("first_surname") or "").lower()
             year = (e.get("year") or "").strip()
             if not surname or year != fn_year:
                 continue
-            # match if filename first-name starts with surname, OR surname
-            # contains the filename name (handles hyphenated / camelCase)
             if fn_name_first.startswith(surname) or surname.startswith(fn_name_first):
                 candidates.append(e)
-        # If exactly one candidate, take it. If several, disambiguate via
-        # verbatim title chunk match against text.
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
             for e in candidates:
                 if _fuzzy_title_match(e["title"], text, threshold=0.85):
                     return e
-            # Ambiguous — return the first (keeps behaviour deterministic
-            # even if not ideal; the downstream doc_id collision logic will
-            # surface duplicates).
             return candidates[0]
 
-    # 3) strict fuzzy title (surname + year in text AND title in text)
     text_lower = text.lower()
     for e in sidecar:
         surname = (e.get("first_surname") or "").lower()
@@ -348,28 +262,18 @@ def match_bib_entry(pdf_path: Path, text: str, sidecar: list) -> Optional[dict]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Filename heuristic
-# ---------------------------------------------------------------------------
-
 _FILENAME_AUTHOR_YEAR_RE = re.compile(
     r"^(?P<name>[A-Za-z][A-Za-z0-9&_.\-]*?)_(?P<year>\d{4})[a-z]?$"
 )
 
 
 def parse_filename_heuristic(pdf_path: Path) -> Optional[dict]:
-    """Detect Author_YYYY / AuthorEtAl_YYYY / Author1&Author2_YYYY conventions.
-    Returns {'name': ..., 'year': ...} or None."""
     stem = pdf_path.stem
     m = _FILENAME_AUTHOR_YEAR_RE.match(stem)
     if not m:
         return None
     return {"name": m.group("name"), "year": m.group("year")}
 
-
-# ---------------------------------------------------------------------------
-# LLM extraction
-# ---------------------------------------------------------------------------
 
 _LLM_PROMPT = """You are extracting bibliographic metadata from the first pages of an academic paper.
 
@@ -391,10 +295,6 @@ Return ONLY the JSON object. No commentary."""
 
 def llm_extract_metadata(text: str, model: Optional[str] = None,
                           timeout: float = 60.0) -> Optional[dict]:
-    """Call the configured LLM (Ollama) to extract metadata. Returns the
-    parsed dict or None on any error. Model defaults to
-    RRR_INGEST_MODEL env or 'mistral-small:24b'.
-    """
     if not text or len(text.strip()) < 50:
         return None
     try:
@@ -422,15 +322,7 @@ def llm_extract_metadata(text: str, model: Optional[str] = None,
         return None
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
 def validate_extraction(authors: list, year: str, text: str) -> tuple:
-    """Returns (is_valid, reasons_list). Requires:
-       - year is a 4-digit string and appears in text
-       - first author's surname appears in text
-    """
     reasons = []
     year_s = str(year or "").strip()
     if not year_s or not re.match(r"^\d{4}$", year_s):
@@ -449,21 +341,10 @@ def validate_extraction(authors: list, year: str, text: str) -> tuple:
     return (len(reasons) == 0, reasons)
 
 
-# ---------------------------------------------------------------------------
-# doc_id generation
-# ---------------------------------------------------------------------------
-
 _LATIN_PARTICLES = {"van", "von", "de", "del", "der", "la", "le", "du", "di", "da"}
 
 
 def _clean_surname_token(s: str) -> str:
-    """Strip non-letters, drop 'et al' markers, lowercase-known-particles.
-
-    v15.8.1: bib may pass 'Van Zanden' (capital V because BibTeX preserved
-    case); the RRR doc_id convention uses lowercase particles: 'vanZanden'.
-    We split on whitespace, lowercase any token in _LATIN_PARTICLES, then
-    concatenate. 'Van Zanden' → 'vanZanden'; 'de La Croix' → 'delaCroix'.
-    """
     if not s:
         return ""
     s = re.sub(r"\bet\s+al\.?", "", s, flags=re.IGNORECASE)
@@ -510,10 +391,6 @@ def generate_doc_id(surnames: list, year: str, existing: set = None) -> str:
     return f"{base}_{n}"
 
 
-# ---------------------------------------------------------------------------
-# Cascade orchestrator
-# ---------------------------------------------------------------------------
-
 def _fill_from_bib(meta: ExtractedMeta, entry: dict) -> None:
     meta.title = entry["title"]
     meta.year = entry["year"]
@@ -552,11 +429,9 @@ def cascade(pdf_path: Path,
              use_crossref: bool = True,
              use_openalex: bool = True,
              llm_model: Optional[str] = None) -> ExtractedMeta:
-    """Run the full cascade on ONE PDF. Returns an ExtractedMeta."""
     existing_doc_ids = set(existing_doc_ids or ())
     meta = ExtractedMeta(pdf_path=str(pdf_path.resolve()))
 
-    # Step 1: content hash (also basic sanity check)
     try:
         meta.content_sha1 = content_sha1(pdf_path)
     except Exception as e:
@@ -565,7 +440,6 @@ def cascade(pdf_path: Path,
         meta.notes = f"content_sha1_failed:{e}"
         return meta
 
-    # Step 2: page text
     text = extract_pages_text(pdf_path, max_pages=3)
     if len(text.strip()) < 200:
         meta.confidence = "low"
@@ -574,11 +448,8 @@ def cascade(pdf_path: Path,
         meta.lang = detect_pdf_language(text)
         return meta
 
-    # v15.12: detect body-text language once, before any early-return path so
-    # every cascade outcome (bib_sidecar / crossref / llm / etc.) carries it.
     meta.lang = detect_pdf_language(text)
 
-    # Step 3: bib sidecar
     if sidecar_bib_entries:
         entry = match_bib_entry(pdf_path, text, sidecar_bib_entries)
         if entry:
@@ -588,12 +459,10 @@ def cascade(pdf_path: Path,
             meta.doc_id = generate_doc_id(_bib_surnames_list(entry), entry["year"], existing_doc_ids)
             return meta
 
-    # Step 4: filename heuristic — hint only, not final metadata
     fn = parse_filename_heuristic(pdf_path)
     if fn:
         meta.notes = f"filename_hint:{fn['name']}_{fn['year']}"
 
-    # Step 5: DOI + CrossRef
     doi = find_doi(text)
     if doi and use_crossref:
         cr = crossref_lookup(doi)
@@ -611,7 +480,6 @@ def cascade(pdf_path: Path,
             meta.doc_id = generate_doc_id(_surnames_from_meta(meta), meta.year, existing_doc_ids)
             return meta
 
-    # Step 6: LLM extraction
     if use_llm:
         llm = llm_extract_metadata(text, model=llm_model)
         if llm and (llm.get("authors") or llm.get("year")):
@@ -644,7 +512,6 @@ def cascade(pdf_path: Path,
             if reasons:
                 meta.notes = ((meta.notes + "; ") if meta.notes else "") + "llm_" + ",".join(reasons)
 
-            # Optional CrossRef upgrade if LLM gave a DOI
             if doi and use_crossref and valid:
                 cr = crossref_lookup(doi)
                 if cr:
@@ -656,7 +523,6 @@ def cascade(pdf_path: Path,
                         meta.title = fields["title"]
                     meta.source = "llm+crossref"
 
-            # Optional OpenAlex title upgrade if venue still missing
             if valid and use_openalex and not meta.venue and meta.title:
                 oa = openalex_by_title(meta.title)
                 if oa:
@@ -671,15 +537,10 @@ def cascade(pdf_path: Path,
             meta.doc_id = generate_doc_id(short_names, year, existing_doc_ids)
             return meta
 
-    # All extractors failed
     meta.confidence = "failed"
     meta.source = "none"
     return meta
 
-
-# ---------------------------------------------------------------------------
-# Corpus-wide ingest
-# ---------------------------------------------------------------------------
 
 def ingest_corpus(corpus_dir: Path,
                    output_csv: Optional[Path] = None,
@@ -689,9 +550,6 @@ def ingest_corpus(corpus_dir: Path,
                    use_openalex: bool = True,
                    llm_model: Optional[str] = None,
                    progress: bool = True) -> list:
-    """Walk corpus_dir for *.pdf; run cascade on each; write metadata.csv.
-    Returns list of ExtractedMeta.
-    """
     pdfs = sorted(corpus_dir.glob("*.pdf"))
     if progress:
         print(f"[ingest] found {len(pdfs)} PDFs in {corpus_dir}")

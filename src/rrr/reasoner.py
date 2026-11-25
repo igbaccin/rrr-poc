@@ -4,34 +4,25 @@ import os
 import re
 import unicodedata
 from rrr.utils import ensure_dir, env_int
-# v15.12: patch ollama.chat to disable qwen3 thinking mode BEFORE any stage
-# runs. Every `import ollama` in the package resolves to the same module
-# object, so this one call covers all ~30 call sites.
 from rrr.llm import install as _install_llm_shim
 _install_llm_shim()
-# The corpus-level outline assigns free-text structural relations across the
-# admitted literature. The retired per-paper stance path is no longer part of
-# this module.
 from rrr.outline import build_outline
 from rrr.metrics import RunMetrics
 from rrr.manifest import write_run_manifest
 from rrr.paths import runs_path, stage_cache_path, stage_cache_enabled
 from rapidfuzz import fuzz
 
-# The active reasoner handles document admission, claim extraction, and the
-# corpus-level outline. Model selection follows the shared reasoner fallback.
 _MODEL = os.environ.get("RRR_REASONER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
 _KEEP_ALIVE = "30m"
 
 
-from rrr.render import _build_author_year_lookup, _collect_cited_docs  # noqa: E402
+from rrr.render import _build_author_year_lookup, _collect_cited_docs
 
 
 def _reference_docids(
     review_text, allowed_docs, author_year_to_docid,
     writer_docids=(), citations_manifest=None,
 ):
-    """Reconcile the review text with the writer's citation artifacts."""
     cited = _collect_cited_docs(review_text, allowed_docs, author_year_to_docid)
     cited.update(did for did in writer_docids if did in allowed_docs)
     for citation in (citations_manifest or {}).get("citations", []):
@@ -42,14 +33,9 @@ def _reference_docids(
 
 
 def _clean_latex(s: str) -> str:
-    """Clean LaTeX artifacts from BibTeX strings."""
     if not s:
         return s
 
-    # BibTeX commonly protects an accented letter with braces. Convert the
-    # commands while their arguments are present, then remove grouping braces.
-    # One or more backslashes also covers metadata that passed through an
-    # additional escaping layer.
     combining_marks = {
         "'": "\N{COMBINING ACUTE ACCENT}",
         "`": "\N{COMBINING GRAVE ACCENT}",
@@ -74,14 +60,11 @@ def _clean_latex(s: str) -> str:
     s = re.sub(r"\\+ss\b", "ß", s)
     s = s.replace('{', '').replace('}', '')
 
-    # Preserve the former fallback for unsupported alphabetic commands and
-    # stray accent markers after converting recognized commands.
     s = re.sub(r"\\+['`\"^~cv]", "", s)
     s = re.sub(r'\\+([a-zA-Z])', r'\1', s)
     return s.strip()
 
 def _cite_harvard(row):
-    """Format citation in Harvard (LUSEM) style."""
     def s(x):
         val = str(x).strip() if x is not None else ""
         return "" if val.lower() == "nan" else val
@@ -162,14 +145,12 @@ def _doc_admit_signature(topic: str, probes: list, doc_ids: list, settings: dict
 
 
 def _doc_admit_cache_path(sig: str):
-    # v15.16: workspace-level (was runs_path("cache", ...) — per-run
-    # under the v15.9 minted-run-id layout, so replay never worked).
     return stage_cache_path("doc_admit", f"{sig}.json")
 
 
 def _load_doc_admit_cache_obj(sig: str):
     if not stage_cache_enabled():
-        return None  # RRR_STAGE_CACHE=0: cold-run measurement mode
+        return None
     try:
         with open(_doc_admit_cache_path(sig), encoding="utf-8") as f:
             obj = json.load(f)
@@ -323,18 +304,8 @@ def _write_json_run(name: str, obj):
 
 
 def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int, metrics=None) -> list:
-    """v8 (R8): rank merged candidates by Reciprocal Rank Fusion across probes
-    instead of max(bm25_score). Pages that rank moderately on every probe now
-    outrank pages that spike on one probe. On multi-aspect topics (where
-    different probes target distinct sub-claims that rarely co-occur on a
-    single page), this preserves breadth-of-probe-agreement as a ranking
-    signal. bm25_score is retained as a tiebreaker for downstream consumers.
-    Constant k=60 is the textbook RRF default.
-    """
     merged = {}
     per_probe_topk = max(1, topk)
-    # v13: RRR_RRF_K retired; k=60 is the textbook RRF default and v8 R8 audit
-    # decision baked into the source.
     rrf_k = 60.0
     for probe in probes:
         candidates = retrieve_fn(probe, topk=per_probe_topk, doc_id=doc_id)
@@ -357,12 +328,8 @@ def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int,
                     existing.setdefault("matched_probes", []).append(probe)
                 if score > 0.0:
                     existing["rrf_score"] = float(existing.get("rrf_score", 0.0)) + rrf_contrib
-                # keep bm25_score as the max for tiebreaking and downstream
-                # diagnostic consumers that still look at it directly.
                 if score > float(existing.get("bm25_score", 0.0) or 0.0):
                     existing["bm25_score"] = score
-    # small bonus for breadth of probe agreement, capped so it can never
-    # dominate a strong single-probe match
     for item in merged.values():
         item["rrf_score"] = float(item.get("rrf_score", 0.0)) + 0.02 * len(set(item.get("matched_probes", [])))
     ranked = sorted(
@@ -374,9 +341,6 @@ def _retrieve_doc_with_probes(retrieve_fn, doc_id: str, probes: list, topk: int,
 
 
 def _layered_t2_inner(args, meta_path):
-    """
-    Inner implementation of layered_t2.
-    """
     import os, json, threading
     import pandas as pd
     from rrr.retrieve import retrieve
@@ -387,37 +351,22 @@ def _layered_t2_inner(args, meta_path):
     topic = args.topic
     metrics = RunMetrics("T2_LAYERED_GLOBAL", topic)
 
-    # v15.11: language routing. CLI sets these before importing us; we
-    # surface them on metrics for observability. Absence means the pipeline
-    # is running via a non-CLI entry point (test/battery script) — fall back
-    # to English so the majority path keeps its zero-directive prompts.
     topic_lang = os.environ.get("RRR_TOPIC_LANG", "en")
     selected_model = os.environ.get("RRR_MODEL", _MODEL)
     metrics.set("topic_lang", topic_lang)
     metrics.set("selected_model", selected_model)
 
-    # v15.9 (#4): mint a per-invocation run_id so this call's artifacts land
-    # in runs/<utc>_<slug>/ rather than the flat runs/ folder — concurrent
-    # runs on the same corpus no longer collide.
-    #
-    # Env overrides for the smoke harness / battery:
-    #   RRR_RUN_ID=<slug>  → use this exact slug (harness knows where to look)
-    #   RRR_RUN_ID=""      → force flat layout (pre-v15.9 behaviour)
-    #   unset              → mint one from timestamp + topic slug
     from rrr.paths import mint_run_id, set_default_run_id
     run_id_env = os.environ.get("RRR_RUN_ID")
     if run_id_env is None:
         run_id = mint_run_id(topic)
     elif run_id_env == "":
-        run_id = None  # explicit opt-out: flat runs/ layout
+        run_id = None
     else:
         run_id = run_id_env
     set_default_run_id(run_id)
     metrics.set("run_id", run_id or "")
 
-    # v8 (R12): fire-and-forget prewarm so the Ollama cold-load (~7s on first
-    # call after model swap) overlaps with metadata loading + planning instead
-    # of being charged to the planning stage. Background thread; no blocking.
     def _prewarm_ollama():
         try:
             import ollama
@@ -450,22 +399,11 @@ def _layered_t2_inner(args, meta_path):
     metrics.set("metadata_path", str(meta_path))
     metrics.set("docs_total", len(all_doc_ids))
 
-    # v15.9 (#1): populate the render-time metadata → author label lookup so
-    # in-text citations and reference-list rendering can use metadata.csv as
-    # the source of truth instead of parsing doc_ids via regex. When a
-    # metadata row lacks display_label / first_author_surname columns, the
-    # seed values come from the legacy regex — so the 50-paper hand-curated
-    # corpus produces byte-identical output.
     from rrr.render import set_metadata_labels
     n_labels = set_metadata_labels(df.to_dict(orient="records"))
     metrics.set("metadata_labels_loaded", n_labels)
     print(f"[Reasoner] loaded {n_labels} metadata-driven author labels")
 
-    # v15.9 (#5): corpus_fingerprint namespaces the claim cache; content_sha1
-    # (per paper) becomes the primary cache key when populated by the ingest
-    # cascade. Existing metadata.csv without those columns falls back to
-    # doc_id keying (legacy flat cache is still readable via fallback path
-    # in stance._claim_cache_path).
     from rrr.stance import compute_corpus_fingerprint
     corpus_fingerprint = compute_corpus_fingerprint(df)
     metrics.set("corpus_fingerprint", corpus_fingerprint)
@@ -479,13 +417,6 @@ def _layered_t2_inner(args, meta_path):
         _content_sha_by_docid = {}
     metrics.set("content_sha1_populated", len(_content_sha_by_docid))
 
-    # v15.11/v15.12: corpus language distribution + dominant corpus language.
-    # The dominant corpus language is the retrieval/pivot language: the
-    # planner emits BM25 probes in it (translating a cross-language topic),
-    # internal reasoning runs in it, and the writer translates the final
-    # review from it into the topic language. When metadata.csv has no lang
-    # column we assume the corpus is English (the historical default) so the
-    # feature is fully backward-compatible.
     from collections import Counter
     if "lang" in df.columns:
         corpus_lang_dist = dict(Counter(
@@ -494,7 +425,6 @@ def _layered_t2_inner(args, meta_path):
         ))
     else:
         corpus_lang_dist = {"en": len(all_doc_ids)}
-    # Dominant corpus language = most frequent non-unknown lang, default en.
     _ranked = sorted(
         ((k, v) for k, v in corpus_lang_dist.items() if k and k != "unknown"),
         key=lambda kv: kv[1], reverse=True,
@@ -504,7 +434,6 @@ def _layered_t2_inner(args, meta_path):
     metrics.set("corpus_lang", corpus_lang)
     cross_lang = corpus_lang != topic_lang
     metrics.set("cross_lang_retrieval", cross_lang)
-    # Expose the pivot language to prompt builders (writer output contract).
     os.environ["RRR_CORPUS_LANG"] = corpus_lang
     if cross_lang:
         print(f"[Reasoner] cross-language: topic_lang={topic_lang} "
@@ -514,8 +443,6 @@ def _layered_t2_inner(args, meta_path):
     ensure_dir(str(runs_path()))
     ensure_dir(str(runs_path("layered_docs")))
 
-    # v15.14: env_int — a malformed env value degrades to the default with a
-    # warning instead of an unhandled ValueError mid-run.
     PER_DOC_TOPK = env_int("RRR_PER_DOC_TOPK", 30)
     MAX_SENTS_PER_PAGE = env_int("RRR_MAX_SENTS_PAGE", 8)
     MIN_CHARS = env_int("RRR_MIN_SENT_CHARS", 20)
@@ -523,8 +450,6 @@ def _layered_t2_inner(args, meta_path):
     GLOBAL_MIN_DOCS = env_int("RRR_GLOBAL_MIN_DOCS", 5)
     MD_QUOTE_CAP = env_int("RRR_MD_QUOTE_CAP", 8)
     DOC_BUDGET = env_int("RRR_DOC_BUDGET", 24)
-    # v13: RRR_DOC_ADMIT_CACHE retired (always on). The cache is cheap to
-    # write, the v8 default was 1, and no battery script overrode it.
     DOC_ADMIT_CACHE = True
     DOC_ADMIT_REPLAY = os.environ.get("RRR_DOC_ADMIT_REPLAY", "0") == "1"
     EV_CAP = env_int("RRR_EV_PER_DOC_CAP", 8)
@@ -540,12 +465,6 @@ def _layered_t2_inner(args, meta_path):
     score_query = " ".join(plan_obj.get("keywords_must", []) + plan_obj.get("keywords_any", []))
     score_query = score_query.strip() or topic
     planner_mode = plan_obj.get("planner_meta", {}).get("mode", "unknown")
-    # v8 (R9): when the LLM planner produced real phrase probes, do NOT inject
-    # the bag-of-words concatenation as an additional probe. In baseline runs
-    # the synthetic probe dominated max(token_set_ratio) scoring because it had
-    # the most surface tokens, making the LLM-derived phrase probes do almost
-    # no work. The synthetic remains as a fallback only when the planner fell
-    # back to the heuristic mode.
     if planner_mode == "llm":
         probes = _plan_probes(plan_obj, topic, "")
     else:
@@ -626,9 +545,6 @@ def _layered_t2_inner(args, meta_path):
             if not txt:
                 page_sentence_counts[int(c.get("page", 0) or 0)] = 0
                 continue
-            # v13.2 FIX-SNIPPET-WIDEN: out_stats receives the per-page count
-            # of context sentences stitched on (prev+next) so we can tally the
-            # `evidence_context_sentences_added` run-level metric.
             sent_stats = {}
             scored_sents = select_sentences(
                 txt,
@@ -719,16 +635,8 @@ def _layered_t2_inner(args, meta_path):
         }
 
     def enrich_doc(doc):
-        # v15: per-doc enrichment SHRINKS to claim extraction only. The fused
-        # stance+mechanism call (v14.4) is gone — corpus-level outline now
-        # handles clustering and the per-cluster posture replaces per-doc
-        # stance. Claim extraction stays (cached per paper, content-keyed) so
-        # the outline.cluster_papers call has accurate inputs.
         did = doc["doc_id"]
         from rrr.stance import extract_paper_claim
-        # v15.9 (#5): pass corpus_fingerprint + content_sha1 (when populated)
-        # so this per-paper cache entry lands in the corpus-namespaced dir
-        # keyed by PDF content, not by doc_id string.
         claim_info = extract_paper_claim(
             did, metrics=metrics,
             corpus_fingerprint=corpus_fingerprint,
@@ -794,20 +702,6 @@ def _layered_t2_inner(args, meta_path):
     metrics.set("topic_fit_selected_probe_coverage", topic_fit.get("selected_probe_coverage"))
     print(f"[Layered-T2] admitted={len(admitted_docs)} selected_for_llm={len(selected_docs)} budget={DOC_BUDGET}")
 
-    # v15.10 (#3+#4): early Stage 0 precheck BEFORE per_document_sweep. The
-    # sweep's ~5s/doc claim-extraction LLM call is by far the most expensive
-    # pre-writer stage on cold cache (~4 min for 50 docs). Stage 0 only reads
-    # doc_id + citation, both available from the metadata refs dict without
-    # needing claims. Running precheck here lets a genuine refusal skip the
-    # sweep entirely; PROCEED falls through and the late build_outline() call
-    # inside the outline stage hits the same-signature cache with zero LLM
-    # cost. Also splits the previously-conflated 'outline_failed' refusal
-    # reason into:
-    #   - no_admitted_docs      (BM25/admission produced 0 docs)
-    #   - stage0_llm_failed     (precheck LLM error or malformed JSON)
-    #   - corpus_off_topic      (precheck returned REFUSE)
-    # and leaves 'outline_failed' meaning only 'Stage 1 clustering returned
-    # nothing' for the late-fall-through case.
     if not selected_docs:
         print("[Layered-T2] refusal=no_admitted_docs (BM25 admitted zero docs)")
         write_run("T2_LAYERED_GLOBAL", topic,
@@ -863,8 +757,6 @@ def _layered_t2_inner(args, meta_path):
             "different intellectual domains with no honest scholarly path.")
         print(f"[Layered-T2] refusal=corpus_off_topic (Stage 0 early precheck)")
         print(f"[Layered-T2] reason: {refusal_explanation}")
-        # Persist a minimal outline_plan.json so debugging matches the late
-        # refusal path's artefacts.
         _early_plan = {
             "refused": True,
             "refusal_reason": "corpus_off_topic",
@@ -904,8 +796,6 @@ def _layered_t2_inner(args, meta_path):
         )
         metrics.save()
         return
-    # PROCEED — fall through. The late build_outline precheck call hits the
-    # same-signature cache (sorted titles) with zero LLM cost.
 
     doc_summaries = []
     with metrics.stage("per_document_sweep"):
@@ -916,10 +806,6 @@ def _layered_t2_inner(args, meta_path):
                 if res:
                     doc_summaries.append(res)
 
-    # v15: assign evidence IDs and persist per-doc artefacts FIRST so the
-    # outline builder (and the writer downstream) can reference stable
-    # evidence anchors. Outline is built next from the persisted doc
-    # summaries (claim + quotes).
     evidence_id_count = _assign_evidence_ids(doc_summaries)
     metrics.set("evidence_ids_assigned", evidence_id_count)
 
@@ -944,17 +830,10 @@ def _layered_t2_inner(args, meta_path):
     metrics.set("topic_fit_represented_share", topic_fit.get("represented_share"))
     print(f"[Layered-T2] per-document sweep complete: {kept} docs summarised")
 
-    # v15: corpus-level OUTLINE replaces per-paper stance + within-stance
-    # cluster synthesis. Three LLM calls (Stage 1 cluster + Stage 2 posture
-    # per cluster + Stage 3 order) produce an outline_plan with topic_shape,
-    # clusters, postures, and the section order for the writer.
     print("[Layered-T2] building corpus-level outline (v15)...")
     with metrics.stage("outline"):
         outline_plan = build_outline(topic, doc_summaries, metrics=metrics)
     if outline_plan is None:
-        # v15.10: early precheck already caught Stage 0 failures and empty
-        # doc_summaries, so 'outline_failed' now means Stage 1 clustering
-        # returned no valid plan. Renamed for observability.
         print("[Layered-T2] refusal=stage1_clustering_failed (Stage 1 clustering LLM returned no valid plan)")
         write_run("T2_LAYERED_GLOBAL", topic,
                   {"docs_seen": len(all_doc_ids), "docs_represented": kept},
@@ -971,11 +850,6 @@ def _layered_t2_inner(args, meta_path):
         metrics.save()
         return
 
-    # v15.1.0: Stage 0 corpus-fit refusal. The precheck call has explicit
-    # authority to decline a (topic, corpus) pair that has no honest
-    # scholarly path between them. This refusal fires BEFORE clustering and
-    # is independent of unassigned_share (which the inclusive-clustering
-    # prompt was structurally unable to drive above zero).
     if outline_plan.get("refused"):
         refusal_reason = outline_plan.get("refusal_reason", "corpus_off_topic")
         refusal_explanation = (
@@ -986,7 +860,6 @@ def _layered_t2_inner(args, meta_path):
         )
         print(f"[Layered-T2] refusal={refusal_reason} (Stage 0 precheck)")
         print(f"[Layered-T2] reason: {refusal_explanation}")
-        # Persist the precheck plan for debugging.
         try:
             with open(runs_path("outline_plan.json"), "w", encoding="utf-8") as _f:
                 json.dump(outline_plan, _f, indent=2, ensure_ascii=False)
@@ -1010,10 +883,6 @@ def _layered_t2_inner(args, meta_path):
         metrics.save()
         return
 
-    # Propagate cluster_id and relation onto each doc_summary so existing
-    # downstream code that walks doc_summaries (writer's evidence id map,
-    # citation validators) keeps working. Unassigned docs get cluster_id=""
-    # and relation="unassigned".
     cluster_id_by_doc = {}
     relation_by_doc = {}
     for c in outline_plan.get("clusters", []):
@@ -1025,9 +894,6 @@ def _layered_t2_inner(args, meta_path):
         d["cluster_id"] = cluster_id_by_doc.get(did, "")
         d["relation"] = relation_by_doc.get(did, "unassigned")
 
-    # Surface relation distribution + topic shape on metrics for smoke
-    # inspection. The smoke contract: AJR/Nunn must land in
-    # `upstream_of_topic_cause` (not `rival_to_topic_cause`).
     metrics.set("outline_topic_shape", outline_plan.get("topic_shape"))
     metrics.set("relation_distribution", outline_plan.get("relation_distribution"))
     metrics.set("outline_unassigned_share", outline_plan.get("unassigned_share"))
@@ -1037,32 +903,18 @@ def _layered_t2_inner(args, meta_path):
           f"unassigned_share={outline_plan.get('unassigned_share')} "
           f"relations={outline_plan.get('relation_distribution')}")
 
-    # Persist the outline plan to disk REGARDLESS of refusal so future
-    # debugging has the cluster/relation/unassigned breakdown. The full
-    # ledger writes later; this is a small standalone dump.
     try:
         with open(runs_path("outline_plan.json"), "w", encoding="utf-8") as _f:
             json.dump(outline_plan, _f, indent=2, ensure_ascii=False)
     except Exception:
         pass
 
-    # v15: corpus-fit refusal — fires when too many admitted papers could not
-    # be clustered into any stream. This is the structural analogue of
-    # v14.4's tangential-fraction refusal but driven by the outline's own
-    # unassigned bucket, which is a much sharper signal than per-paper
-    # stance because Stage 1 sees the whole corpus at once. Threshold knob:
-    # RRR_UNASSIGNED_REFUSAL_THRESHOLD. v15.0.1 default raised from 0.5 to
-    # 0.7 — the v15.0 INST smoke had unassigned_share=0.58 on a clearly
-    # on-topic corpus because Stage 1's prompt was too eager to dump
-    # borderline papers; the v15b inclusive-clustering prompt + a more
-    # permissive threshold gives the pipeline more room to proceed on
-    # legitimately-on-topic corpora. Disable with >=1.0.
     try:
         unassigned_threshold = float(os.environ.get("RRR_UNASSIGNED_REFUSAL_THRESHOLD", "0.7"))
     except ValueError:
         unassigned_threshold = 0.7
     if unassigned_threshold <= 0.0 or unassigned_threshold > 1.0:
-        unassigned_threshold = 1.01  # effectively disabled
+        unassigned_threshold = 1.01
     unassigned_share = float(outline_plan.get("unassigned_share") or 0.0)
     total_admitted = outline_plan.get("admitted_total") or kept
     if unassigned_share >= unassigned_threshold and total_admitted >= 5:
@@ -1114,14 +966,6 @@ def _layered_t2_inner(args, meta_path):
 
     import collections
     def _render_claim_verdict(topic, doc_summaries, meta_n_total, outline_plan, refs_by_docid):
-        """v15.9 (T1 revival): render a claim-evaluator verdict.
-
-        Reuses everything the T2 pipeline produced up to Stage 2 posture,
-        but stops before the writer. Output: a markdown artifact grouping
-        papers by their relation to the claim, with per-paper claim +
-        top-quote so a reader can grade the corpus's aggregate stance
-        without paying for the ~6-min writer run.
-        """
         clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
         doc_by_id = {d.get("doc_id"): d for d in doc_summaries}
         relations = outline_plan.get("relation_distribution", {}) or {}
@@ -1129,7 +973,6 @@ def _layered_t2_inner(args, meta_path):
         topic_cause = outline_plan.get("topic_cause", "") or ""
         topic_outcome = outline_plan.get("topic_outcome", "") or ""
 
-        # Group by relation, preserving ordered_cluster_ids order within each
         by_relation = {}
         for cid in outline_plan.get("ordered_cluster_ids", []) or list(clusters_by_id.keys()):
             c = clusters_by_id.get(cid)
@@ -1138,9 +981,6 @@ def _layered_t2_inner(args, meta_path):
             rel = c.get("relation", "adjacent")
             by_relation.setdefault(rel, []).append(c)
 
-        # Ordering: supporting first, then rival, then upstream/downstream,
-        # then adjacent, then anything else. Makes the verdict readable
-        # top-to-bottom as "the claim is supported by X, contested by Y..."
         rel_order = [
             "same_as_topic_cause", "same_as_topic_outcome",
             "supports", "supports_claim",
@@ -1166,7 +1006,6 @@ def _layered_t2_inner(args, meta_path):
         ordered_relations = [r for r in rel_order if r in by_relation and not seen.add(r)]
         ordered_relations += [r for r in by_relation if r not in seen]
 
-        # Aggregate counts across DOCS (not clusters) for the headline verdict
         docs_by_rel = {rel: 0 for rel in by_relation}
         for cid, c in clusters_by_id.items():
             docs_by_rel.setdefault(c.get("relation", "adjacent"), 0)
@@ -1240,8 +1079,6 @@ def _layered_t2_inner(args, meta_path):
 
 
     def _render_review_narrative(topic, doc_summaries, meta_n_total, outline_plan):
-        # v15: narrative summary is the outline plan rendered as markdown.
-        # No stance buckets. Sections are streams ordered by Stage 3.
         clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
         doc_by_id = {d.get("doc_id"): d for d in doc_summaries}
         lines = []
@@ -1287,8 +1124,6 @@ def _layered_t2_inner(args, meta_path):
 
     ensure_dir(str(runs_path()))
 
-    # v15.9 (#6): propagate doc-level provenance into the ledger so the
-    # writer can build citations.json without re-reading metadata.csv.
     _pdf_paths_by_docid = {}
     if "pdf_path" in df.columns:
         _pdf_paths_by_docid = {
@@ -1323,19 +1158,12 @@ def _layered_t2_inner(args, meta_path):
             "docs_selected_for_llm": len(selected_docs),
         },
         "docs": doc_summaries,
-        # v15.9 (#6): provenance data for citations.json
         "pdf_paths_by_docid": _pdf_paths_by_docid,
         "pdf_page_offsets": _pdf_page_offsets,
         "dois_by_docid": _dois_by_docid,
-        # v15: outline_plan is now the corpus-level structure the writer
-        # consumes. It replaces the v11-C cluster_syntheses keyed by
-        # "stance::cluster_label" — clusters are top-level, not nested under
-        # discrete stance buckets.
         "outline_plan": outline_plan,
     }
     with metrics.stage("write_ledger"):
-        # v15.14: atomic via save_json — the ledger is the writer's input; a
-        # crash mid-write left a truncated file that broke any replay.
         from rrr.utils import save_json as _save_json_atomic
         _save_json_atomic(ledger_data, runs_path("review_ledger.json"))
         _save_json_atomic(plan_obj, runs_path("plan.json"))
@@ -1349,8 +1177,6 @@ def _layered_t2_inner(args, meta_path):
                     f"\n**Coverage:** {kept} of {len(all_doc_ids)} documents.\n",
                     f"\n**Topic shape:** {outline_plan.get('topic_shape','?')}\n",
                     "\n---\n"]
-        # v15: appendix groups docs by their cluster + relation, in the
-        # outline's ordered_cluster_ids. Unassigned docs are listed last.
         clusters_by_id = {c["cluster_id"]: c for c in outline_plan.get("clusters", [])}
         doc_by_id = {d.get("doc_id"): d for d in doc_summaries}
         for cid in outline_plan.get("ordered_cluster_ids", []) or list(clusters_by_id.keys()):
@@ -1387,18 +1213,10 @@ def _layered_t2_inner(args, meta_path):
         with open(runs_path("T2_review.md"), "w", encoding="utf-8") as f:
             f.write("\n".join(md_lines))
 
-    # v13: RRR_WRITE_REVIEW retired. The writer is the headline architecture
-    # output; the narrative-only short summary is preserved but only printed
-    # when narrative_only is requested. Composition now runs unconditionally
-    # so the composed review always lands on disk.
     print("\n[Layered-T2] wrote: runs/review_narrative.md and runs/review_ledger.json")
     if not getattr(args, "narrative_only", False):
         print("[Layered-T2] appendix: runs/T2_review.md")
 
-    # v15.9 (T1 revival): claim-eval mode. Stop after Stage 0/1/2 + ledger
-    # write. Emit runs/claim_verdict.md with per-cluster + aggregate.
-    # Reuses all upstream invariants (retrieval, admission, quote-verify)
-    # but skips the ~6-min writer + validation chain.
     if getattr(args, "t1_only", False) or getattr(args, "claim_only", False):
         try:
             verdict_md = _render_claim_verdict(topic, doc_summaries, len(all_doc_ids), outline_plan, refs)
@@ -1429,10 +1247,7 @@ def _layered_t2_inner(args, meta_path):
         except Exception as e:
             print(f"[Layered-T1] verdict render failed, falling through to T2: {e}")
 
-    if True:  # v13: writer composition is unconditional (was RRR_WRITE_REVIEW gate)
-        # v14: RRR_WRITER_MODE dispatches between the single-pass (default) and
-        # chunked writer paths. The chunked path is preserved as a measurement
-        # fallback so v13.1.1 5-topic smokes remain reproducible.
+    if True:
         from rrr.writer import compose_review
         print("[Layered-T2] composing long-form literature review...")
         writer_error_msg = None
@@ -1535,11 +1350,6 @@ def _layered_t2_inner(args, meta_path):
                 for i, rline in enumerate(ref_lines, start=1):
                     f.write(f"{i}. {rline}\n")
 
-            # v15.9: append the reference list to review_composed.md so the
-            # single-file artifact is self-contained (the reader doesn't need
-            # to open a second file to see what was cited). The separate
-            # review_references.txt is preserved for backward compat with
-            # scripts that read it directly.
             composed_md = runs_path("review_composed.md")
             if composed_md.is_file():
                 try:
@@ -1557,10 +1367,6 @@ def _layered_t2_inner(args, meta_path):
             writer_error_msg = str(e)
 
     metrics.set("refusal", False)
-    # v15.14: the manifest previously recorded an unconditional success shape
-    # even when the writer crashed — downstream automation reading it saw a
-    # healthy run with no review_composed.md. Record writer_failed explicitly
-    # and only list outputs that actually exist on disk.
     outputs = [
         "review_ledger.json",
         "review_narrative.md",
@@ -1588,5 +1394,4 @@ def _layered_t2_inner(args, meta_path):
 
 
 def layered_t2(args, meta_path):
-    """Run the current layered T2 pipeline once."""
     return _layered_t2_inner(args, meta_path)

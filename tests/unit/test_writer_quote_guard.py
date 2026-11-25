@@ -1,4 +1,3 @@
-"""The quotation verifier never ships a failed quotation as a quotation (vlm.2.4)."""
 import tempfile
 import unittest
 from pathlib import Path

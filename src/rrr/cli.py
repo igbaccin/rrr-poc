@@ -1,31 +1,12 @@
 import argparse, json, os, re, sys
 
 
-# v15.10: deterministic sanity gate before any LLM call. Rejects topics that
-# are obviously not scholarly questions — keyboard slams, all-punctuation
-# strings, single-word fragments. Kills the descriptive+PROCEED loophole for
-# word-salad topics that reach Stage 0 with real English tokens and no
-# coherent meaning. The gate is intentionally lenient: real scholarly topics
-# with unusual phrasings must not be rejected. If in doubt, let it through
-# and rely on Stage 0.
-#
-# v15.11: Unicode-aware. Recognises non-Latin scholarly topics (CJK, Arabic,
-# Cyrillic, Devanagari) as legitimate. The letter-count minimum uses
-# Unicode isalpha() so each CJK character counts as one letter. Multi-token
-# rule fires only when whitespace is present (Latin, Cyrillic, Arabic, etc.);
-# scriptio-continua languages (CJK) get a special path that rejects only
-# when the input mixes letters with digits or punctuation (the keyboard-slam
-# signature: '09p<GYHKLGCH' is a single letter run alongside symbols, while
-# '机构改革与经济增长' is a pure letter run).
 _MIN_LETTER_CODEPOINTS = 4
 _MIN_MULTI_LETTER_TOKENS = 2
 _MULTI_LETTER_TOKEN_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 
 def _reject_gibberish_topic(topic: str) -> str | None:
-    """Return a rejection reason if the topic is obviously not scholarly,
-    else None. Applied at CLI entry before any pipeline setup or LLM call.
-    """
     if topic is None:
         return "topic is None"
     stripped = topic.strip()
@@ -51,54 +32,25 @@ def _reject_gibberish_topic(topic: str) -> str | None:
 
 
 def t2(args, meta_path):
-    # v13: cli.t2 now only dispatches to the live multi-pass path. The legacy
-    # single-pass T2 (`t2` without --multi) was the v6-era strict reasoner
-    # entrypoint; the layered_t2 architecture (v8+) supersedes it end-to-end
-    # and is what every battery script invokes. Same for the v6-era t1 (single
-    # claim, no writer) and t3 (page extraction) entrypoints — t3 stays retired
-    # (v13 removed). t1 REVIVED in v15.9 as a claim-evaluator mode: same
-    # pipeline as T2 up to Stage 2 posture, but stops before the writer and
-    # emits claim_verdict.md instead of review_composed.md.
     if not getattr(args, "multi", False):
         raise SystemExit(
             "cli.t2 now requires --multi. The single-pass path was retired in v13; "
             "use scripts/run_small_validation.py or scripts/run_battery.sh for the "
             "full layered pipeline."
         )
-    # v15.11: deferred import so env vars set by main() (RRR_MODEL,
-    # RRR_TOPIC_LANG) take effect before reasoner reads them at import time.
     from rrr.reasoner import layered_t2
     layered_t2(args, meta_path)
 
 
 def t1(args, meta_path):
-    """v15.9 revival: claim-eval mode. Same pipeline as T2 up to Stage 2
-    posture, then stops. Emits runs/claim_verdict.md with per-cluster + aggregate
-    breakdown of how the corpus stands on the claim. ~15-20% of T2's runtime
-    because it skips the writer + validation chain."""
-    # We reuse layered_t2's whole entry, gated by args.t1_only which the
-    # reasoner short-circuits on after Stage 2 + ledger write.
     setattr(args, "multi", True)
     setattr(args, "t1_only", True)
-    # narrative-only saves us the T2_review.md appendix step we don't need.
     setattr(args, "narrative_only", True)
-    # v15.11: deferred import (see t2 comment).
     from rrr.reasoner import layered_t2
     layered_t2(args, meta_path)
 
 
 def ingest_main(argv):
-    """v16: `rrr ingest` — the confidence-gated front door for arbitrary-
-    filename corpora (wires src/rrr/ingest.py into the main path; it was
-    previously eval-only).
-
-    Gate contract (per revision_notes design): every metadata field carries
-    a recorded source; rows that are LOW confidence, FAILED, or purely
-    LLM-inferred without external corroboration do NOT enter the canonical
-    metadata.csv. They are written to <output>.pending.csv for human review
-    and the command exits 3 until the user either hand-edits them in or
-    reruns with --accept-low-confidence (an explicit, logged choice).
-    """
     ap = argparse.ArgumentParser(
         prog="rrr ingest",
         description="Build metadata.csv from a folder of PDFs (arbitrary "
@@ -130,7 +82,7 @@ def ingest_main(argv):
 
     results = ingest_corpus(
         corpus_dir,
-        output_csv=None,  # gate BEFORE anything reaches the canonical file
+        output_csv=None,
         sidecar_bib=Path(args.bib) if args.bib else None,
         use_llm=not args.no_llm,
         use_crossref=not args.no_crossref,
@@ -140,8 +92,6 @@ def ingest_main(argv):
     def _needs_review(m):
         if m.confidence in ("low", "failed"):
             return True
-        # Purely LLM-inferred with no external corroboration requires human
-        # approval regardless of the model's own confidence.
         return m.source == "llm_extraction"
 
     approved = [m for m in results if not _needs_review(m)]
@@ -215,7 +165,6 @@ def ingest_main(argv):
 
 
 def host_doctor_main(argv):
-    """Verify that native host mode will use a product subscription."""
     ap = argparse.ArgumentParser(
         prog="rrr host-doctor",
         description="Verify Codex or Claude subscription-backed host mode.",
@@ -270,7 +219,6 @@ def host_doctor_main(argv):
 
 
 def prepare_main(argv):
-    """Prepare a managed RRR workspace from a folder containing PDFs."""
     ap = argparse.ArgumentParser(
         prog="rrr prepare",
         description=(
@@ -348,7 +296,6 @@ def prepare_main(argv):
 
 
 def _select_topic_runtime(topic):
-    """Detect the topic language, then validate the configured runtime."""
     from rrr.language import detect_topic_language, select_model
 
     try:
@@ -363,19 +310,12 @@ def _select_topic_runtime(topic):
 
 
 def main():
-    # v15.12: force UTF-8 on stdout/stderr so multilingual output (accented
-    # Latin, CJK, Arabic, Cyrillic) prints correctly regardless of the host
-    # locale. On a POSIX/C locale (common on cloud pods) Python may otherwise
-    # pick an ASCII console encoding and mangle non-ASCII prints. File writes
-    # already pass encoding="utf-8" explicitly; this covers the console path.
     for _stream in (sys.stdout, sys.stderr):
         try:
             _stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
-    # v16: `rrr ingest` has its own argument contract; dispatch before the
-    # t1/t2 parser (whose --metadata/--topic are required) sees the argv.
     if len(sys.argv) > 1 and sys.argv[1] == "ingest":
         ingest_main(sys.argv[2:])
         return
@@ -413,9 +353,6 @@ def main():
     if args.linkify:
         os.environ["RRR_LINKIFY"] = "1"
 
-    # Resolve the model before importing the reasoner, whose modules bind the
-    # selection at import time. Language-detection failures can use English as
-    # a fallback. Runtime and provider configuration errors remain fatal.
     topic_lang, selected_model = _select_topic_runtime(args.topic)
     os.environ["RRR_TOPIC_LANG"] = topic_lang
     os.environ["RRR_MODEL"] = selected_model

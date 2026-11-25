@@ -11,9 +11,6 @@ from rrr.paths import runs_path
 from rrr.utils import ensure_dir
 
 
-# v15.14: never persist credential-looking env values into run artifacts —
-# run_metrics.json gets tarred, downloaded, and shared in replication
-# bundles, and the API runtime makes RRR_*-prefixed credentials plausible.
 _SENSITIVE_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASS|CREDENTIAL", re.IGNORECASE)
 
 
@@ -114,7 +111,6 @@ class RunMetrics:
         }
 
     def save(self, path=None):
-        # v15.14: atomic write — a crash mid-save left truncated metrics.
         out_path = str(path or runs_path("run_metrics.json"))
         ensure_dir(os.path.dirname(out_path))
         tmp = out_path + ".tmp"

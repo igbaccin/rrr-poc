@@ -1,4 +1,3 @@
-"""Quotation spans never cross marks of the other kind, and a demoted quotation leaves no stray mark (vlm.2.5)."""
 import tempfile
 import unittest
 from pathlib import Path

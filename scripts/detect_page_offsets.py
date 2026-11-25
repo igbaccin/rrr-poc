@@ -1,47 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""detect_page_offsets.py -- deterministic printed-page-offset detector for the RRR corpus.
-
-For every document in the page-text directory (files <doc_id>_page_<N>.txt,
-N = 1-based physical PDF page), extract printed-page-number candidates from
-the first 3 / last 3 non-boilerplate lines of each page, vote a per-document
-offset (printed = pdf_page_index + offset), and validate the implied printed
-range against the 'pages' column of metadata.csv.
-
-Design notes (from corpus recon):
-  * PUA oldstyle-figure digits (U+F730..U+F739) are translated to ASCII first
-    (Temin_2002, Koepke&Baten_2005 emit ALL digits that way).
-  * Known boilerplate lines (JSTOR download footer trio, OUP/Cambridge
-    watermarks, bare URLs, Elsevier eLocator headers) are dropped before the
-    head/tail windows are taken, because they mask the real header/footer.
-  * Candidate forms:
-      - bare number on its own line (head or tail window), rejected when a
-        directly adjacent line is also purely numeric (chart ticks / table
-        cell runs) or when it is a plausible calendar year outside the
-        metadata printed range;
-      - number embedded at the start/end of a running-head line (head window
-        only, first 3 lines): '32 Evsey D. Domar', 'Causes of Slavery 25',
-        '404 Canadian Journal of Sociology'; guarded against footnotes,
-        'VOL./NO./NUMBER' banners, year ranges, pp.-citations, DOIs/URLs.
-  * JSTOR / Taylor&Francis cover pages (unpaginated boilerplate) are detected
-    by signature, excluded from candidate extraction and from the predicted
-    printed range. The JSTOR cover 'pp. A-B' range is captured as independent
-    evidence (it is authoritative even when metadata.csv is wrong).
-  * Offset = mode of per-page votes; confidence = share of voting pages that
-    agree with the mode. Pages contributing no agreeing candidate are
-    reported (covers, scan first pages, figure-only pages, ...).
-  * Metadata match uses the range START as anchor (tolerance 1) and requires
-    the predicted end not to overrun the declared end by more than 1; PDFs
-    that end BEFORE the declared range end are legitimate (common) and only
-    get a soft note.
-
-Stdlib only, deterministic, UTF-8 everywhere.
-
-Usage:
-  python scripts/detect_page_offsets.py \
-      --page-text data/page_text --metadata metadata.csv \
-      --out revision_notes/page_offset_report.json
-"""
 
 import argparse
 import csv
@@ -51,31 +8,23 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# ---------------------------------------------------------------- constants
-
-# Adobe oldstyle-figure private-use digits -> ASCII digits.
 PUA_DIGITS = {0xF730 + d: ord('0') + d for d in range(10)}
 
-# Lines dropped before taking the head/tail windows (they hide real footers).
 BOILER = [
     re.compile(r'^This content downloaded from', re.I),
     re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}\s+on\s.*UTC', re.I),
     re.compile(r'^All use subject to ', re.I),
-    re.compile(r'academic\.oup\.com'),                       # OUP watermark line
+    re.compile(r'academic\.oup\.com'),
     re.compile(r'Published online by Cambridge University Press'),
     re.compile(r'^Downloaded from\b', re.I),
-    re.compile(r'^https?://\S+$'),                           # bare URL / DOI line
-    re.compile(r'^Explorations in Economic History\s+\d+\s+\(\d{4}\)\s+\d{5,}\s*$'),  # eLocator header
+    re.compile(r'^https?://\S+$'),
+    re.compile(r'^Explorations in Economic History\s+\d+\s+\(\d{4}\)\s+\d{5,}\s*$'),
 ]
 
 BARE = re.compile(r'^\d{1,4}$')
-# Pure-number neighbour line (chart ticks, table cells, decimals). Kept tight:
-# '(1995).' (citation year fragment) must NOT count, or real footers next to
-# footnote text get rejected (Goldin_2006 p2).
 NUMISH = re.compile(r'^[\d.,]+$')
 LEAD = re.compile(r'^(\d{1,4})\s+(.+)$')
 TRAIL = re.compile(r'^(.*?[^\s\d\-–—])\s+(\d{1,4})$')
-# Lines never treated as running heads (citations, DOIs, prices, OCR ranges).
 BADLINE = re.compile(r'(?i)\bpp?\.?\s*\d|https?://|\bdoi\b|©|\bissn\b|%|\$')
 MONTHS = re.compile(r'(?i)^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?[\s,]')
 STOPTOK = {'NO', 'NUMBER', 'VOL', 'VOLUME', 'PART', 'TABLE', 'FIGURE', 'FIG',
@@ -88,12 +37,7 @@ OUP_URL = re.compile(r'academic\.oup\.com/\w+/article(?:-abstract)?/(\d+)/(\d+)/
 YEAR_LO, YEAR_HI = 1500, 2099
 
 
-# ---------------------------------------------------------------- helpers
-
 def parse_pages_field(s):
-    """Parse metadata 'pages' -> ((start, end), kind) with kind in
-    {'range', 'single', None}. '8--38' -> ((8, 38), 'range');
-    '101424' -> ((101424, 101424), 'single') (eLocator suspect)."""
     s = (s or '').strip()
     if not s:
         return None, None
@@ -110,8 +54,6 @@ def parse_pages_field(s):
 
 
 def plausible_page_number(v, meta_rng):
-    """Reject 0 and calendar years 1500-2099 unless the declared printed
-    range actually spans such values."""
     if v <= 0:
         return False
     if YEAR_LO <= v <= YEAR_HI:
@@ -128,30 +70,23 @@ def numericish(line):
 
 
 def page_candidates(lines, meta_rng):
-    """Extract printed-page-number candidates from the head/tail windows of
-    the non-boilerplate lines. Bare numbers are taken from the first 4 / last
-    4 lines (EHR-style footers stack number + AUTHORS + (c) + venue = 4
-    lines); embedded running-head forms only from the first 3.
-    Returns list of (value, kind, line_idx, line)."""
     n = len(lines)
     out = []
     idxs = sorted(set(list(range(min(4, n))) + list(range(max(0, n - 4), n))))
     for i in idxs:
         ln = lines[i]
-        # --- bare number on its own line (head or tail) -------------------
         if BARE.fullmatch(ln):
             v = int(ln)
             if len(ln) > 1 and ln[0] == '0':
-                continue                       # '07' etc: not a page number
+                continue
             if not plausible_page_number(v, meta_rng):
                 continue
             prev_num = i > 0 and numericish(lines[i - 1])
             next_num = i + 1 < n and numericish(lines[i + 1])
             if prev_num or next_num:
-                continue                       # chart ticks / table cell run
+                continue
             out.append((v, 'bare', i, ln))
             continue
-        # --- embedded running-head forms: physical top of page only -------
         if i > 2:
             continue
         if BADLINE.search(ln):
@@ -179,7 +114,6 @@ def page_candidates(lines, meta_rng):
 
 
 def detect_front_matter(raw):
-    """True if the page is an unpaginated publisher cover (JSTOR / T&F)."""
     if 'jstor.org/stable' in raw and 'JSTOR is a not-for-profit service' in raw:
         return 'jstor_cover'
     if 'tandfonline.com/action/journalInformation' in raw:
@@ -188,8 +122,6 @@ def detect_front_matter(raw):
         return 'tf_cover'
     return None
 
-
-# ---------------------------------------------------------------- per doc
 
 def process_doc(doc, pages_raw, meta_row):
     meta_str = (meta_row or {}).get('pages', '') if meta_row else ''
@@ -204,7 +136,7 @@ def process_doc(doc, pages_raw, meta_row):
 
     front, front_kinds = [], {}
     jstor_footprint = 0
-    page_votes = {}          # page -> {offset: (value, kind, idx, line)}
+    page_votes = {}
     for p in page_nums:
         raw = translated[p]
         fm = detect_front_matter(raw)
@@ -233,18 +165,15 @@ def process_doc(doc, pages_raw, meta_row):
     n_voting = sum(1 for p in page_nums if page_votes[p])
     n_agree = 0
     if votes:
-        # deterministic: most page-votes, then smallest |offset|, then value
         offset = sorted(votes.items(), key=lambda kv: (-kv[1], abs(kv[0]), kv[0]))[0][0]
         n_agree = sum(1 for p in page_nums if offset in page_votes[p])
         confidence = round(n_agree / n_voting, 3) if n_voting else 0.0
 
-    # pages contributing no agreeing candidate (covers, scan first pages, ...)
     if offset is not None:
         no_agree = [p for p in page_nums if offset not in page_votes[p]]
     else:
         no_agree = sorted(front)
 
-    # evidence samples (first 3 agreeing pages)
     evidence = []
     if offset is not None:
         for p in page_nums:
@@ -255,13 +184,11 @@ def process_doc(doc, pages_raw, meta_row):
                 if len(evidence) == 3:
                     break
 
-    # predicted printed range over content pages (front matter excluded)
     content = [p for p in page_nums if p not in front] or page_nums
     pred = None
     if offset is not None and content:
         pred = [offset + content[0], offset + content[-1]]
 
-    # independent anchors
     cover_rng = None
     if page_nums and page_nums[0] in front:
         joined = ' '.join(l.strip() for l in translated[page_nums[0]].splitlines()
@@ -283,7 +210,6 @@ def process_doc(doc, pages_raw, meta_row):
             oup_start = int(m.group(3))
             break
 
-    # ---------------- validation vs metadata ---------------------------
     notes = []
     matches = False
     if offset is None:
@@ -346,8 +272,6 @@ def process_doc(doc, pages_raw, meta_row):
         'evidence': evidence,
     }
 
-
-# ---------------------------------------------------------------- driver
 
 def load_corpus(page_text_dir):
     docs = {}
@@ -423,7 +347,6 @@ def main(argv=None):
         json.dump(report, fh, indent=2, ensure_ascii=True)
         fh.write('\n')
 
-    # ---------------- compact stdout table -----------------------------
     hdr = '{:<28} {:>5} {:>7} {:>5} {:>12} {:>12} {:>5}  {}'.format(
         'doc', 'pages', 'offset', 'conf', 'pred', 'meta', 'match', 'anomaly')
     print(hdr)

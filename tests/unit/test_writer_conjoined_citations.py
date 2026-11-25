@@ -1,12 +1,3 @@
-"""A citation must never be folded into a prose phrase naming two authors.
-
-Run 043 of the July 2026 battery released ``Mokyr and Kuznets (1973, p.1)``
-after the model wrote ``Mokyr and Kuznets (1973) [E0081] [E0089]``. The
-checker read the result as a two-author work outside the corpus. These tests
-run the writer's production sequence (renderer, chunk normalization, final
-normalization, adjacent-citation merge, repair, terminal audit) on that input
-and on the legitimate forms the guards must leave alone.
-"""
 import sys
 import unittest
 from pathlib import Path
@@ -16,8 +7,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rrr import writer  # noqa: E402
-from rrr.render import _build_display_lookup, parse_citations  # noqa: E402
+from rrr import writer
+from rrr.render import _build_display_lookup, parse_citations
 
 EVIDENCE = {
     "E0081": {"doc_id": "Kuznets_1973", "page": 1},
@@ -30,7 +21,6 @@ LEAD = "Earlier work stressed capital accumulation. "
 
 
 def released(text):
-    """Apply the writer's citation passes in production order."""
     text, stats = writer._render_evidence_id_citations(text, EVIDENCE)
     text, _ = writer._collapse_double_parens(text)
     text, _ = writer._collapse_double_parens(text, LOOKUP)
@@ -102,7 +92,6 @@ class ConjoinedAuthorCitationTests(unittest.TestCase):
                 self.assertEqual(expected, text)
                 self.assertEqual([], faults)
                 if "'s" not in expected:
-                    # A possessive narrative form is prose to the parser.
                     self.assert_clean(text)
 
     def test_every_release_is_stable_on_a_second_pass(self):

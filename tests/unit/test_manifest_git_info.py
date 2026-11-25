@@ -31,7 +31,6 @@ class GitProvenanceTests(unittest.TestCase):
                 "-c", "user.email=rrr-test@example.invalid",
                 "commit", "-q", "-m", "fixture",
             )
-            # Curly quotes, then a byte that neither UTF-8 nor cp1252 decodes.
             note.write_bytes("“quoted”\n".encode("utf-8") + b"\x9d\n")
             expected = hashlib.sha256(
                 _git(temp_dir, "diff", "--no-ext-diff", "--binary")

@@ -1,4 +1,3 @@
-"""Managed corpus workspaces for the interactive RRR product."""
 from __future__ import annotations
 
 import hashlib
@@ -13,8 +12,6 @@ from typing import Iterable, Optional
 
 
 class CorpusDiscoveryError(RuntimeError):
-    """Raised when RRR cannot identify one PDF collection safely."""
-
     def __init__(self, message: str, candidates: Iterable[Path] = ()) -> None:
         super().__init__(message)
         self.candidates = tuple(Path(path) for path in candidates)
@@ -50,7 +47,6 @@ def _pdfs_in(directory: Path) -> list[Path]:
 
 
 def discover_corpus_dir(start: Path) -> Path:
-    """Find one nearby directory containing PDFs without searching broadly."""
     start = Path(start).expanduser().resolve()
     if not start.is_dir():
         raise CorpusDiscoveryError(f"The selected location is not a folder: {start}")
@@ -167,7 +163,6 @@ def prepare_workspace(
     force: bool = False,
     quiet: bool = False,
 ) -> PreparedWorkspace:
-    """Ingest, preprocess, and index a PDF folder in a managed workspace."""
     corpus_dir = Path(corpus_dir).expanduser().resolve()
     pdfs = _pdfs_in(corpus_dir)
     if not pdfs:

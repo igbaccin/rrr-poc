@@ -2,8 +2,6 @@ import re
 
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
-# v8: query-time token RE preserves hyphens so multi-word concepts like
-# "long-run", "rule-of-law", "factor-endowments" survive tokenization for retrieval.
 QUERY_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 STOPWORDS = {
@@ -11,9 +9,6 @@ STOPWORDS = {
     "have", "in", "is", "it", "its", "of", "on", "or", "that", "the",
     "their", "this", "to", "was", "were", "with",
 }
-# v8: query-time stoplist trimmed — keep "of","the","that","for" tokenizable
-# so phrases like "rule of law", "theory of growth", "test for unit root" don't
-# silently collapse to a unigram bag before BM25 sees them.
 QUERY_STOPWORDS = STOPWORDS - {"of", "the", "that", "for"}
 
 
@@ -43,13 +38,6 @@ def tokenize(text: str):
 
 
 def tokenize_query(text: str):
-    """v8: query-time tokenizer that preserves hyphens and a smaller stoplist.
-
-    Used by retrieve() to keep multi-word concepts intact. Doc-time tokenize()
-    is unchanged so the existing BM25 index does not need rebuilding.
-    Hyphenated tokens are also emitted as their components so they still match
-    the doc-time tokens in the index.
-    """
     tokens = []
     for tok in QUERY_TOKEN_RE.findall(normalize_text(text).lower()):
         if tok in QUERY_STOPWORDS:

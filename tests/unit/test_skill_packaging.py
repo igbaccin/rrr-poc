@@ -91,14 +91,6 @@ class SkillPackagingTests(unittest.TestCase):
         self.assertIn("rrr/cli.py", names)
 
     def test_hosted_profiles_are_separately_versioned_artifacts(self):
-        """vcx (Codex) and vcl (Claude) must be independently replaceable.
-
-        They ship the same tested runtime today, which is the intended
-        starting point: Claude begins from the Codex contract. But they are
-        separate files with separate manifests, so a Claude-specific change
-        rebuilds only vcl and cannot silently alter the runtime Codex was
-        accepted with.
-        """
         plugin_runtime = json.loads(
             (PLUGIN_ROOT / "runtime" / "runtime.json").read_text(encoding="utf-8")
         )
@@ -113,11 +105,7 @@ class SkillPackagingTests(unittest.TestCase):
 
         plugin_wheel = PLUGIN_ROOT / "runtime" / plugin_runtime["wheel"]
         claude_wheel = claude_root / "runtime" / claude_runtime["wheel"]
-        # Distinct files, so one can be rebuilt without the other.
         self.assertNotEqual(plugin_wheel.resolve(), claude_wheel.resolve())
-        # Byte-identical today. When the Claude modifications land this
-        # assertion is the one to update, together with a vcl-only bump --
-        # never by editing a shared wheel in place.
         self.assertEqual(claude_wheel.read_bytes(), plugin_wheel.read_bytes())
         for manifest, wheel in (
             (plugin_runtime, plugin_wheel),
@@ -133,13 +121,6 @@ class SkillPackagingTests(unittest.TestCase):
         )
 
     def test_local_distribution_is_versioned_independently_from_hosted(self):
-        """The local product and the hosted runtimes are separate profiles.
-
-        They were once the same wheel, synced from dist/ into the plugin. They
-        are now versioned independently -- vlm for local models, vcx and vcl
-        for the hosted agents -- because they are different writers with
-        different prose contracts, not successive versions of one thing.
-        """
         local_wheels = sorted((ROOT / "dist").glob("rrr_poc-*.whl"))
         self.assertEqual(1, len(local_wheels), "expected exactly one local wheel")
         local_wheel = local_wheels[0]
@@ -152,8 +133,6 @@ class SkillPackagingTests(unittest.TestCase):
         hosted = json.loads(
             (PLUGIN_ROOT / "runtime" / "runtime.json").read_text(encoding="utf-8")
         )
-        # The local wheel must not be silently republished as the hosted
-        # runtime: that is how a local-only fix would reach Codex untested.
         self.assertNotEqual(local_wheel.name, hosted["wheel"])
 
     def test_bootstrap_reinstalls_a_changed_wheel_with_the_same_version(self):

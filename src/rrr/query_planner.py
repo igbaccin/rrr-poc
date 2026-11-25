@@ -1,22 +1,8 @@
 import os, json, re, time
 
 
-# v13: RRR_PLANNER_T/CTX/PRED, RRR_PLANNER_TERMS_T/CTX/PRED, RRR_PLANNER_PROBE_CAP
-# retired. These were per-stage CTX/PRED/T tuning knobs the v8-v12 work
-# converged on; no caller in scripts/, README, or pod configs overrode them.
-# v14.2: temperature 0.1 -> 0.0 on planner stages. Per the v14.2
-# investigation, the planner is the only LLM call upstream of BM25 retrieval,
-# and its output (probes) is NOT cached on disk — so any sampling at T>0
-# perturbs evidence extraction across runs even with identical topic + model.
-# At T=0 the same (topic, model, prompt) input deterministically returns the
-# same probes (modulo backend non-determinism, but mistral-small is stable).
 _PLANNER_OPTIONS = {"temperature": 0.0, "num_ctx": 2048, "num_predict": 700}
-# v9 (R7): second-stage planner asks for domain technical vocabulary the topic
-# statement does not contain. Smaller budget than stage 1 because we want a
-# tight list of phrases. v14.2: T 0.1 -> 0.0 for the same reason as above.
 _TERMS_OPTIONS = {"temperature": 0.0, "num_ctx": 2048, "num_predict": 300}
-# v9 (R7): max probes after merging stage 1 + stage 2. Stage 1 caps at 8; stage
-# 2 can add up to (PROBE_CAP - len(stage1)) novel technical phrases.
 _PROBE_CAP = 12
 
 
@@ -42,11 +28,6 @@ def _ensure_probes(topic: str, obj: dict, insert_raw_topic: bool = True):
             probes.append(" ".join(must[:6]))
         if any_terms:
             probes.append(" ".join(any_terms[:8]))
-    # v15.12: only force the raw topic string in as probe[0] when it is in
-    # the corpus language. For a cross-language topic (e.g. a Chinese topic
-    # against an English corpus) the raw topic tokenises to zero BM25 tokens
-    # and would just waste a probe slot — the corpus-language probes emitted
-    # by the planner do the retrieval work instead.
     if insert_raw_topic and topic and topic.lower() not in probes:
         probes.insert(0, topic.lower())
     obj["probes"] = probes[:8]
@@ -73,14 +54,6 @@ def _heuristic_plan(topic: str):
 
 def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None,
                           corpus_lang: str = "en", topic_lang: str = "en"):
-    """v9 (R7): second-stage planner call that asks for technical vocabulary
-    the topic statement does not contain. Returns a list of short phrases, or
-    [] on any failure (this stage is purely additive — a failure means we keep
-    stage-1 probes only, not a degraded plan).
-
-    v15.12: terms of art are emitted in the CORPUS language so they match the
-    BM25 index, regardless of the topic's language.
-    """
     start = time.perf_counter()
     try:
         import ollama
@@ -125,7 +98,6 @@ def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None,
             stream=False,
         )
         raw = (res.get("message", {}).get("content") or "").strip()
-        # tolerate either a clean JSON or a JSON-with-prefix
         start_idx = raw.find("{")
         end_idx = raw.rfind("}")
         if start_idx < 0 or end_idx <= start_idx:
@@ -149,32 +121,14 @@ def _extract_terms_of_art(topic: str, plan_obj: dict, model: str, metrics=None,
         return []
 
 
-# v12: topic reformulation. Normalises any user-typed topic into a
-# scholarly-question form for internal use, while leaving the user's original
-# string on the rendered output's title. The pipeline currently threads the
-# raw topic into every writer prompt, which produces meta-commentary and
-# defend/attack framing when the user writes a strong thesis. Reformulating
-# upstream eliminates that pressure.
-# v13: RRR_TOPIC_REFORM_T/CTX/PRED retired (lever pruning); per-stage tuning
-# never overridden in the wild.
 _TOPIC_REFORM_OPTIONS = {"temperature": 0.0, "num_ctx": 2048, "num_predict": 400}
 
 
 def _reformulate_topic(topic: str, model: str, metrics=None):
-    """v12: turn the user's raw topic into a scholarly investigation question.
-
-    Returns a dict {topic_question, topic_dimensions} or None on any failure
-    (caller falls back to using the raw topic for both surfaces).
-    """
     start = time.perf_counter()
     try:
         import ollama
         import os
-        # v15.11: reformulation MUST preserve the input's language. Without
-        # this, the writer (which consumes topic_question, not topic_display)
-        # generates prose in whatever language the reformulation drifted to
-        # — nearly always English on mistral. Explicit language directive
-        # + explicit "same language" clause in the prompt fixes this.
         from rrr.language import language_directive
         topic_lang = os.environ.get("RRR_TOPIC_LANG", "en")
         _lang_directive = language_directive(topic_lang)
@@ -249,18 +203,12 @@ def _reformulate_topic(topic: str, model: str, metrics=None):
 
 
 def _merge_probes_with_terms(probes, terms, cap=None):
-    """v9 (R7): merge stage-1 probes and stage-2 technical terms; reject
-    near-duplicates via substring containment (avoids adding the rapidfuzz
-    dependency to the planner module just for this).
-    """
     out = list(probes)
     seen_lower = {p.lower().strip() for p in out if p}
     for t in terms or []:
         t_clean = (t or "").strip().lower()
         if not t_clean or t_clean in seen_lower:
             continue
-        # reject if substring of an existing probe, or an existing probe is
-        # a substring of it
         if any(t_clean in p.lower() or p.lower() in t_clean for p in out if p):
             continue
         out.append(t_clean)
@@ -273,12 +221,6 @@ def _merge_probes_with_terms(probes, terms, cap=None):
 def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "en"):
     model = os.environ.get("RRR_PLANNER_MODEL", os.environ.get("RRR_MODEL", "mistral-small:24b"))
     start = time.perf_counter()
-    # v15.12: cross-language retrieval. BM25 matches on corpus-language
-    # tokens, so when the topic language differs from the corpus language
-    # the planner must emit search terms IN THE CORPUS LANGUAGE (the model
-    # translates the topic's concepts). Without this, a French/Chinese topic
-    # produces French/Chinese probes that tokenise to nothing against an
-    # English index and every doc is rejected as no_retrieved_pages.
     cross_lang = bool(corpus_lang) and bool(topic_lang) and corpus_lang != topic_lang
     try:
         import ollama
@@ -316,8 +258,6 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
             stream=False,
         )
         raw = res["message"]["content"].strip()
-        # v15.13: robust extraction tolerates verbose models (qwen3:30b-a3b,
-        # frontier API models) that wrap the object in prose or fences.
         from rrr.utils import extract_first_json
         obj = extract_first_json(raw)
         if obj is None:
@@ -330,8 +270,6 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
         obj["keywords_must"] = _clean_list(obj["keywords_must"], 8, item_limit=60)
         obj["keywords_any"]  = _clean_list(obj["keywords_any"], 12, item_limit=60)
         obj["exclude"]       = _clean_list(obj["exclude"], 8, item_limit=60)
-        # Cross-language: do NOT insert the raw (topic-language) topic as a
-        # probe — it can't match the corpus-language index.
         obj = _ensure_probes(topic, obj, insert_raw_topic=not cross_lang)
         duration_s = time.perf_counter() - start
         obj["planner_meta"] = {
@@ -343,9 +281,6 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
             "cross_lang_retrieval": cross_lang,
         }
 
-        # v9 (R7): second-stage technical-vocabulary call. Purely additive —
-        # failure leaves stage-1 probes intact.
-        # v13: RRR_PLANNER_TWO_STAGE retired (always on).
         terms = _extract_terms_of_art(topic, obj, model, metrics=metrics,
                                       corpus_lang=corpus_lang, topic_lang=topic_lang)
         if terms:
@@ -358,9 +293,6 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
             obj["planner_meta"]["probes_added_by_terms"] = added
             print(f"[Planner] stage2 terms_of_art={len(terms)} probes_added={added} total_probes={len(obj['probes'])}")
 
-        # v12: topic reformulation. Falls back to raw topic on failure so the
-        # rest of the pipeline never breaks on a None topic_question.
-        # v13: RRR_TOPIC_REFORMULATION retired (always on).
         obj["topic_display"] = topic
         obj["topic_question"] = topic
         reform = _reformulate_topic(topic, model, metrics=metrics)
@@ -379,10 +311,6 @@ def plan(topic: str, metrics=None, corpus_lang: str = "en", topic_lang: str = "e
                                response_chars=len(raw))
         return obj
     except Exception as e:
-        # v15.14: honour cross_lang in the fallback too. The success path
-        # already skips inserting the raw topic as probe[0] when the topic
-        # language differs from the corpus (it tokenises to nothing against
-        # the BM25 index); the fallback used the default and re-inserted it.
         obj = _ensure_probes(topic, _heuristic_plan(topic),
                              insert_raw_topic=not cross_lang)
         obj["planner_meta"] = {
