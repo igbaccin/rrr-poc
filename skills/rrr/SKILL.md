@@ -172,6 +172,11 @@ to stop on a leftover reference list.
 
 Reuse the metadata and index for later questions over an unchanged corpus.
 
+A topic may be a claim, a comparison, a description, or an open question that
+names an outcome and asks why it came about ("Why did X decline?"). For an
+open question RRR sets the explanations the corpus offers side by side, and
+`t1` lists those explanations and gives no verdict.
+
 ## Deliver the recorded outcome
 
 - Deliver `claim_verdict.md` verbatim after a successful T1 run.
@@ -180,6 +185,10 @@ Reuse the metadata and index for later questions over an unchanged corpus.
   `run_manifest.json` when present.
 - In host mode, identify the `host_calls/` audit directory.
 - Report corpus-fit warnings, refusals, and failed stages in plain language.
+- A refusal (`refusal=<reason>` on the console) is a finding about the corpus:
+  it cannot answer the topic. A breakdown (`breakdown=<reason>`) is a failed
+  stage of the run and says nothing about the corpus. Report a breakdown as a
+  failed run and offer to run it again.
 
 ## Preserve integrity
 
