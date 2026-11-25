@@ -87,16 +87,21 @@ requires about 35 to 40 model calls, which count against the Codex allowance.
 
 ### Which model runs
 
-A run uses the model the user has selected in Codex. RRR reads the model of
-the thread that starts the run from the record Codex keeps of that thread, and
-otherwise the model of the Codex configuration (`config.toml`), which the model
-picker writes. `gpt-6.2-sol` runs only when RRR finds no selection.
+A run uses the model and the reasoning effort the user has selected in Codex.
+RRR reads both from the record Codex keeps of the thread that starts the run,
+and otherwise from the Codex configuration (`config.toml`), which the model
+picker writes. `gpt-6.2-sol` at its default effort runs only when RRR finds no
+selection.
 
-`rrr host-doctor --host codex` prints the model and where it came from, and
-each run records its model in `run_manifest.json`. Set `RRR_HOST_MODEL` to keep
-a series of runs on one model whatever is selected in Codex. The reasoning
-effort selected in Codex is not carried over; each call runs at the model's
-default effort.
+`rrr host-doctor --host codex` prints the model, the effort and where each came
+from, and each run records them in `run_manifest.json`, as in
+`codex:gpt-6.2-sol@xhigh`. A high effort makes each of the 35 to 40 calls
+slower and uses more of the allowance.
+
+Set `RRR_HOST_MODEL` to keep a series of runs on one model whatever is selected
+in Codex. A pinned model runs at its default effort. Set `RRR_HOST_EFFORT`
+(`low`, `medium`, `high`, `xhigh`) to pin the effort as well, or
+`RRR_HOST_EFFORT=default` to run an inherited model at its default effort.
 
 Continue with [Before running](before_running.md) to see how RRR finds the PDF
 folder and prepares its metadata catalogue.
@@ -156,15 +161,15 @@ language-model calls through the user's Claude subscription.
 
 ### Which model runs
 
-A run uses the model the user has selected in Claude Code. RRR reads the model
-of the session that starts the run from that session's transcript, then the
-`ANTHROPIC_MODEL` variable, then the model of the user settings
-(`settings.json`), which `/model` writes. `claude-opus-5-5` runs only when RRR
-finds no selection.
+A run uses the model and the effort the user has selected in Claude Code. RRR
+reads both from the transcript of the session that starts the run, then from
+the `ANTHROPIC_MODEL` and `CLAUDE_CODE_EFFORT_LEVEL` variables, then from the
+user settings (`settings.json`), which `/model` writes. `claude-opus-5-5` at
+its default effort runs only when RRR finds no selection.
 
-`rrr host-doctor --host claude` prints the model and where it came from, and
-each run records its model in `run_manifest.json`. Set `RRR_HOST_MODEL` to keep
-a series of runs on one model whatever is selected in Claude Code.
+`rrr host-doctor --host claude` prints the model, the effort and where each
+came from, and each run records them in `run_manifest.json`. `RRR_HOST_MODEL`
+and `RRR_HOST_EFFORT` pin a series of runs, as described for Codex above.
 
 Continue with [Before running](before_running.md) to understand corpus and
 metadata preparation.

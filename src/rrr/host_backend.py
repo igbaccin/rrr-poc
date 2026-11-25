@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 _CODEX_DEFAULT_MODEL = "gpt-6.2-sol"
 _CLAUDE_DEFAULT_MODEL = "claude-opus-5-5"
 _SESSION_ID_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,63}")
+_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,23}")
 _TOML_TABLE_RE = re.compile(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$")
 _TOML_STRING_RE = re.compile(
     r"""^\s*([A-Za-z0-9_-]+)\s*=\s*(?:"([^"\\]*)"|'([^']*)')\s*(?:#.*)?$"""
@@ -154,7 +155,12 @@ def _toml_strings(text: str) -> Dict[str, Any]:
     return data
 
 
-def _codex_config_model(config: Path) -> str:
+def _effort_text(value: Any) -> str:
+    text = value.strip().lower() if isinstance(value, str) else ""
+    return text if _EFFORT_RE.fullmatch(text) else ""
+
+
+def _codex_config(config: Path) -> Dict[str, Any]:
     try:
         text = config.read_text(encoding="utf-8")
         try:
@@ -164,7 +170,7 @@ def _codex_config_model(config: Path) -> str:
         else:
             data = tomllib.loads(text)
     except (OSError, ValueError):
-        return ""
+        return {}
     chosen = dict(data)
     profiles = data.get("profiles")
     name = data.get("profile")
@@ -174,20 +180,21 @@ def _codex_config_model(config: Path) -> str:
     if isinstance(profile, dict):
         chosen.update(profile)
     if str(chosen.get("model_provider") or "openai").strip().lower() != "openai":
-        return ""
-    return _model_text(chosen.get("model"))
+        return {}
+    return chosen
 
 
 @functools.lru_cache(maxsize=8)
-def _selected_codex_model(home: str, thread: str) -> Optional[tuple]:
+def _codex_selection(home: str, thread: str) -> tuple:
     root = Path(home)
+    model = effort = None
     if _SESSION_ID_RE.fullmatch(thread):
         try:
             records = sorted((root / "sessions").rglob(f"rollout-*-{thread}.jsonl"))
         except OSError:
             records = []
         for record in records[-1:]:
-            model, provider = "", "openai"
+            found_model, found_effort, provider = "", "", "openai"
             try:
                 for row in _json_lines(record, b'"turn_context"', b'"session_meta"'):
                     payload = row.get("payload")
@@ -196,28 +203,36 @@ def _selected_codex_model(home: str, thread: str) -> Optional[tuple]:
                     if row.get("type") == "session_meta":
                         provider = str(payload.get("model_provider") or provider)
                     elif row.get("type") == "turn_context":
-                        model = _model_text(payload.get("model")) or model
+                        found_model = _model_text(payload.get("model")) or found_model
+                        found_effort = _effort_text(payload.get("effort")) or found_effort
             except OSError:
-                model = ""
-            if model and provider.strip().lower() == "openai":
-                return model, "this Codex thread"
+                found_model = found_effort = ""
+            if provider.strip().lower() == "openai":
+                if found_model:
+                    model = (found_model, "this Codex thread")
+                if found_effort:
+                    effort = (found_effort, "this Codex thread")
     config = root / "config.toml"
-    model = _codex_config_model(config)
-    if model:
-        return model, f"the Codex configuration, {config}"
-    return None
+    chosen = _codex_config(config)
+    source = f"the Codex configuration, {config}"
+    if model is None and _model_text(chosen.get("model")):
+        model = (_model_text(chosen.get("model")), source)
+    if effort is None and _effort_text(chosen.get("model_reasoning_effort")):
+        effort = (_effort_text(chosen.get("model_reasoning_effort")), source)
+    return model, effort
 
 
 @functools.lru_cache(maxsize=8)
-def _selected_claude_model(home: str, session: str, env_model: str) -> Optional[tuple]:
+def _claude_selection(home: str, session: str, env_model: str, env_effort: str) -> tuple:
     root = Path(home)
+    model = effort = None
     if _SESSION_ID_RE.fullmatch(session):
         try:
             transcripts = sorted((root / "projects").glob(f"*/{session}.jsonl"))
         except OSError:
             transcripts = []
         for transcript in transcripts[-1:]:
-            model = ""
+            found_model = found_effort = ""
             try:
                 for row in _json_lines(transcript, b'"assistant"'):
                     message = row.get("message")
@@ -226,22 +241,57 @@ def _selected_claude_model(home: str, session: str, env_model: str) -> Optional[
                         and not row.get("isSidechain")
                         and isinstance(message, dict)
                     ):
-                        model = _model_text(message.get("model")) or model
+                        found_model = _model_text(message.get("model")) or found_model
+                        found_effort = _effort_text(row.get("effort")) or found_effort
             except OSError:
-                model = ""
-            if model:
-                return model, "this Claude Code session"
-    if env_model:
-        return env_model, "ANTHROPIC_MODEL"
+                found_model = found_effort = ""
+            if found_model:
+                model = (found_model, "this Claude Code session")
+            if found_effort:
+                effort = (found_effort, "this Claude Code session")
+    if model is None and env_model:
+        model = (env_model, "ANTHROPIC_MODEL")
+    if effort is None and _effort_text(env_effort):
+        effort = (_effort_text(env_effort), "CLAUDE_CODE_EFFORT_LEVEL")
     settings = root / "settings.json"
     try:
         data = json.loads(settings.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         data = None
-    model = _model_text(data.get("model")) if isinstance(data, dict) else ""
-    if model:
-        return model, f"the Claude Code settings, {settings}"
-    return None
+    data = data if isinstance(data, dict) else {}
+    source = f"the Claude Code settings, {settings}"
+    if model is None and _model_text(data.get("model")):
+        model = (_model_text(data.get("model")), source)
+    if effort is None:
+        per_model = data.get("modelSettings")
+        per_model = per_model if isinstance(per_model, dict) else {}
+        name = re.sub(r"\[[^\]]*\]$", "", model[0]) if model else ""
+        keys = [key for key in per_model if key == name] or [
+            key for key in per_model if name and name in str(key).split("-")
+        ]
+        own = per_model.get(keys[0]) if len(keys) == 1 else None
+        level = _effort_text(own.get("effortLevel")) if isinstance(own, dict) else ""
+        level = level or _effort_text(data.get("effortLevel"))
+        if level:
+            effort = (level, source)
+    return model, effort
+
+
+def _host_selection(host: str) -> tuple:
+    if host == "codex":
+        return _codex_selection(
+            str(_codex_home()), os.environ.get("CODEX_THREAD_ID", "").strip(),
+        )
+    return _claude_selection(
+        str(_claude_home()),
+        os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip(),
+        os.environ.get("ANTHROPIC_MODEL", "").strip(),
+        os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "").strip(),
+    )
+
+
+def _host_label(host: str) -> str:
+    return "Codex" if host == "codex" else "Claude Code"
 
 
 def resolve_host_model(host: Optional[str] = None) -> tuple:
@@ -249,21 +299,33 @@ def resolve_host_model(host: Optional[str] = None) -> tuple:
     override = os.environ.get("RRR_HOST_MODEL", "").strip()
     if override:
         return override, "RRR_HOST_MODEL"
-    if host == "codex":
-        selected = _selected_codex_model(
-            str(_codex_home()), os.environ.get("CODEX_THREAD_ID", "").strip(),
-        )
-        label, fallback = "Codex", _CODEX_DEFAULT_MODEL
-    else:
-        selected = _selected_claude_model(
-            str(_claude_home()),
-            os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip(),
-            os.environ.get("ANTHROPIC_MODEL", "").strip(),
-        )
-        label, fallback = "Claude Code", _CLAUDE_DEFAULT_MODEL
+    selected = _host_selection(host)[0]
     if selected:
         return selected
-    return fallback, f"RRR fallback; the model selected in {label} could not be established"
+    fallback = _CODEX_DEFAULT_MODEL if host == "codex" else _CLAUDE_DEFAULT_MODEL
+    return (
+        fallback,
+        f"RRR fallback; the model selected in {_host_label(host)} could not be established",
+    )
+
+
+def resolve_host_effort(host: Optional[str] = None) -> tuple:
+    host = host or _host_name()
+    raw = os.environ.get("RRR_HOST_EFFORT", "").strip()
+    if raw:
+        override = _effort_text(raw)
+        if not override:
+            raise HostBackendError(
+                "RRR_HOST_EFFORT must be one word, such as low, medium, high or "
+                f"xhigh, or default; received {raw!r}"
+            )
+        return ("" if override == "default" else override), "RRR_HOST_EFFORT"
+    if os.environ.get("RRR_HOST_MODEL", "").strip():
+        return "", "RRR_HOST_MODEL pins the model and RRR_HOST_EFFORT is not set"
+    selected = _host_selection(host)[1]
+    if selected:
+        return selected
+    return "", f"no effort selected in {_host_label(host)} was found"
 
 
 def _host_model(host: Optional[str] = None) -> str:
@@ -272,7 +334,8 @@ def _host_model(host: Optional[str] = None) -> str:
 
 def host_model_name() -> str:
     host = _host_name()
-    return f"{host}:{_host_model(host)}"
+    effort = resolve_host_effort(host)[0]
+    return f"{host}:{_host_model(host)}" + (f"@{effort}" if effort else "")
 
 
 def _timeout_seconds() -> float:
@@ -609,10 +672,13 @@ def host_diagnostics() -> Dict[str, Any]:
             last_error = exc
             continue
         model, model_source = resolve_host_model(host)
+        effort, effort_source = resolve_host_effort(host)
         return {
             "host": host,
             "model": model,
             "model_source": model_source,
+            "effort": effort,
+            "effort_source": effort_source,
             "executable": executable,
             "authentication": auth,
             "authentication_ready": True,
@@ -660,6 +726,7 @@ def host_smoke_test() -> Dict[str, Any]:
 def _codex_chat(
     payload: Dict[str, Any],
     model: str,
+    effort: str = "",
 ) -> tuple[str, str, str, Dict[str, Any]]:
     prompt = _backend_prompt(payload)
     last_error: Optional[BaseException] = None
@@ -704,8 +771,10 @@ def _codex_chat(
                 str(output_path),
                 "--model",
                 model,
-                "-",
             ])
+            if effort:
+                command.extend(["-c", "model_reasoning_effort=" + json.dumps(effort)])
+            command.append("-")
             env = _child_environment("codex")
             try:
                 auth = _verify_subscription_auth("codex", executable, env)
@@ -743,6 +812,7 @@ def _codex_chat(
 def _claude_chat(
     payload: Dict[str, Any],
     model: str,
+    effort: str = "",
 ) -> tuple[str, str, str, Dict[str, Any]]:
     system_parts = [
         str(message.get("content") or "")
@@ -789,6 +859,8 @@ def _claude_chat(
                 "--model",
                 model,
             ]
+            if effort:
+                command.extend(["--effort", effort])
             env = _child_environment("claude")
             try:
                 auth = _verify_subscription_auth("claude", executable, env)
@@ -882,6 +954,7 @@ def host_chat(
 ) -> Dict[str, Any]:
     host = _host_name()
     selected_model = _host_model(host)
+    selected_effort = resolve_host_effort(host)[0]
     stage = _infer_stage(_rrr_stage)
     payload = _request_payload(messages or [], options, format, stage)
     prompt_bytes = json.dumps(
@@ -893,8 +966,8 @@ def host_chat(
 
     def invoke() -> tuple[str, str, str, Dict[str, Any]]:
         if host == "codex":
-            return _codex_chat(payload, selected_model)
-        return _claude_chat(payload, selected_model)
+            return _codex_chat(payload, selected_model, selected_effort)
+        return _claude_chat(payload, selected_model, selected_effort)
 
     try:
         if _env_flag("RRR_HOST_PARALLEL", False):
@@ -909,6 +982,7 @@ def host_chat(
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "host": host,
                 "requested_model": selected_model,
+                "requested_effort": selected_effort or None,
                 "stage": stage,
                 "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
                 "request": payload,
@@ -930,6 +1004,7 @@ def host_chat(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "host": host,
         "requested_model": selected_model,
+        "requested_effort": selected_effort or None,
         "reported_model": actual_model,
         "context_mode": "isolated_cli",
         "authentication": auth,

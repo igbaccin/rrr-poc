@@ -20,8 +20,8 @@ CLAUDE_FALLBACK = "claude-opus-5-5"
 
 
 def _clear():
-    host_backend._selected_codex_model.cache_clear()
-    host_backend._selected_claude_model.cache_clear()
+    host_backend._codex_selection.cache_clear()
+    host_backend._claude_selection.cache_clear()
 
 
 class _Hosts(unittest.TestCase):
@@ -41,8 +41,8 @@ class _Hosts(unittest.TestCase):
             clear=False,
         )
         self.environment.start()
-        for name in ("RRR_HOST_MODEL", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
-                     "ANTHROPIC_MODEL"):
+        for name in ("RRR_HOST_MODEL", "RRR_HOST_EFFORT", "CODEX_THREAD_ID",
+                     "CLAUDE_CODE_SESSION_ID", "ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL"):
             os.environ.pop(name, None)
         _clear()
 
@@ -59,8 +59,10 @@ class _Hosts(unittest.TestCase):
         folder = self.codex / "sessions" / "2026" / "11" / "24"
         folder.mkdir(parents=True, exist_ok=True)
         rows = [{"type": "session_meta", "payload": {"id": thread, "model_provider": provider}}]
-        for model in turns:
-            rows.append({"type": "turn_context", "payload": {"model": model, "effort": "xhigh"}})
+        for turn in turns:
+            model, effort = turn if isinstance(turn, tuple) else (turn, None)
+            context = {"model": model} if effort is None else {"model": model, "effort": effort}
+            rows.append({"type": "turn_context", "payload": context})
             rows.append({"type": "response_item", "payload": {"type": "message"}})
         (folder / f"rollout-2026-11-24T23-55-56-{thread}.jsonl").write_text(
             "\n".join(json.dumps(row) for row in rows) + "\nnot json\n", encoding="utf-8",
@@ -87,7 +89,7 @@ def _assistant(model, **extra):
 
 class CodexModelTests(_Hosts):
     def test_the_thread_that_starts_rrr_decides(self):
-        self.write_config('model = "gpt-6.2-astra"\nmodel_reasoning_effort = "xhigh"\n')
+        self.write_config('model = "gpt-6.2-astra"\n')
         self.write_thread(["gpt-6.2-sol"])
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}):
             self.assertEqual(
@@ -243,6 +245,116 @@ class ClaudeModelTests(_Hosts):
             self.assertEqual(("sonnet", "RRR_HOST_MODEL"), host_backend.resolve_host_model("claude"))
 
 
+class EffortTests(_Hosts):
+    CONFIG = 'model = "gpt-6.2-astra"\nmodel_reasoning_effort = "xhigh"\n'
+
+    def test_the_thread_gives_the_effort_of_its_latest_turn(self):
+        self.write_config(self.CONFIG)
+        self.write_thread([("gpt-6.2-sol", "high"), ("gpt-6.2-sol", "low")])
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}):
+            self.assertEqual(("low", "this Codex thread"), host_backend.resolve_host_effort("codex"))
+            self.assertEqual("codex:gpt-6.2-sol@low", host_backend.host_model_name())
+
+    def test_the_configuration_gives_the_effort_when_the_thread_names_none(self):
+        self.write_config('model = "gpt-6.2-astra"\nmodel_reasoning_effort = "XHigh"\n')
+        effort, source = host_backend.resolve_host_effort("codex")
+        self.assertEqual("xhigh", effort)
+        self.assertIn("the Codex configuration", source)
+        self.write_thread(["gpt-6.2-sol"])
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}):
+            self.assertEqual("codex:gpt-6.2-sol@xhigh", host_backend.host_model_name())
+
+    def test_the_active_profile_gives_its_own_effort(self):
+        self.write_config(
+            'model = "gpt-6.2-astra"\nmodel_reasoning_effort = "low"\nprofile = "review"\n\n'
+            '[profiles.review]\nmodel_reasoning_effort = "high"\n'
+        )
+        self.assertEqual("high", host_backend.resolve_host_effort("codex")[0])
+        self.assertEqual("codex:gpt-6.2-astra@high", host_backend.host_model_name())
+
+    def test_no_selection_means_the_default_effort_of_the_model(self):
+        effort, source = host_backend.resolve_host_effort("codex")
+        self.assertEqual("", effort)
+        self.assertIn("no effort selected in Codex", source)
+        self.assertEqual("codex:" + CODEX_FALLBACK, host_backend.host_model_name())
+        for broken in ("model_reasoning_effort = 3\n", 'model_reasoning_effort = "very high"\n',
+                       'model_reasoning_effort = ""\n'):
+            self.write_config(broken)
+            self.assertEqual("", host_backend.resolve_host_effort("codex")[0], broken)
+
+    def test_the_environment_variable_comes_first_and_default_asks_for_none(self):
+        self.write_config(self.CONFIG)
+        with patch.dict(os.environ, {"RRR_HOST_EFFORT": " Medium "}):
+            self.assertEqual(("medium", "RRR_HOST_EFFORT"), host_backend.resolve_host_effort("codex"))
+            self.assertEqual("codex:gpt-6.2-astra@medium", host_backend.host_model_name())
+        with patch.dict(os.environ, {"RRR_HOST_EFFORT": "default"}):
+            self.assertEqual(("", "RRR_HOST_EFFORT"), host_backend.resolve_host_effort("codex"))
+            self.assertEqual("codex:gpt-6.2-astra", host_backend.host_model_name())
+        with patch.dict(os.environ, {"RRR_HOST_EFFORT": "very high"}):
+            with self.assertRaises(host_backend.HostBackendError):
+                host_backend.resolve_host_effort("codex")
+
+    def test_a_pinned_model_inherits_no_effort(self):
+        self.write_config(self.CONFIG)
+        self.write_thread([("gpt-6.2-astra", "xhigh")])
+        with patch.dict(os.environ, {"RRR_HOST_MODEL": "gpt-6.2-sol", "CODEX_THREAD_ID": THREAD}):
+            effort, source = host_backend.resolve_host_effort("codex")
+            self.assertEqual("", effort)
+            self.assertIn("RRR_HOST_MODEL pins the model", source)
+            self.assertEqual("codex:gpt-6.2-sol", host_backend.host_model_name())
+            with patch.dict(os.environ, {"RRR_HOST_EFFORT": "low"}):
+                self.assertEqual("codex:gpt-6.2-sol@low", host_backend.host_model_name())
+
+    def test_a_configuration_for_another_provider_gives_no_effort(self):
+        self.write_config(
+            'model = "qwen3:32b"\nmodel_provider = "ollama"\nmodel_reasoning_effort = "high"\n'
+        )
+        self.assertEqual("", host_backend.resolve_host_effort("codex")[0])
+
+    def test_the_claude_session_gives_the_effort(self):
+        self.write_settings({"model": "opus[1m]", "effortLevel": "low"})
+        self.write_session([
+            _assistant("claude-fable-5-2", effort="high"),
+            _assistant("claude-fable-5-2", effort="xhigh", perTurnEffort="xhigh"),
+            _assistant("claude-haiku-5-5", effort="low", isSidechain=True),
+        ])
+        with patch.dict(os.environ, {"RRR_HOST": "claude", "CLAUDE_CODE_SESSION_ID": SESSION,
+                                     "CLAUDE_CODE_EFFORT_LEVEL": "medium"}):
+            self.assertEqual(
+                ("xhigh", "this Claude Code session"), host_backend.resolve_host_effort("claude"),
+            )
+            self.assertEqual("claude:claude-fable-5-2@xhigh", host_backend.host_model_name())
+
+    def test_without_a_session_the_variable_then_the_settings_give_the_effort(self):
+        self.write_settings({"model": "opus[1m]", "effortLevel": "low"})
+        with patch.dict(os.environ, {"CLAUDE_CODE_EFFORT_LEVEL": "medium"}):
+            self.assertEqual(
+                ("medium", "CLAUDE_CODE_EFFORT_LEVEL"), host_backend.resolve_host_effort("claude"),
+            )
+        effort, source = host_backend.resolve_host_effort("claude")
+        self.assertEqual("low", effort)
+        self.assertIn("the Claude Code settings", source)
+
+    def test_the_effort_kept_for_the_selected_model_comes_before_the_general_one(self):
+        per_model = {
+            "claude-opus-5-5": {"effortLevel": "xhigh"},
+            "claude-sonnet-5-5": {"effortLevel": "medium"},
+        }
+        self.write_settings(
+            {"model": "claude-opus-5-5[1m]", "effortLevel": "low", "modelSettings": per_model}
+        )
+        self.assertEqual("xhigh", host_backend.resolve_host_effort("claude")[0])
+        self.write_settings({"model": "opus[1m]", "modelSettings": per_model})
+        self.assertEqual("xhigh", host_backend.resolve_host_effort("claude")[0])
+        per_model["claude-opus-4-8"] = {"effortLevel": "high"}
+        self.write_settings({"model": "opus", "modelSettings": per_model})
+        effort, source = host_backend.resolve_host_effort("claude")
+        self.assertEqual("", effort)
+        self.assertIn("no effort selected in Claude Code", source)
+        self.write_settings({"model": "opus", "modelSettings": "none", "effortLevel": 4})
+        self.assertEqual("", host_backend.resolve_host_effort("claude")[0])
+
+
 class HostCallUsesTheResolvedModelTests(_Hosts):
     CODEX_AUTH = {"kind": "subscription", "provider": "openai", "method": "chatgpt"}
     CLAUDE_AUTH = {"kind": "subscription", "provider": "anthropic", "method": "claude.ai"}
@@ -267,6 +379,32 @@ class HostCallUsesTheResolvedModelTests(_Hosts):
         self.assertEqual("gpt-6.2-astra", command[command.index("--model") + 1])
         self.assertIn("--ignore-user-config", command)
         self.assertNotIn("CODEX_THREAD_ID", observed["env"])
+        self.assertFalse([part for part in command if "model_reasoning_effort" in part])
+
+    def test_the_codex_command_carries_the_inherited_effort_and_the_audit_records_it(self):
+        self.write_config('model = "gpt-6.2-astra"\nmodel_reasoning_effort = "xhigh"\n')
+        observed = {}
+
+        def fake_run(command, prompt, cwd, env):
+            observed["command"] = list(command)
+            Path(command[command.index("-o") + 1]).write_text("OK", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="OK\n", stderr="")
+
+        audit = Path(self.temp.name) / "audit"
+        with patch.dict(os.environ, {"RRR_HOST_AUDIT": "1", "RRR_HOST_AUDIT_DIR": str(audit)}), \
+                patch.object(host_backend, "_command_candidates", return_value=["codex"]), \
+                patch.object(host_backend, "_run_process", side_effect=fake_run), \
+                patch.object(host_backend, "_verify_subscription_auth", return_value=self.CODEX_AUTH):
+            host_backend.host_chat(messages=[{"role": "user", "content": "x"}])
+        command = observed["command"]
+        setting = 'model_reasoning_effort="xhigh"'
+        self.assertEqual("-c", command[command.index(setting) - 1])
+        self.assertEqual("-", command[-1])
+        records = [json.loads(path.read_text(encoding="utf-8")) for path in audit.glob("*.json")]
+        self.assertEqual(
+            [("gpt-6.2-astra", "xhigh")],
+            [(record["requested_model"], record["requested_effort"]) for record in records],
+        )
 
     def test_the_claude_command_names_the_inherited_model_and_loads_no_settings(self):
         self.write_settings({"model": "opus[1m]"})
@@ -287,9 +425,19 @@ class HostCallUsesTheResolvedModelTests(_Hosts):
         command = observed["command"]
         self.assertEqual("opus[1m]", command[command.index("--model") + 1])
         self.assertEqual("", command[command.index("--setting-sources") + 1])
+        self.assertNotIn("--effort", command)
+        self.write_settings({"model": "sonnet", "effortLevel": "high"})
+        with patch.dict(os.environ, {"RRR_HOST_AUDIT": "0", "RRR_HOST": "claude"}), \
+                patch.object(host_backend, "_command_candidates", return_value=["claude"]), \
+                patch.object(host_backend, "_run_process", side_effect=fake_run), \
+                patch.object(host_backend, "_verify_subscription_auth", return_value=self.CLAUDE_AUTH):
+            host_backend.host_chat(messages=[{"role": "user", "content": "x"}])
+        command = observed["command"]
+        self.assertEqual("sonnet", command[command.index("--model") + 1])
+        self.assertEqual("high", command[command.index("--effort") + 1])
 
-    def test_host_doctor_reports_the_model_and_its_source(self):
-        self.write_config('model = "gpt-6.2-astra"\n')
+    def test_host_doctor_reports_the_model_the_effort_and_their_sources(self):
+        self.write_config('model = "gpt-6.2-astra"\nmodel_reasoning_effort = "xhigh"\n')
         with patch.object(host_backend, "_command_candidates", return_value=["codex"]), \
                 patch.object(host_backend, "_verify_subscription_auth", return_value=self.CODEX_AUTH):
             status = host_backend.host_diagnostics()
@@ -302,8 +450,11 @@ class HostCallUsesTheResolvedModelTests(_Hosts):
         self.assertEqual("gpt-6.2-astra", status["model"])
         self.assertIn("the Codex configuration", status["model_source"])
         self.assertIn("[RRR] model: gpt-6.2-astra (from the Codex configuration, ", console.getvalue())
-        self.assertEqual("gpt-6.2-astra", json.loads(as_json.getvalue())["model"])
-        self.assertIn("model_source", json.loads(as_json.getvalue()))
+        self.assertIn("[RRR] effort: xhigh (from the Codex configuration, ", console.getvalue())
+        report = json.loads(as_json.getvalue())
+        self.assertEqual(("gpt-6.2-astra", "xhigh"), (report["model"], report["effort"]))
+        self.assertIn("model_source", report)
+        self.assertIn("effort_source", report)
 
     def test_host_doctor_names_the_environment_variable_when_it_decides(self):
         self.write_config('model = "gpt-6.2-astra"\n')
@@ -314,6 +465,19 @@ class HostCallUsesTheResolvedModelTests(_Hosts):
                 contextlib.redirect_stdout(console):
             host_doctor_main(["--host", "codex"])
         self.assertIn("[RRR] model: gpt-6.1-terra (from RRR_HOST_MODEL)", console.getvalue())
+        self.assertIn(
+            "[RRR] effort: the model's default (RRR_HOST_MODEL pins the model and "
+            "RRR_HOST_EFFORT is not set)",
+            console.getvalue(),
+        )
+        console = io.StringIO()
+        with patch.object(host_backend, "_command_candidates", return_value=["codex"]), \
+                patch.object(host_backend, "_verify_subscription_auth", return_value=self.CODEX_AUTH), \
+                contextlib.redirect_stdout(console):
+            host_doctor_main(["--host", "codex", "--model", "gpt-6.1-terra", "--effort", "low"])
+        self.assertIn("[RRR] effort: low (from RRR_HOST_EFFORT)", console.getvalue())
+        os.environ.pop("RRR_HOST_MODEL", None)
+        os.environ.pop("RRR_HOST_EFFORT", None)
 
     def test_host_doctor_says_when_the_fallback_runs(self):
         console = io.StringIO()
@@ -334,10 +498,20 @@ class SkillTextTests(unittest.TestCase):
         for relative in (".agents/skills/rrr/SKILL.md", "plugins/rrr/skills/rrr/SKILL.md",
                          "skills/rrr/SKILL.md"):
             text = " ".join((root / relative).read_text(encoding="utf-8").split())
-            self.assertIn("A run inherits the model the user has selected in Codex", text)
-            self.assertIn("A run inherits the model the user has selected in Claude Code", text)
-            self.assertIn("`gpt-6.2-sol` runs only when RRR finds no selection", text)
-            self.assertIn("`claude-opus-5-5` runs only when RRR finds no selection", text)
+            self.assertIn(
+                "A run inherits the model and the reasoning effort the user has selected in Codex",
+                text,
+            )
+            self.assertIn(
+                "A run inherits the model and the effort the user has selected in Claude Code", text,
+            )
+            self.assertIn(
+                "`gpt-6.2-sol` at its default effort runs only when RRR finds no selection", text,
+            )
+            self.assertIn(
+                "`claude-opus-5-5` at its default effort runs only when RRR finds no selection", text,
+            )
+            self.assertIn("`RRR_HOST_EFFORT`", text)
             self.assertNotIn("newest Sol-tier", text)
             self.assertNotIn("The default host model is", text)
             self.assertIn("GPT-5.5 or GPT-5.6 model", text)

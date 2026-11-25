@@ -208,6 +208,7 @@ def host_doctor_main(argv):
     )
     ap.add_argument("--host", choices=["codex", "claude"], default=None)
     ap.add_argument("--model", default=None)
+    ap.add_argument("--effort", default=None)
     ap.add_argument(
         "--smoke",
         action="store_true",
@@ -220,6 +221,8 @@ def host_doctor_main(argv):
         os.environ["RRR_HOST"] = args.host
     if args.model:
         os.environ["RRR_HOST_MODEL"] = args.model
+    if args.effort:
+        os.environ["RRR_HOST_EFFORT"] = args.effort
 
     from rrr.host_backend import (
         HostBackendError,
@@ -246,6 +249,10 @@ def host_doctor_main(argv):
         f"{auth['method']} subscription{suffix}"
     )
     print(f"[RRR] model: {status['model']} (from {status.get('model_source', 'unknown')})")
+    if status.get("effort"):
+        print(f"[RRR] effort: {status['effort']} (from {status.get('effort_source', 'unknown')})")
+    else:
+        print(f"[RRR] effort: the model's default ({status.get('effort_source', 'not set')})")
     print(f"[RRR] executable: {status['executable']}")
     if status.get("inference_ready"):
         print("[RRR] inference smoke test: passed")
