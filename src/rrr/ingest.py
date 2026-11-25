@@ -736,6 +736,13 @@ _YEAR_LETTERS = "abcdefghijklmnopqrstuvwxyz"
 _DOC_ID_PARTS_RE = re.compile(r"^(?P<name>.+)_(?P<year>\d{4})(?P<letter>[a-z]?)$")
 
 
+def _group_label(meta, name: str, year: str) -> str:
+    from rrr.render import _regex_doc_id_to_author_label
+
+    surnames = list(getattr(meta, "surnames", None) or []) or _surnames_from_meta(meta)
+    return build_display_label(surnames, year) or _regex_doc_id_to_author_label(f"{name}_{year}")
+
+
 def _year_letter_hint(meta: ExtractedMeta, year: str) -> tuple:
     cell = re.fullmatch(r"\s*(\d{4})([a-z])\s*", str(meta.year or ""))
     if cell and cell.group(1) == year:
@@ -787,7 +794,7 @@ def assign_year_letters(rows: list) -> list:
             source = "assigned" if not wanted else f"assigned ({wanted} already in use)"
             taken[letter] = (meta, source)
         record = {
-            "label": _regex_doc_id_to_author_label(f"{name}_{year}"),
+            "label": _group_label(members[0][0], name, year),
             "members": [],
         }
         for letter in sorted(taken):
@@ -822,7 +829,7 @@ def year_letter_groups(rows: list) -> list:
         if len(members) < 2:
             continue
         report.append({
-            "label": _regex_doc_id_to_author_label(f"{name}_{year}"),
+            "label": _group_label(members[0], name, year),
             "members": [
                 {
                     "doc_id": meta.doc_id,

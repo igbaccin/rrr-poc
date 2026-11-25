@@ -148,6 +148,17 @@ class AssignYearLettersTests(unittest.TestCase):
         ]
         self.assertEqual([], assign_year_letters(rows))
 
+    def test_a_group_is_named_by_the_label_its_works_share(self):
+        rows = [
+            _row("GhanaStatisticalService_2000", "2000", "Ghana Statistical Service (2000a).pdf"),
+            _row("GhanaStatisticalService_2000a", "2000", "Ghana Statistical Service (2000b).pdf"),
+        ]
+        for row in rows:
+            row.surnames = ["Ghana Statistical Service"]
+        groups = assign_year_letters(rows)
+        self.assertEqual("Ghana Statistical Service (2000)", groups[0]["label"])
+        self.assertEqual(groups, year_letter_groups(rows))
+
     def test_groups_can_be_rebuilt_from_lettered_rows(self):
         rows = [
             _row("Plange_1979", "1979", "Plange (1979a).pdf"),

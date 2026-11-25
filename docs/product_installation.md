@@ -335,11 +335,13 @@ that folder once on a computer that reaches the index and runs the same Python
 version and the same system as the target:
 
 ```bash
-python -m pip download --dest wheelhouse "PATH_TO/runtime/rrr_poc-15.19.3-py3-none-any.whl"
+python -m pip download --dest wheelhouse "PATH_TO/runtime/rrr_poc-VERSION-py3-none-any.whl"
 ```
 
-The command downloads RRR's dependencies beside the bundled wheel. Copy the
-folder to the target computer and name it when installing:
+The wheel is the one in the `runtime` folder of the plugin or the skill, and
+`runtime.json` beside it gives its exact name. The command downloads RRR's
+dependencies beside it. Copy the folder to the target computer and name it
+when installing:
 
 ```bash
 python scripts/bootstrap_rrr.py --wheelhouse PATH_TO/wheelhouse --json
