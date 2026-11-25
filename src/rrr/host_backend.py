@@ -385,6 +385,10 @@ def _backend_prompt(payload: Dict[str, Any]) -> str:
     return "\n".join(rules) + "\n\n<rrr_request_json>\n" + rendered + "\n</rrr_request_json>"
 
 
+def _no_window_flags() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
@@ -396,6 +400,7 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
                 stderr=subprocess.DEVNULL,
                 timeout=15,
                 check=False,
+                creationflags=_no_window_flags(),
             )
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -417,7 +422,9 @@ def _run_command(
 ) -> subprocess.CompletedProcess:
     popen_options: Dict[str, Any] = {}
     if os.name == "nt":
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | _no_window_flags()
+        )
     else:
         popen_options["start_new_session"] = True
     try:

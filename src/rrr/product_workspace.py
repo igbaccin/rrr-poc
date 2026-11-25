@@ -214,6 +214,7 @@ def _run(command: list[str], env: dict[str, str], quiet: bool = False) -> None:
         text=quiet,
         encoding="utf-8" if quiet else None,
         errors="replace" if quiet else None,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
     )
     if quiet:
         if completed.stdout:

@@ -53,6 +53,7 @@ def _run_git(args):
             capture_output=True,
             timeout=20,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
         if res.returncode == 0:
             return res.stdout
@@ -102,6 +103,7 @@ def _hardware_info():
             capture_output=True,
             timeout=10,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
         if res.returncode == 0:
             info["gpus"] = [line.strip() for line in res.stdout.splitlines() if line.strip()]
