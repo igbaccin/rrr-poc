@@ -146,12 +146,14 @@ class SkillPackagingTests(unittest.TestCase):
                 patch.object(module.venv.EnvBuilder, "create"),
                 patch.object(module.subprocess, "run") as run,
             ):
+                run.return_value.returncode = 0
                 result = module.bootstrap(PLUGIN_ROOT, install_base=install_base)
         self.assertFalse(result["reused"])
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 3)
         self.assertIn("--force-reinstall", commands[1])
         self.assertIn("--no-deps", commands[1])
+        self.assertEqual(["-c", "import rrr.cli"], commands[2][1:])
 
     def test_repo_marketplace_points_to_the_plugin(self):
         marketplace = json.loads(

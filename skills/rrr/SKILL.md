@@ -79,16 +79,22 @@ CLI invocation with `RRR_RUNTIME` unset continues to use local Ollama.
 
 ## Resolve the RRR command
 
-1. Use an existing `rrr` command when `rrr prepare --help` succeeds.
+In these instructions `rrr` stands for the resolved RRR command. That command
+is always an interpreter followed by `-m rrr`, for example
+`<python> -m rrr prepare "<folder>" --json`. Do not start the `rrr` launcher
+file itself: it is an unsigned executable, and a managed Windows computer may
+refuse to run it ("blocked by group policy").
+
+1. Use `python -m rrr` when `python -m rrr prepare --help` succeeds.
 2. When the current project is an RRR checkout containing `pyproject.toml` and
    `src/rrr/`, install that checkout if needed. Use `python -m pip install -e
    <repo-root>` for local or host mode and add `[api]` for provider API mode.
 3. Otherwise, look for `runtime/runtime.json` in this skill directory and in
    the installed plugin root two levels above it. When a bundle is present,
    tell the user that RRR is completing its first-time installation. Run the
-   adjacent `scripts/bootstrap_rrr.py --json` and use the `rrr` executable
-   returned in its JSON output. Add `--api` when the user selected a provider
-   API.
+   adjacent `scripts/bootstrap_rrr.py --json` and use the `command` array
+   returned in its JSON output (the private runtime's interpreter, then `-m`
+   and `rrr`). Add `--api` when the user selected a provider API.
 
 The plugin bootstrap installs its verified bundled wheel and dependencies in
 RRR's private user-data directory. Do not ask the user to install the Python

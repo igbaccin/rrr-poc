@@ -111,8 +111,8 @@ https://github.com/igbaccin/rrr-poc.
 
 Copy the complete skills/rrr directory to ~/.claude/skills/rrr. Preserve
 SKILL.md, runtime, scripts, and agents. Run scripts/bootstrap_rrr.py --json
-from the installed skill, then use the returned rrr executable to run
-rrr host-doctor --host claude --json. Use my Claude subscription. Do not
+from the installed skill, then run the returned command with
+host-doctor --host claude --json added. Use my Claude subscription. Do not
 configure an Anthropic API key or Ollama. Stop after confirming that /rrr is
 installed and tell me whether Claude Code needs to be restarted.
 ```

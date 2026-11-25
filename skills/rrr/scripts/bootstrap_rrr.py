@@ -60,6 +60,30 @@ def _runtime_paths(install_root: Path) -> tuple[Path, Path, Path]:
     return venv_dir, venv_dir / "bin" / "python", venv_dir / "bin" / "rrr"
 
 
+def _quiet_child() -> dict:
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
+def runtime_command(python_exe: Path) -> list[str]:
+    return [str(python_exe), "-m", "rrr"]
+
+
+def runtime_starts(python_exe: Path) -> bool:
+    try:
+        completed = subprocess.run(
+            [str(python_exe), "-c", "import rrr.cli"],
+            capture_output=True,
+            timeout=180,
+            check=False,
+            **_quiet_child(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def bootstrap(
     plugin_root: Path,
     install_base: Path | None = None,
@@ -75,7 +99,7 @@ def bootstrap(
     requested_extras = {"api"} if install_api else set()
     reused = False
     installed_extras: set[str] = set()
-    if marker.is_file() and python_exe.is_file() and rrr_exe.is_file():
+    if marker.is_file() and python_exe.is_file():
         try:
             installed = json.loads(marker.read_text(encoding="utf-8"))
             installed_extras = set(installed.get("extras", []))
@@ -83,6 +107,7 @@ def bootstrap(
                 installed.get("bootstrap_schema") == BOOTSTRAP_SCHEMA
                 and installed.get("sha256") == bundle["sha256"]
                 and requested_extras.issubset(installed_extras)
+                and runtime_starts(python_exe)
             )
         except (json.JSONDecodeError, OSError):
             reused = False
@@ -117,6 +142,11 @@ def bootstrap(
             ],
             check=True,
         )
+        if not runtime_starts(python_exe):
+            raise RuntimeError(
+                "RRR was installed, but its interpreter cannot import it: "
+                f"{python_exe}"
+            )
         marker.write_text(
             json.dumps(
                 {
@@ -135,6 +165,7 @@ def bootstrap(
     return {
         "version": version,
         "python": str(python_exe),
+        "command": runtime_command(python_exe),
         "rrr": str(rrr_exe),
         "install_root": str(install_root),
         "extras": sorted(installed_extras | requested_extras),
@@ -163,7 +194,7 @@ def main() -> None:
     else:
         action = "reused" if result["reused"] else "installed"
         print(f"[RRR] {action} RRR {result['version']}")
-        print(f"[RRR] command: {result['rrr']}")
+        print(f"[RRR] command: {' '.join(result['command'])}")
 
 
 if __name__ == "__main__":

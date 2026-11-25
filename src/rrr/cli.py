@@ -379,6 +379,7 @@ def main():
         return
 
     ap = argparse.ArgumentParser(
+        prog="rrr",
         description="RRR CLI. `t2` runs the full literature-review pipeline; "
                     "`t1` runs the claim-evaluator (same up to Stage 2, no writer)."
     )
