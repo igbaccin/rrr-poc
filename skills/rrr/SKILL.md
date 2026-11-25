@@ -123,8 +123,20 @@ Exit status `3` means that some metadata needs human review. Show those records
 and wait for the user's decision. Add `--accept-low-confidence` only after
 approval. The optional `--with-llm-metadata` route can add one model call for
 each unresolved OCR-usable PDF, so explain that additional usage before using
-it. Stop on an extraction or reference-section invariant failure. PDFs without
-usable OCR text remain outside RRR's reliable extraction path.
+it. Stop on an extraction failure. PDFs without usable OCR text remain outside
+RRR's reliable extraction path.
+
+The JSON result of `rrr prepare` carries a `warnings` list. Show every warning
+to the user in plain words before running the task, then continue.
+
+- `reference_list_removed` names a document and a page that still held part of
+  a reference list. RRR cut the page at the list, or set the page aside, and
+  the entry lists the first lines it removed.
+- `shared_citation_label` names two or more documents that are cited under one
+  label. Pass on the remedy the warning gives.
+
+Add `--strict`, or set `RRR_STRICT_PREPARE=1`, when the user wants preparation
+to stop on a leftover reference list.
 
 ## Run the task
 

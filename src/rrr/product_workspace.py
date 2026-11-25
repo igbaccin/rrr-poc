@@ -182,6 +182,26 @@ def _warnings(workspace_dir: Path) -> tuple:
             "doc_ids": doc_ids,
             "message": message.strip(),
         })
+    for record in report.get("reference_leaks") or []:
+        if not isinstance(record, dict):
+            continue
+        done = (
+            f"RRR cut the page at the list and kept {record.get('kept_chars', 0)} "
+            "characters of text"
+            if record.get("action") == "cut"
+            else "RRR set the page aside, and it is not indexed"
+        )
+        warnings.append({
+            "type": "reference_list_removed",
+            "doc_id": str(record.get("doc_id") or ""),
+            "page": record.get("page"),
+            "action": record.get("action"),
+            "lines": list(record.get("lines") or []),
+            "message": (
+                f"{record.get('doc_id')} page {record.get('page')} still held a "
+                f"reference list. {done}. Use --strict to stop on such a page."
+            ),
+        })
     return tuple(warnings)
 
 
@@ -210,6 +230,7 @@ def prepare_workspace(
     accept_low_confidence: bool = False,
     force: bool = False,
     quiet: bool = False,
+    strict: bool = False,
 ) -> PreparedWorkspace:
     corpus_dir = Path(corpus_dir).expanduser().resolve()
     pdfs = _pdfs_in(corpus_dir)
@@ -255,11 +276,10 @@ def prepare_workspace(
     if accept_low_confidence:
         ingest.append("--accept-low-confidence")
     _run(ingest, env, quiet=quiet)
-    _run(
-        [sys.executable, "-m", "rrr.preprocess", "--metadata", str(metadata_path)],
-        env,
-        quiet=quiet,
-    )
+    preprocess = [sys.executable, "-m", "rrr.preprocess", "--metadata", str(metadata_path)]
+    if strict:
+        preprocess.append("--strict")
+    _run(preprocess, env, quiet=quiet)
     _run(
         [sys.executable, "-m", "rrr.index", "--metadata", str(metadata_path)],
         env,

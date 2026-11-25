@@ -1,4 +1,4 @@
-import argparse, os, pandas as pd, re
+import argparse, json, os, pandas as pd, re, shutil, sys
 import pymupdf
 from rrr.utils import sha256_file, ensure_dir, save_json
 from rrr.paths import data_path
@@ -258,10 +258,109 @@ def scan_reference_leaks(page_text_dir):
     return leaks
 
 
+def _bibliography_run_start(text: str):
+    matches = list(_BIB_ENTRY_LINE_RE.finditer(text))
+    for index in range(len(matches) - 2):
+        first, second, third = matches[index:index + 3]
+        if second.start() - first.end() <= 300 and third.start() - second.end() <= 300:
+            return first.start()
+    return matches[0].start() if matches else None
+
+
+def resolve_reference_leaks(page_text_dir, page_meta_dir=None, min_kept_chars: int = 200) -> list:
+    page_text_dir = str(page_text_dir)
+    if page_meta_dir is None:
+        page_meta_dir = os.path.join(os.path.dirname(page_text_dir), "page_meta")
+    set_aside_dir = os.path.join(os.path.dirname(page_text_dir), "page_text_set_aside")
+    records = []
+    for name, reason in scan_reference_leaks(page_text_dir):
+        path = os.path.join(page_text_dir, name)
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        doc_id, _, page = name[:-len(".txt")].rpartition("_page_")
+        cuts = []
+        header = _STANDALONE_REF_HEADER_RE.search(text)
+        if header:
+            cuts.append(header.start())
+        run = _bibliography_run_start(text)
+        if run is not None:
+            cuts.append(run)
+        cut = min(cuts) if cuts else 0
+        kept = text[:cut].rstrip()
+        lines = [
+            " ".join(match.group(0).split())[:160]
+            for match in _BIB_ENTRY_LINE_RE.finditer(text)
+        ][:5]
+        meta_path = os.path.join(str(page_meta_dir), f"{doc_id}_page_{page}.json")
+        if len(kept) >= min_kept_chars:
+            action = "cut"
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(kept)
+            if os.path.isfile(meta_path):
+                save_json(
+                    {
+                        "doc_id": doc_id,
+                        "page": int(page),
+                        "page_type": "content",
+                        "char_count": len(kept),
+                        "sentences": sentence_spans(kept),
+                    },
+                    meta_path,
+                )
+        else:
+            action = "set_aside"
+            ensure_dir(set_aside_dir)
+            shutil.move(path, os.path.join(set_aside_dir, name))
+            if os.path.isfile(meta_path):
+                os.remove(meta_path)
+            kept = ""
+        records.append({
+            "doc_id": doc_id,
+            "page": int(page),
+            "file": name,
+            "reason": reason,
+            "action": action,
+            "kept_chars": len(kept),
+            "removed_chars": len(text) - len(kept),
+            "lines": lines,
+        })
+    return records
+
+
+def _strict_prepare(flag: bool) -> bool:
+    raw = os.environ.get("RRR_STRICT_PREPARE", "").strip().lower()
+    return bool(flag) or raw in {"1", "true", "yes", "on"}
+
+
+def _record_reference_leaks(metadata_path: str, records: list) -> None:
+    report_path = os.path.join(os.path.dirname(os.path.abspath(metadata_path)),
+                               "ingest_report.json")
+    report = {}
+    if os.path.isfile(report_path):
+        try:
+            with open(report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            report = {}
+    if not isinstance(report, dict):
+        report = {}
+    if not records and "reference_leaks" not in report and not os.path.isfile(report_path):
+        return
+    report["reference_leaks"] = records
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, ensure_ascii=False)
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(prog="python -m rrr.preprocess")
     ap.add_argument("--metadata", required=True)
     ap.add_argument("--workers", type=int, default=max(1, cpu_count()-1))
+    ap.add_argument(
+        "--strict", action="store_true",
+        help="Stop when a retained page still holds a reference list "
+             "(also RRR_STRICT_PREPARE=1). By default the page is cut at the "
+             "list, or set aside, and reported.",
+    )
     args = ap.parse_args()
     df = pd.read_csv(args.metadata)
     rows = [r.to_dict() for _, r in df.iterrows()]
@@ -279,10 +378,31 @@ def main():
     print(f"[done] preprocessing - excluded {total_ref_excluded} reference pages total")
 
     leaks = scan_reference_leaks(data_path("page_text"))
-    if leaks:
-        print(f"[FATAL] reference-leak invariant FAILED — {len(leaks)} retained "
+    if leaks and _strict_prepare(args.strict):
+        print(f"[FATAL] reference-leak invariant FAILED - {len(leaks)} retained "
               f"page(s) still contain a bibliography:")
         for fn, why in leaks:
+            print(f"    {fn}: {why}")
+        raise SystemExit(1)
+    records = resolve_reference_leaks(data_path("page_text"), data_path("page_meta")) if leaks else []
+    for record in records:
+        done = (
+            f"the page was cut at the list ({record['kept_chars']} characters kept)"
+            if record["action"] == "cut"
+            else "the page was set aside and is not indexed"
+        )
+        sys.stderr.write(
+            f"[RRR] warning: {record['doc_id']} page {record['page']}: a reference "
+            f"list remained on the page ({record['reason']}); {done}.\n"
+        )
+        for line in record["lines"]:
+            sys.stderr.write(f"    {line}\n")
+    _record_reference_leaks(args.metadata, records)
+    remaining = scan_reference_leaks(data_path("page_text"))
+    if remaining:
+        print(f"[FATAL] reference-leak invariant FAILED - {len(remaining)} retained "
+              f"page(s) still contain a bibliography after the cut:")
+        for fn, why in remaining:
             print(f"    {fn}: {why}")
         raise SystemExit(1)
     print("[invariant] OK - no reference-section leaks in retained page_text.")

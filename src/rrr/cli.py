@@ -273,6 +273,12 @@ def prepare_main(argv):
     ap.add_argument("--with-llm-metadata", action="store_true")
     ap.add_argument("--accept-low-confidence", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument(
+        "--strict", action="store_true",
+        help="Stop when a retained page still holds a reference list. By "
+             "default RRR cuts the page at the list, or sets it aside, and "
+             "reports it under warnings. RRR_STRICT_PREPARE=1 does the same.",
+    )
     ap.add_argument("--json", action="store_true", dest="as_json")
     args = ap.parse_args(argv)
 
@@ -306,6 +312,7 @@ def prepare_main(argv):
             accept_low_confidence=args.accept_low_confidence,
             force=args.force,
             quiet=args.as_json,
+            strict=args.strict,
         )
     except CorpusDiscoveryError as exc:
         error = {
