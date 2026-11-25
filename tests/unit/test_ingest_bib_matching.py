@@ -222,7 +222,6 @@ class FileNameMatchTests(unittest.TestCase):
             "Aryeetey and Kanbur (2008).pdf": "AryeeteyKanbur2008",
             "Aryeetey & McKay (2008).pdf": "AryeeteyMcKay2008",
             "Appiah-Kubi et al. (2008).pdf": "AppiahKubi2008",
-            "Appiah-Kubi (2008).pdf": "AppiahKubi2008solo",
             "Food and Agriculture Organization (2001).pdf": "FAO2001",
         }
         for file_name, key in expected.items():
@@ -230,6 +229,25 @@ class FileNameMatchTests(unittest.TestCase):
             self.assertIsNotNone(match.entry, f"{file_name}: {match.note}")
             self.assertEqual(key, match.entry["key"], file_name)
             self.assertEqual("file_name", match.route, file_name)
+
+    def test_a_file_named_after_one_author_says_nothing_about_co_authors(self):
+        solo = _entry("AppiahKubi2008solo", ["Appiah-Kubi"], "2008",
+                      title="Poverty Reduction, Growth and Inequality in Ghana since 1990")
+        team = _entry("AppiahKubi2008", ["Appiah-Kubi", "Oduro", "Senadza"], "2008",
+                      title="Understanding Poverty in Ghana: Risk and Vulnerability")
+        for file_name in ("Appiah-Kubi (2008).pdf", "AppiahKubi2008x.pdf", "Appiah-Kubi_2008.pdf"):
+            match = _match(file_name, [solo, team], FILLER)
+            self.assertTrue(match.ambiguous, file_name)
+            self.assertIn("AppiahKubi2008solo, AppiahKubi2008", match.note)
+        page = "Understanding poverty in Ghana: risk and vulnerability\n" + FILLER
+        self.assertEqual("AppiahKubi2008", _match("Appiah-Kubi (2008).pdf", [solo, team], page).entry["key"])
+        self.assertEqual(
+            "AppiahKubi2008", _match("Appiah-Kubi et al. (2008).pdf", [solo, team], FILLER).entry["key"]
+        )
+        self.assertEqual(
+            "AppiahKubi2008",
+            _match("Appiah-Kubi and Oduro (2008).pdf", [solo, team], FILLER).entry["key"],
+        )
 
     def test_reference_manager_file_names_find_their_entry(self):
         sidecar = self.SIDECAR + [
@@ -243,6 +261,7 @@ class FileNameMatchTests(unittest.TestCase):
                 "MoradiAustinBaten2013",
             "Aryeetey and Kanbur - 2008 - Ghana's economy at half century.pdf":
                 "AryeeteyKanbur2008",
+            "2008 - Appiah-Kubi et al. - Understanding poverty in Ghana.pdf": "AppiahKubi2008",
             "World Bank (1995) Ghana Poverty Past Present and Future.pdf": "WorldBank1995",
             "2017 - de Haas - Measuring rural welfare.pdf": "deHaas2017",
             "2003_Canagarajah and Pörtner_Evolution of poverty.pdf": "CanagarajahPortner2003",
@@ -324,13 +343,14 @@ class FileNameMatchTests(unittest.TestCase):
         self.assertFalse(match.ambiguous)
         self.assertIn("file name read as Brukum (1998)", match.note)
         self.assertIn("no bibliography entry has that first author and year", match.note)
-        self.assertIn("no bibliography title found on the first pages", match.note)
+        self.assertIn("no bibliography title found as one phrase on the first pages", match.note)
         match = _match("scan0042.pdf", self.SIDECAR, FILLER)
         self.assertIn("file name has no author-and-year form", match.note)
 
 
 class TitleMatchTests(unittest.TestCase):
     TITLE = "Evolution of Poverty and Welfare in Ghana in the 1990s: Achievements and Challenges"
+    SHORT = "Poverty Trends in Ghana in the 1990s"
 
     def test_ligatures_and_accents_are_folded_on_both_sides(self):
         title = "Efficient Offices and the Financing of Pörtner's Welfare Reforms"
@@ -344,7 +364,7 @@ class TitleMatchTests(unittest.TestCase):
         page = "GHANA: POVERTY PAST, PRESENT AND FUTURE\nWorld Bank 1995\n" + FILLER
         self.assertTrue(_fuzzy_title_match("Ghana: Poverty Past, Present and Future", page))
 
-    def test_the_match_stays_strict(self):
+    def test_the_title_must_stand_as_one_phrase(self):
         scattered = (
             "Welfare rose. Poverty fell in Ghana. The 1990s brought challenges and "
             "achievements, and the evolution of prices mattered. " + FILLER
@@ -354,18 +374,71 @@ class TitleMatchTests(unittest.TestCase):
         self.assertFalse(_fuzzy_title_match(self.TITLE, other))
         self.assertFalse(_fuzzy_title_match("Ghana in 1957", "Ghana in 1957 " + FILLER))
 
-    def test_the_title_route_needs_author_and_year_on_the_page(self):
+    def test_a_run_of_generic_words_shared_with_another_title_is_no_match(self):
+        page = (
+            "Growth with Selective Poverty Reduction: Ghana in the 1990s\n"
+            "Harold Coulombe and Andrew McKay\nPoverty trends are described with "
+            "the Ghana Statistical Service surveys of 2000. " + FILLER
+        )
+        self.assertFalse(_fuzzy_title_match(self.SHORT, page))
+        sidecar = [
+            _entry("GSS2000a", ["Ghana Statistical Service"], "2000", title=self.SHORT),
+            _entry("CoulombeMcKay2007", ["Coulombe", "McKay"], "2007",
+                   title="Growth with Selective Poverty Reduction: Ghana in the 1990s"),
+        ]
+        match = _match("paper_046.pdf", sidecar, page)
+        self.assertEqual(("CoulombeMcKay2007", "title"), (match.entry["key"], match.route))
+
+    def test_a_long_title_needs_no_author_or_year_and_a_short_one_does(self):
         sidecar = [_entry("CP2003", ["Canagarajah", "Pörtner"], "2003", title=self.TITLE)]
-        page = self.TITLE + "\nSudharshan Canagarajah and Claus C. Pörtner\n2003\n" + FILLER
+        page = self.TITLE + "\nAfrica Region Working Paper Series\n" + FILLER
         match = _match("wp61.pdf", sidecar, page)
         self.assertEqual(("CP2003", "title"), (match.entry["key"], match.route))
-        without_year = page.replace("2003", "")
-        self.assertIsNone(_match("wp61.pdf", sidecar, without_year).entry)
+
+        short = [_entry("Young2012", ["Young"], "2012", title="The African Growth Miracle")]
+        bare = "The African Growth Miracle\n" + FILLER
+        self.assertIsNone(_match("paper.pdf", short, bare).entry)
+        named = "The African Growth Miracle\nAlwyn Young\n2012\n" + FILLER
+        self.assertEqual("Young2012", _match("paper.pdf", short, named).entry["key"])
 
     def test_a_lettered_bibliography_year_still_matches_by_title(self):
         sidecar = [_entry("PlangeOne", ["Plange"], "1979a", title=self.TITLE)]
         page = self.TITLE + "\nNii-K. Plange\n1979\n" + FILLER
         self.assertEqual("PlangeOne", _match("x.pdf", sidecar, page).entry["key"])
+
+    def test_the_works_own_title_comes_before_a_title_it_cites(self):
+        own = "Education in Northern Ghana, 1906-1940: A Study in Colonial Paradox"
+        cited = "Forced Labour in British West Africa: The Case of the Northern Territories"
+        sidecar = [
+            _entry("Thomas1973", ["Thomas"], "1973", title=cited),
+            _entry("Thomas1974", ["Thomas"], "1974", title=own),
+        ]
+        page = own + "\nRoger G. Thomas\n" + FILLER * 3 + "\nSee my earlier article, " + cited + "."
+        match = _match("paper_090.pdf", sidecar, page)
+        self.assertEqual(("Thomas1974", "title"), (match.entry["key"], match.route))
+
+    def test_a_title_found_late_is_offered_and_not_taken(self):
+        cited = "Forced Labour in British West Africa: The Case of the Northern Territories"
+        sidecar = [_entry("Thomas1973", ["Thomas"], "1973", title=cited)]
+        page = FILLER * 5 + "\nSee " + cited + " (Thomas 1973)."
+        match = _match("paper_091.pdf", sidecar, page)
+        self.assertEqual(("Thomas1973", "title_late"), (match.entry["key"], match.route))
+        self.assertIn("words into the text", match.note)
+        self.assertIn("or a work that cites it", match.note)
+        self.assertIsNone(match_bib_entry(Path("paper_091.pdf"), page, sidecar))
+
+    def test_one_title_in_two_entries_is_reported(self):
+        title = "The Politics of Regional Inequality in Ghana: State Elites, Donors and PRSPs"
+        sidecar = [
+            _entry("AbdulaiHulme2014", ["Abdulai", "Hulme"], "2014", title=title),
+            _entry("AbdulaiHulme2015", ["Abdulai", "Hulme"], "2015", title=title),
+        ]
+        page = title + "\nAbdul-Gafaru Abdulai and David Hulme\n" + FILLER
+        match = _match("paper_001.pdf", sidecar, page)
+        self.assertTrue(match.ambiguous)
+        self.assertIn("AbdulaiHulme2014, AbdulaiHulme2015", match.note)
+        dated = page + " Published 2015."
+        self.assertEqual("AbdulaiHulme2015", _match("paper_001.pdf", sidecar, dated).entry["key"])
 
 
 class CascadeMatchingTests(unittest.TestCase):
@@ -448,6 +521,26 @@ class CascadeMatchingTests(unittest.TestCase):
         self.assertEqual("Plange_1979a", by_name["Plange (1979a).pdf"].doc_id)
         self.assertEqual("Plange_1979b", by_name["Plange (1979b).pdf"].doc_id)
 
+    def test_a_pdf_that_only_cites_a_listed_work_waits_for_the_user(self):
+        cited = "Underdevelopment in Northern Ghana: Natural Causes or Colonial Capitalism"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            corpus = Path(temp_dir) / "papers"
+            make_pdf(
+                corpus / "download (3).pdf", "Notes on a Seminar", "A. N. Other", "1985",
+                extra=FILLER + " " + FILLER + " As argued in " + cited + ", the reserve was made.",
+            )
+            write_bib(corpus / "bibliography.bib", [
+                ("article", "PlangeUnder", {
+                    "author": "Plange, Nii-K.", "title": cited, "year": "1979",
+                }),
+            ])
+            rows = self._ingest(corpus)
+        row = rows[0]
+        self.assertEqual(("bib_title_late", "low"), (row.source, row.confidence))
+        self.assertEqual("Plange_1979", row.doc_id)
+        self.assertIn("the title of PlangeUnder first appears", row.notes)
+        self.assertIn("--accept-low-confidence", row.notes)
+
     def test_an_unmatched_pdf_says_why(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             corpus = self._corpus(Path(temp_dir), True)
@@ -456,7 +549,7 @@ class CascadeMatchingTests(unittest.TestCase):
         row = next(row for row in rows if row.pdf_path.endswith("scan0042.pdf"))
         self.assertEqual(("none", "failed"), (row.source, row.confidence))
         self.assertIn("unmatched: bibliography: file name has no author-and-year form", row.notes)
-        self.assertIn("no bibliography title found on the first pages", row.notes)
+        self.assertIn("no bibliography title found as one phrase on the first pages", row.notes)
         self.assertIn("no DOI on the first pages", row.notes)
         self.assertIn("model extraction not requested", row.notes)
 
@@ -480,6 +573,18 @@ class RepeatedEntryTests(unittest.TestCase):
         self.assertEqual(("", "low", "bib_repeated"), (copy.doc_id, copy.confidence, copy.source))
         self.assertIn("PlangeOne is already matched to Plange (1979).pdf", copy.notes)
         self.assertIn("give this PDF its own entry", copy.notes)
+        self.assertEqual("Plange_1979", rows[1].doc_id)
+
+    def test_a_late_title_never_keeps_an_entry_another_pdf_holds(self):
+        cited_in = ExtractedMeta(
+            doc_id="Plange_1979a", year="1979", pdf_path=str(Path("corpus") / "a seminar.pdf"),
+            bib_key="PlangeOne", content_sha1="333", source="bib_title_late",
+            confidence="low", notes="bibliography: the title of PlangeOne first appears ...",
+        )
+        rows = [cited_in, self._row("Plange (1979).pdf", "file_name", "222")]
+        held = hold_repeated_bib_entries(rows)
+        self.assertEqual(["a seminar.pdf"], [Path(row.pdf_path).name for row in held])
+        self.assertEqual(("", "bib_repeated"), (cited_in.doc_id, cited_in.source))
         self.assertEqual("Plange_1979", rows[1].doc_id)
 
     def test_an_identical_copy_is_named_as_such(self):

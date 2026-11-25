@@ -4,6 +4,7 @@ import codecs
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -302,27 +303,79 @@ def _match_text(value) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", _ascii_fold(value).lower()))
 
 
-def _fuzzy_title_match(title: str, text: str, threshold: float = 0.9) -> bool:
+_TITLE_PHRASE_SHARE = 0.8
+_TITLE_NEAR_START_WORDS = 150
+_TITLE_TIE_WORDS = 30
+
+
+def _word_positions(words: list) -> dict:
+    positions: dict = {}
+    for index, word in enumerate(words):
+        positions.setdefault(word, []).append(index)
+    return positions
+
+
+def _longest_title_run(title_words: list, text_words: list, positions: dict) -> tuple:
+    best_length, best_position = 0, -1
+    for start in range(len(title_words)):
+        if len(title_words) - start <= best_length:
+            break
+        for position in positions.get(title_words[start], ()):
+            length = 0
+            while (
+                start + length < len(title_words)
+                and position + length < len(text_words)
+                and title_words[start + length] == text_words[position + length]
+            ):
+                length += 1
+            if length > best_length or (
+                length == best_length and length and position < best_position
+            ):
+                best_length, best_position = length, position
+    return best_length, best_position
+
+
+def _title_phrase(title, text_words: list, positions: dict,
+                  share: float = _TITLE_PHRASE_SHARE) -> Optional[int]:
+    title_words = _match_text(title).split()
+    if len(title_words) < 4:
+        return None
+    length, position = _longest_title_run(title_words, text_words, positions)
+    if length < max(4, math.ceil(share * len(title_words))):
+        return None
+    return position
+
+
+def _fuzzy_title_match(title: str, text: str, threshold: float = _TITLE_PHRASE_SHARE) -> bool:
     if not title or not text:
         return False
-    title_words = _match_text(title).split()
-    text_plain = _match_text(text)
-    return _title_words_match(title_words, text_plain, set(text_plain.split()), threshold)
+    text_words = _match_text(text).split()
+    return _title_phrase(title, text_words, _word_positions(text_words), threshold) is not None
 
 
-def _title_words_match(title_words: list, text_plain: str, text_words: set,
-                       threshold: float) -> bool:
-    tokens = [word for word in title_words if len(word) >= 5]
-    if len(tokens) < 3:
-        return False
-    hits = sum(1 for token in tokens if token in text_words)
-    if (hits / len(tokens)) < threshold:
-        return False
-    padded = f" {text_plain} "
-    for i in range(len(title_words) - 3):
-        if f" {' '.join(title_words[i:i + 4])} " in padded:
-            return True
-    return False
+def _earliest_title(entries: list, text_words: list, positions: dict, padded: str) -> tuple:
+    found = []
+    for order, entry in enumerate(entries):
+        position = _title_phrase(entry.get("title"), text_words, positions)
+        if position is None:
+            continue
+        surname = _match_text(entry.get("first_surname"))
+        year, _ = _year_parts(entry.get("year"))
+        named = bool(surname and year and f" {surname} " in padded and f" {year} " in padded)
+        if len(_match_text(entry.get("title")).split()) < 6 and not named:
+            continue
+        found.append((position, order, named, entry))
+    if not found:
+        return None, -1, []
+    found.sort(key=lambda item: (item[0], item[1]))
+    position = found[0][0]
+    tied = [item for item in found if item[0] - position <= _TITLE_TIE_WORDS]
+    if len(tied) > 1:
+        named = [item for item in tied if item[2]]
+        if len(named) != 1:
+            return None, position, [item[3] for item in tied]
+        return named[0][3], named[0][0], []
+    return found[0][3], position, []
 
 
 @dataclass
@@ -360,16 +413,14 @@ def _entry_fits_file_name(entry: dict, parsed: dict) -> str:
 
 def _narrow_by_co_authors(candidates: list, parsed: dict) -> list:
     wanted = [_match_key(name) for name in parsed["surnames"]]
+    if not parsed["et_al"] and len(wanted) < 2:
+        return candidates
 
     def agrees(entry: dict) -> bool:
         surnames = [_match_key(name) for name in entry.get("surnames") or []]
-        if not surnames:
-            return False
         if parsed["et_al"]:
             return len(surnames) >= 3
-        if len(wanted) >= 2:
-            return surnames[1:len(wanted)] == wanted[1:]
-        return len(surnames) == 1
+        return surnames[1:len(wanted)] == wanted[1:]
 
     agreeing = [entry for entry in candidates if agrees(entry)]
     return agreeing or candidates
@@ -378,7 +429,8 @@ def _narrow_by_co_authors(candidates: list, parsed: dict) -> list:
 def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMatch:
     name_key = _file_name_key(pdf_path.name)
     text_plain = _match_text(text)
-    text_words = set(text_plain.split())
+    text_word_list = text_plain.split()
+    positions = _word_positions(text_word_list)
     padded = f" {text_plain} "
 
     listed = [
@@ -424,12 +476,9 @@ def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMat
             if by_letter:
                 candidates = by_letter
         if len(candidates) > 1:
-            by_title = [
-                entry for entry in candidates
-                if _fuzzy_title_match(entry["title"], text, threshold=0.85)
-            ]
-            if len(by_title) == 1:
-                candidates = by_title
+            by_title, _, _ = _earliest_title(candidates, text_word_list, positions, padded)
+            if by_title is not None:
+                candidates = [by_title]
         if len(candidates) == 1:
             return BibMatch(entry=candidates[0], route="file_name")
         if len(candidates) > 1 and ambiguous is None:
@@ -455,22 +504,36 @@ def match_bib_entry_detailed(pdf_path: Path, text: str, sidecar: list) -> BibMat
     else:
         notes.append("file name has no author-and-year form")
 
-    for entry in sidecar:
-        surname = _match_text(entry.get("first_surname"))
-        year, _ = _year_parts(entry.get("year"))
-        if not surname or not year:
-            continue
-        if f" {surname} " not in padded or year not in text_words:
-            continue
-        if _title_words_match(_match_text(entry["title"]).split(), text_plain,
-                              text_words, 0.9):
+    entry, position, tied = _earliest_title(sidecar, text_word_list, positions, padded)
+    if tied:
+        keys = ", ".join(item["key"] for item in tied)
+        return BibMatch(
+            ambiguous=True,
+            note=(
+                f"bibliography: the title on the first pages belongs to {len(tied)} "
+                f"entries ({keys}). Name this file in the file field of the right one"
+            ),
+        )
+    if entry is not None:
+        if position <= _TITLE_NEAR_START_WORDS:
             return BibMatch(entry=entry, route="title")
-    notes.append("no bibliography title found on the first pages")
+        return BibMatch(
+            entry=entry,
+            route="title_late",
+            note=(
+                f"bibliography: the title of {entry['key']} first appears "
+                f"{position} words into the text, so this PDF is either that work "
+                "or a work that cites it. Confirm by naming the file in the entry's "
+                "file field, or admit the row with --accept-low-confidence"
+            ),
+        )
+    notes.append("no bibliography title found as one phrase on the first pages")
     return BibMatch(note="bibliography: " + "; ".join(notes))
 
 
 def match_bib_entry(pdf_path: Path, text: str, sidecar: list) -> Optional[dict]:
-    return match_bib_entry_detailed(pdf_path, text, sidecar).entry
+    match = match_bib_entry_detailed(pdf_path, text, sidecar)
+    return None if match.route == "title_late" else match.entry
 
 
 _FILENAME_AUTHOR_YEAR_RE = re.compile(
@@ -487,9 +550,9 @@ _FILENAME_FORMS = (
                + r"\s*[)\]]\s*[-\u2013\u2014_,.:]?\s*\S.*$"),
     re.compile(r"^(?P<names>.*?[^\W\d_].*?)[\s_\-,.]+" + _FILENAME_YEAR + r"\s*$"),
     re.compile(r"^(?P<names>[^\W\d_]+(?:[&\-][^\W\d_]+)*)" + _FILENAME_YEAR + r"$"),
-    re.compile(r"^" + _FILENAME_YEAR + r"\s*[-\u2013\u2014_ ]\s*"
-               r"(?P<names>[^\W\d_][^\-\u2013\u2014_]*?)"
-               r"(?:\s*[-\u2013\u2014_]\s*.+)?$"),
+    re.compile(r"^" + _FILENAME_YEAR + r"(?:" + _FILENAME_DASH + r"|_|\s+)"
+               r"(?P<names>[^\W\d_].*?)"
+               r"(?:(?:" + _FILENAME_DASH + r"|_).+)?$"),
 )
 _FILENAME_ET_AL_RE = re.compile(
     r"(?:(?i:[\s_,]+et[\s_.]*al\.?)|(?<=[a-z])EtAl)\s*$"
@@ -814,7 +877,10 @@ def hold_repeated_bib_entries(rows: list) -> list:
     strength = {"file_field": 0, "key": 1, "file_name": 2, "title": 3}
     by_key: dict = {}
     for meta in rows:
-        if getattr(meta, "source", "") == "bib_sidecar" and getattr(meta, "bib_key", ""):
+        if (
+            getattr(meta, "source", "") in ("bib_sidecar", "bib_title_late")
+            and getattr(meta, "bib_key", "")
+        ):
             by_key.setdefault(meta.bib_key, []).append(meta)
     held = []
     for key, members in by_key.items():
@@ -910,6 +976,14 @@ def cascade(pdf_path: Path,
 
     if sidecar_bib_entries:
         match = match_bib_entry_detailed(pdf_path, text, sidecar_bib_entries)
+        if match.entry and match.route == "title_late":
+            entry = match.entry
+            _fill_from_bib(meta, entry)
+            meta.source = "bib_title_late"
+            meta.confidence = "low"
+            meta.notes = match.note
+            meta.doc_id = generate_doc_id(_bib_surnames_list(entry), entry["year"], existing_doc_ids)
+            return meta
         if match.entry:
             entry = match.entry
             _fill_from_bib(meta, entry)
