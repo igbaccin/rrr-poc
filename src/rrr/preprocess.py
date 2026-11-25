@@ -386,6 +386,9 @@ def _record_reference_leaks(metadata_path: str, records: list) -> None:
 
 
 def main():
+    from rrr.utils import force_utf8_stdio
+
+    force_utf8_stdio()
     ap = argparse.ArgumentParser(prog="python -m rrr.preprocess")
     ap.add_argument("--metadata", required=True)
     ap.add_argument("--workers", type=int, default=max(1, cpu_count()-1))

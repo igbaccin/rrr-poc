@@ -180,6 +180,11 @@ def main() -> None:
     ap.add_argument("--api", action="store_true", help="Install provider API dependencies")
     ap.add_argument("--json", action="store_true", dest="as_json")
     args = ap.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     try:
         result = bootstrap(
             Path(args.plugin_root),

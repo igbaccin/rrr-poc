@@ -347,6 +347,57 @@ def prepare_main(argv):
             sys.stderr.write(f"[RRR] warning: {warning['message']}\n")
 
 
+_COMMANDS = (
+    ("prepare", "Catalogue, extract and index a folder of PDFs."),
+    ("t2", "Write a page-cited literature review on a topic."),
+    ("t1", "Evaluate one claim against the collection."),
+    ("ingest", "Build metadata.csv for a folder of PDFs (the first step of prepare)."),
+    ("host-doctor", "Check the Codex or Claude login that host mode uses."),
+)
+
+
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("rrr-poc")
+    except Exception:
+        return "unknown (source checkout)"
+
+
+def _task_parser() -> argparse.ArgumentParser:
+    commands = "\n".join(f"  {name:<12} {text}" for name, text in _COMMANDS)
+    ap = argparse.ArgumentParser(
+        prog="rrr",
+        usage="rrr <command> [options]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "RRR, Retrieval-Restricted Reasoning: page-cited research synthesis "
+            "from the PDFs you choose.\n\n"
+            "commands:\n" + commands + "\n\n"
+            "Run `rrr <command> --help` for the options of prepare, ingest and "
+            "host-doctor.\nThe options listed below are those of t1 and t2.\n"
+            "Where the rrr launcher is blocked, every command also runs as "
+            "`python -m rrr <command>`."
+        ),
+    )
+    ap.add_argument("--version", action="version", version=f"rrr {_version()}")
+    ap.add_argument("task", choices=["t1", "t2"], metavar="{t1,t2}",
+                    help="Which pipeline task to run.")
+    ap.add_argument("--metadata", required=True,
+                    help="metadata.csv of the prepared collection.")
+    ap.add_argument("--topic", required=True,
+                    help="Topic (T2) or claim (T1) to evaluate.")
+    ap.add_argument("--multi", action="store_true",
+                    help="Run the layered T2 pipeline (default for both t1 and t2).")
+    ap.add_argument("--narrative-only", action="store_true",
+                    help="T2: skip the T2_review.md appendix. Ignored by t1.")
+    ap.add_argument("--linkify", action="store_true",
+                    help="T2: rewrite in-text citations as clickable markdown links "
+                         "to the source PDF page. Sets RRR_LINKIFY=1.")
+    return ap
+
+
 def _select_topic_runtime(topic):
     from rrr.language import detect_topic_language, select_model
 
@@ -361,41 +412,27 @@ def _select_topic_runtime(topic):
     return topic_lang, select_model(topic_lang)
 
 
-def main():
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
+def main(argv=None):
+    from rrr.utils import force_utf8_stdio
 
-    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
-        ingest_main(sys.argv[2:])
+    force_utf8_stdio()
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    if argv and argv[0] == "ingest":
+        ingest_main(argv[1:])
         return
-    if len(sys.argv) > 1 and sys.argv[1] == "host-doctor":
-        host_doctor_main(sys.argv[2:])
+    if argv and argv[0] == "host-doctor":
+        host_doctor_main(argv[1:])
         return
-    if len(sys.argv) > 1 and sys.argv[1] == "prepare":
-        prepare_main(sys.argv[2:])
+    if argv and argv[0] == "prepare":
+        prepare_main(argv[1:])
         return
 
-    ap = argparse.ArgumentParser(
-        prog="rrr",
-        description="RRR CLI. `t2` runs the full literature-review pipeline; "
-                    "`t1` runs the claim-evaluator (same up to Stage 2, no writer)."
-    )
-    ap.add_argument("task", choices=["t1", "t2"],
-                    help="Which pipeline task to run.")
-    ap.add_argument("--metadata", required=True)
-    ap.add_argument("--topic", required=True,
-                    help="Topic (T2) or claim (T1) to evaluate.")
-    ap.add_argument("--multi", action="store_true",
-                    help="Run the layered T2 pipeline (default for both t1 and t2).")
-    ap.add_argument("--narrative-only", action="store_true",
-                    help="T2: skip the T2_review.md appendix. Ignored by t1.")
-    ap.add_argument("--linkify", action="store_true",
-                    help="T2: rewrite in-text citations as clickable markdown links "
-                         "to the source PDF page. Sets RRR_LINKIFY=1.")
-    args = ap.parse_args()
+    ap = _task_parser()
+    if not argv:
+        ap.print_help(sys.stderr)
+        raise SystemExit(2)
+    args = ap.parse_args(argv)
 
     reject = _reject_gibberish_topic(args.topic)
     if reject:

@@ -1,5 +1,13 @@
-import os, json, hashlib, re, datetime
+import os, json, hashlib, re, datetime, sys
 from rrr.paths import runs_path
+
+
+def force_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def ensure_dir(path):

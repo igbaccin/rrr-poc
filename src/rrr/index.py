@@ -1,6 +1,6 @@
 import argparse, os, glob, pickle, numpy as np, pandas as pd
 from rank_bm25 import BM25Okapi
-from rrr.utils import ensure_dir
+from rrr.utils import ensure_dir, force_utf8_stdio
 from rrr.paths import data_path, indices_path
 from rrr.text import page_sort_key, tokenize
 
@@ -21,7 +21,8 @@ def build_bm25(doc_id_list):
     return bm, page_ids
 
 def main():
-    ap = argparse.ArgumentParser()
+    force_utf8_stdio()
+    ap = argparse.ArgumentParser(prog="python -m rrr.index")
     ap.add_argument("--metadata", required=True)
     args = ap.parse_args()
     df = pd.read_csv(args.metadata)

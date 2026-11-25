@@ -212,6 +212,8 @@ def _run(command: list[str], env: dict[str, str], quiet: bool = False) -> None:
         check=False,
         capture_output=quiet,
         text=quiet,
+        encoding="utf-8" if quiet else None,
+        errors="replace" if quiet else None,
     )
     if quiet:
         if completed.stdout:
@@ -258,6 +260,7 @@ def prepare_workspace(
     workspace_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["RRR_PROJECT_ROOT"] = str(workspace_dir)
+    env["PYTHONIOENCODING"] = "utf-8"
 
     ingest = [
         sys.executable,

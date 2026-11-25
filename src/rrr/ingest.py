@@ -80,12 +80,12 @@ def content_sha1(pdf_path: Path) -> str:
 
 def extract_pages_text(pdf_path: Path, max_pages: int = 3) -> str:
     try:
-        import fitz
+        import pymupdf
     except Exception:
         return ""
     parts = []
     try:
-        with fitz.open(pdf_path) as doc:
+        with pymupdf.open(pdf_path) as doc:
             for i, page in enumerate(doc):
                 if i >= max_pages:
                     break
@@ -1030,7 +1030,7 @@ def ingest_corpus(corpus_dir: Path,
             existing_doc_ids.add(meta.doc_id)
         dt = time.perf_counter() - t0
         if progress:
-            print(f"  [{dt:5.1f}s] {pdf.name:44s}  →  doc_id={meta.doc_id!r:34s} "
+            print(f"  [{dt:5.1f}s] {pdf.name:44s}  ->  doc_id={meta.doc_id!r:34s} "
                   f"src={meta.source} conf={meta.confidence}"
                   + (f"  notes={meta.notes}" if meta.notes else ""))
     for meta in hold_repeated_bib_entries(results):
