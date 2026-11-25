@@ -347,9 +347,10 @@ _BREAKDOWN_EXPLANATIONS = {
         "about the corpus. Inspect metrics.llm_calls and run it again."
     ),
     "stage1_clustering_failed": (
-        "Stage 1 (clustering) returned no valid plan after one retry. This "
-        "is a fault of the run, not a finding about the corpus. Inspect "
-        "metrics.llm_calls and run it again."
+        "Stage 1 (clustering) produced no usable plan: a call to the model "
+        "failed, or two answers could not be used. This is a fault of the "
+        "run, not a finding about the corpus. Inspect metrics.llm_calls and "
+        "run it again."
     ),
 }
 
@@ -1091,6 +1092,8 @@ def _layered_t2_inner(args, meta_path):
             "adjacent": "Adjacent (related but not addressing the claim directly)",
             **dict(_OPEN_QUESTION_RELATIONS),
         }
+        if topic_shape == "explanatory":
+            rel_label["adjacent"] = "Adjacent (related, without bearing on the outcome directly)"
         seen = set()
         ordered_relations = [r for r in rel_order if r in by_relation and not seen.add(r)]
         ordered_relations += [r for r in by_relation if r not in seen]

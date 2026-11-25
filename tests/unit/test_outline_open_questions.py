@@ -549,6 +549,26 @@ class WholeOutlineTests(StubbedStages):
         self.assertEqual("stage0", diagnostics["stage"])
         self.assertEqual("malformed_json", diagnostics["failure"])
 
+    def test_a_stage_1_failure_names_its_real_cause(self):
+        def call_fails(prompt):
+            if "PRE-FLIGHT" in prompt:
+                return reply(stage0("explanatory", outcome="decline of honeybee colonies"))
+            raise TimeoutError("The read operation timed out")
+
+        diagnostics = {}
+        plan = self.run_with(FakeModel(router=call_fails), outline.build_outline, BEES, SUMMARIES,
+                             diagnostics=diagnostics)
+        self.assertIsNone(plan)
+        self.assertEqual("stage1", diagnostics["stage"])
+        self.assertEqual("model_call_error", diagnostics["failure"])
+        self.assertIn("timed out", diagnostics["detail"])
+
+        direct = {}
+        self.assertIsNone(self.run_with(FakeModel(router=lambda p: {"message": {"content": "not json"}}),
+                                        outline.cluster_papers, BEES, SUMMARIES, topic_shape="explanatory",
+                                        topic_outcome="decline of honeybee colonies", diagnostics=direct))
+        self.assertEqual("no_valid_cluster_plan", direct["failure"])
+
     def test_a_claim_still_takes_the_causal_path(self):
         def router(prompt):
             if "PRE-FLIGHT" in prompt:

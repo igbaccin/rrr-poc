@@ -88,6 +88,12 @@ class OpenQuestionVerdictTests(unittest.TestCase):
         self.assertIn("No stream of the corpus offers an explanation of glacier surges", verdict["headline"])
         self.assertEqual("explains=0, documents=1, disputes=0, adjacent=0", verdict["breakdown"])
 
+    def test_the_adjacent_heading_of_an_open_question_does_not_speak_of_a_claim(self):
+        import inspect
+
+        source = inspect.getsource(reasoner._layered_t2_inner)
+        self.assertIn('rel_label["adjacent"] = "Adjacent (related, without bearing on the outcome directly)"', source)
+
     def test_the_explanatory_relations_have_headings(self):
         relations = [rel for rel, _ in reasoner._OPEN_QUESTION_RELATIONS]
         self.assertEqual(["explains_outcome", "documents_outcome", "disputes_outcome"], relations)

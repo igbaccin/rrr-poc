@@ -765,7 +765,8 @@ def _validate_cluster_plan(obj, valid_doc_ids: set, topic_shape: str) -> Optiona
 def cluster_papers(topic: str, doc_summaries: List[dict],
                    topic_shape: str = "causal",
                    topic_outcome: str = "",
-                   metrics=None) -> Optional[dict]:
+                   metrics=None,
+                   diagnostics: Optional[dict] = None) -> Optional[dict]:
     doc_claims = [
         {"doc_id": d.get("doc_id", ""), "claim": (d.get("claim") or "").strip()}
         for d in doc_summaries
@@ -807,7 +808,7 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
         if metrics:
             metrics.record_llm("outline_cluster", _MODEL, options=_OPTIONS_CLUSTER,
                                success=False, error=e)
-        return None
+        return _precheck_failure(diagnostics, "model_call_error", f"{type(e).__name__}: {e}")
 
     plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids, topic_shape))
     if plan is None:
@@ -833,10 +834,10 @@ def cluster_papers(topic: str, doc_summaries: List[dict],
             if metrics:
                 metrics.record_llm("outline_cluster_retry", _MODEL, options=_OPTIONS_CLUSTER,
                                    success=False, error=e)
-            return None
+            return _precheck_failure(diagnostics, "model_call_error", f"{type(e).__name__}: {e}")
         plan = _parse_and_validate(raw, lambda obj: _validate_cluster_plan(obj, valid_doc_ids, topic_shape))
         if plan is None:
-            return None
+            return _precheck_failure(diagnostics, "no_valid_cluster_plan", raw[:300])
 
     plan["model"] = _MODEL
     plan["prompt_version"] = _CLUSTER_PROMPT_VERSION
@@ -1492,11 +1493,12 @@ def build_outline(topic: str, doc_summaries: List[dict], metrics=None,
     plan = cluster_papers(topic, doc_summaries,
                           topic_shape=topic_shape,
                           topic_outcome=topic_outcome,
-                          metrics=metrics)
+                          metrics=metrics,
+                          diagnostics=diagnostics)
     if not plan:
         if diagnostics is not None:
             diagnostics["stage"] = "stage1"
-            diagnostics["failure"] = "no_valid_cluster_plan"
+            diagnostics.setdefault("failure", "no_valid_cluster_plan")
         return None
     summaries_by_doc = {
         d.get("doc_id"): d for d in doc_summaries if d.get("doc_id")
